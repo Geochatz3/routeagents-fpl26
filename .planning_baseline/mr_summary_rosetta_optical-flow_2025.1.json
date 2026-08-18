@@ -1,0 +1,47 @@
+{
+  "input": "/mnt/d/fpl26_optimization_contest/benchmarks_v1.2.0/fpl26_contest_benchmarks/rosetta_optical-flow_2025.1.dcp",
+  "final_output": "/mnt/d/fpl26_optimization_contest/benchmarks_v1.2.0/fpl26_contest_benchmarks/rosetta_optical-flow_2025.1_optimized.dcp",
+  "attempts": [
+    {
+      "i": 1,
+      "fmax": 325.30904359141186,
+      "status": "VALID_OPTIMIZED",
+      "cost": 0.26659155,
+      "elapsed": 1904.6316602230072,
+      "output": "/tmp/mr_rosetta_optical-flow_2025.1_58569_1.dcp",
+      "exists": true,
+      "run_dir": "/mnt/d/fpl26_optimization_contest/wt_final_round_dev/dcp_optimizer_run-20260720_122226"
+    },
+    {
+      "i": 2,
+      "fmax": 353.60678925035364,
+      "status": "VALID_OPTIMIZED_NO_EDIF",
+      "cost": 0.27789294999999997,
+      "elapsed": 5153.768833875656,
+      "output": "/tmp/mr_rosetta_optical-flow_2025.1_58569_2.dcp",
+      "exists": true,
+      "run_dir": "/mnt/d/fpl26_optimization_contest/wt_final_round_dev/dcp_optimizer_run-20260720_125414"
+    },
+    {
+      "i": 3,
+      "fmax": 325.30904359141186,
+      "status": "VALID_OPTIMIZED",
+      "cost": 0.07881139999999999,
+      "elapsed": 1147.9005234241486,
+      "output": "/tmp/mr_rosetta_optical-flow_2025.1_58569_3.dcp",
+      "exists": true,
+      "run_dir": "/mnt/d/fpl26_optimization_contest/wt_final_round_dev/dcp_optimizer_run-20260720_142012"
+    }
+  ],
+  "chosen": {
+    "i": 2,
+    "fmax": 353.60678925035364,
+    "status": "VALID_OPTIMIZED_NO_EDIF",
+    "cost": 0.27789294999999997,
+    "elapsed": 5153.768833875656,
+    "output": "/tmp/mr_rosetta_optical-flow_2025.1_58569_2.dcp",
+    "exists": true,
+    "run_dir": "/mnt/d/fpl26_optimization_contest/wt_final_round_dev/dcp_optimizer_run-20260720_125414"
+  },
+  "total_wall": 8500.0
+}

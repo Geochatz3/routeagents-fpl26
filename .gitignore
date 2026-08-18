@@ -1,0 +1,31 @@
+__pycache__
+*.dcp
+*.log
+*.jou
+*.edf
+.env
+.venv/
+dcp_optimizer_run-*/
+fpl26_contest_benchmarks/
+live_tests/
+strategy_memory.jsonl
+
+# GEPA Phase 0/1 derived dataset (regenerable via gepa/etl.py from the D-drive source)
+gepa/dataset.jsonl
+gepa/signal_gate_run.log
+
+# --- Secret-shaped files (jul26) ------------------------------------------
+# A live RSA private key DID reach history once: fpl26contest-key.pem, 1674 B,
+# commit 4d26386 (2026-05-09, a 186-file WIP snapshot). It is gone from HEAD but
+# permanent in history. These patterns stop a recurrence; they CANNOT un-commit
+# the existing one — only ROTATING that key makes the historical copy inert, and
+# that must happen before this repo is ever pushed to a hosted service (even a
+# private one: private is not a security boundary, and GitHub secret scanning
+# does not cover private repos without Advanced Security).
+# scripts/build_submission.sh:60 already fails the build on these patterns.
+*.pem
+*.key
+*_key
+*credentials*
+.env.*
+!.env.example

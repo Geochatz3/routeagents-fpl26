@@ -1,0 +1,17 @@
+# FPGA Design Optimization Agent Dependencies
+
+# Core dependencies
+mcp==1.28.1
+
+# OpenAI client (only needed for full agent mode using OpenRouter, not test mode)
+# Upper bounds below are the mcp-2.0.0 lesson applied to the rest of the file:
+# `make setup` resolves these FRESH on the eval box after the deadline, so any
+# bare `>=` can float into a major we have never run. Bounds only — the floors
+# are unchanged, so nothing that resolves today stops resolving.
+openai>=1.0.0,<3.0.0
+
+# RapidWright MCP dependencies
+rapidwright>=2025.2.1,<2026.0.0
+
+# Vivado MCP dependencies (pexpect for process control)
+pexpect>=4.8.0,<5.0.0

@@ -1,0 +1,47 @@
+{
+    "Report Information": {
+        "Copyright": "Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2025 Advanced Micro Devices, Inc. All Rights Reserved.",
+        "Tool Version": "Vivado v.2025.1 (win64) Build 6140274 Thu May 22 00:12:29 MDT 2025",
+        "Date": "Thu May 21 19:08:50 2026",
+        "Host": "admin running 64-bit major release  (build 9200)",
+        "Command": "report_design_analysis -qor_summary -json {C:\\tmp\\session12_qor\\corescore_500_mod.dcp.qor.json}",
+        "Design": "corescore_vu3p",
+        "Device": "xcvu3p",
+        "Design State": "Optimized"
+    },
+    "Design QoR Summary": [{
+            "Task Name": "route_design",
+            "Options": "",
+            "Directives": "Default",
+            "Runtime(mins)": "4",
+            "WNS(ns)": "-1.219",
+            "TNS(ns)": "-7554.326",
+            "WHS(ns)": "0.010",
+            "THS(ns)": "0.000",
+            "RQA": "",
+            "Global Cong Level N-E-S-W": "",
+            "Global Cong Tile% N-E-S-W": "",
+            "Long Cong Level N-E-S-W": "- 0 - -",
+            "Long Cong Tile% N-E-S-W": "- 0.0 - -",
+            "Short Cong Level N-E-S-W": "",
+            "Short Cong Tile% N-E-S-W": "",
+            "Number of threads": "2"
+        }, {
+            "Task Name": "place_design",
+            "Options": "-unplace",
+            "Directives": "",
+            "Runtime(mins)": "0",
+            "WNS(ns)": "",
+            "TNS(ns)": "",
+            "WHS(ns)": "",
+            "THS(ns)": "",
+            "RQA": "",
+            "Global Cong Level N-E-S-W": "",
+            "Global Cong Tile% N-E-S-W": "",
+            "Long Cong Level N-E-S-W": "",
+            "Long Cong Tile% N-E-S-W": "",
+            "Short Cong Level N-E-S-W": "",
+            "Short Cong Tile% N-E-S-W": "",
+            "Number of threads": ""
+        }]
+}
