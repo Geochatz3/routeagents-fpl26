@@ -1,44 +1,9 @@
-"""Micro-accepts replace the seed later combos run from. DEFAULT OFF, A/B pending.
+"""Test the optional gate that rejects improvements below the meaningful-gain
+threshold.
 
-THE OBSERVATION (jul29, fir_systolic). Two runs of the SAME configuration,
-bit-identical for six cycles, differing only in the recipe baseline they inherited
-(-0.216 vs -0.247 — 0.031 ns of ordinary noise):
-
-    cycle  combo               night16c            shipref
-    1-5    Explore..LASTMILE   identical           identical
-    6      __ROUTE_REROLL__    -0.243 no accept    -0.243 ACCEPT (gain 0.0040)
-    8      ExtraTimingOpt      -0.154  <-- WIN     -0.327  <-- ruined
-    final                      -0.154 (+21.30)     -0.243  (+9.07)
-
-An accept does not merely bank a result; it replaces the state later cycles start
-from — the property the ladder docstring already relies on ("the rung that runs
-FIRST runs from the UNMODIFIED seed"). In shipref the worse baseline made a
-mediocre cycle 6 look like a 0.0040 ns improvement, accepting it modified the seed,
-and ExtraTimingOpt — fir's winning combo FROM A CLEAN SEED — then produced -0.327.
-
-A 0.0040 ns micro-accept cost 12.23 MHz, which rank_delta prices at 1.5-2.6
-mean-rank points.
-
-CORPUS CHECK (jul29, both parity boxes). Five micro-accepts exist in total, and
-they are 4/5 TERMINAL — not the 4/4 the jul06 note recorded:
-
-    fir/shipdef_a      0.0040   terminal; ExtraTimingOpt -0.327
-                                (twin run with a clean seed: -0.154)
-    logicnets/banded   0.0080   terminal; ExtraTimingOpt -0.716 vs incumbent -0.505
-    logicnets/uni3b    0.0050   terminal
-    3d/uni             0.0050   terminal
-    digit/rerun        0.0060   MEANINGFUL ACCEPT FOLLOWED (-0.695 -> -0.661)
-
-digit is a straight counter-example: a micro-accept need not be fatal, so the gate
-would have cost that run its later gain. Suggestive the other way is that BOTH runs
-where ExtraTimingOpt followed a micro-accept collapsed (-0.327, -0.716) while fir's
-clean-seed twin won at -0.154 — but only fir has the counterfactual.
-
-WHY THE FLAG IS OFF. One clean natural experiment, a supporting pattern, and one
-counter-example — against the ILS accept rule, which is the core of the optimizer.
-The mechanism story reads well, and that is exactly when this project has
-historically over-committed. These tests pin the SWITCH and the arithmetic, not a
-claim that the switch is an improvement.
+Accepted results replace the seed used by later combinations, so small gains
+can alter subsequent search. The gate is disabled by default; these tests cover
+switch behavior and threshold arithmetic in ns.
 """
 from __future__ import annotations
 
@@ -80,9 +45,9 @@ def test_flag_parses_like_its_siblings(monkeypatch, val, expected):
 
 
 def test_the_fir_numbers_are_what_the_gate_would_have_caught(ils):
-    """The measured cycle-6 gain sits below the meaningful threshold and above
-    the accept margin — which is exactly why it was accepted, and why this gate
-    is the one that changes it."""
+    """Verify that a gain between the accept margin and meaningful-gain threshold
+    is accepted normally but rejected by the micro-accept gate.
+    """
     cfg = ils.ILSPolishConfig()
     shipref_best_before = -0.247      # recipe baseline that run inherited
     cycle6_wns = -0.243               # identical result in BOTH runs

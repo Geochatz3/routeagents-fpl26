@@ -1,11 +1,8 @@
-"""Submission-safety tests for the optimizer's failure-mode handling.
+"""Tests recovery paths that preserve a valid output DCP when optimization fails.
 
-The contest contract: every benchmark must produce a valid output DCP, even
-when optimization fails entirely.  These tests pin down the recovery paths in
-`dcp_optimizer.py` so they don't regress.
-
-We don't spawn Vivado/RapidWright/MCP — we mock the call surface and verify
-the lifecycle decisions.
+The optimizer copies a usable baseline artifact whenever recovery is possible
+and reports a clean hard failure otherwise. External tool calls are mocked to
+isolate lifecycle decisions.
 """
 from __future__ import annotations
 
@@ -34,11 +31,10 @@ def _async(coro):
 
 
 class _FakeBaselineDCP:
-    """Builds a tiny 'baseline' DCP file we can copy from in tests.
+    """Provides a minimal baseline DCP stand-in for safety tests.
 
-    Real DCPs are PKZip archives; for the submission-safety paths we test
-    here, the optimizer only does shutil.copy on these files — content is
-    irrelevant.  We write a non-empty byte string so the size check passes.
+    Real DCPs are ZIP archives, but these paths only copy the file. A nonempty
+    payload satisfies the artifact-size check; its content is irrelevant.
     """
 
     def __init__(self, tmpdir: Path):
@@ -87,8 +83,10 @@ class PhaseOneFailureTests(unittest.TestCase):
         self.assertIn("phase1_failed_baseline_copied", events)
 
     def test_phase1_failure_with_missing_baseline_hard_fails_cleanly(self):
-        """If even the baseline is missing, final_status must be HARD_FAIL
-        and we must not produce a zero-byte phantom DCP.
+        """Verifies that a missing baseline produces a clean hard failure.
+
+        The final status must be `HARD_FAIL`, and no output DCP, including a
+        zero-byte placeholder, may be created.
         """
         # Point at a baseline that doesn't exist.
         self.opt.input_dcp_path = self.run_dir / "no_such_baseline.dcp"

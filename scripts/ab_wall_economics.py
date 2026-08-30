@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
-"""04-02 (R-AB): per-attempt wall attribution + DEBUG-WALL A/B evidence
-grading for the D3 (--wall-handback) / D4 (--split-aware) flip decision.
+"""Parse attempt-level wall usage and grade paired wall-allocation runs.
 
-Pure decision/parsing logic (parse_attempt_wall, draw_count, grade_pair)
-lives at module top, unit-tested without Vivado (tests/test_ab_wall_
-economics.py, fixtures = REAL beta/AWS harness-log excerpts). The thin
-__main__ below shells out to `make run_optimizer` per variant at DEBUG-WALL
-and appends an evidence row — orchestration only, no decisions.
+Decision and parsing helpers operate without invoking FPGA tools. The
+command-line entry point runs each variant and appends an evidence row.
 
-PITFALL 4 (04-RESEARCH.md, verified against scorecard.json + harness logs):
-the scorecard's `wall_time_seconds` is the WHOLE wrapper process (setup +
-all attempts + winner_polish) — e.g. amd_mini-isp beta: scorecard 2058.17s
-vs attempt 1 alone ~1215s + attempt 2 ~797s. Per-attempt attribution MUST
-come from mr_summary_<stem>.json's attempts[].elapsed and/or the wrapper's
-own `[multi-restart]` log lines; this module NEVER reads the scorecard
-number for per-attempt work.
-
-PITFALL 5: gamma = wall_time_seconds/3600 of the whole wrapper — A/B gamma
-deltas must reconcile with the per-attempt rows this module emits; the
-whole-wrapper number is reported alongside (from the log-derived remaining
-markers) but never substituted for a per-attempt value.
-
-EVIDENCE SCOPE (T-04-03): everything produced locally under the DEBUG-WALL
-convention (MAX_WALL 8000-9000, ~2.5x eval speed) is BEHAVIOR evidence
-only — never a score claim. Score confirmation rides AWS rehearsal #1.
+Per-attempt elapsed time comes from restart summaries or wrapper log markers,
+never from the scorecard's whole-process wall time. Gamma uses the
+whole-process wall time in hours and remains separate from attempt attribution.
 """
 from __future__ import annotations
 
@@ -37,16 +20,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# ---------------------------------------------------------------------------
 # Constants (evidence-commented, route_gate.py style)
-# ---------------------------------------------------------------------------
 
-# Meaningfulness threshold for an fmax delta between paired A/B runs.
-# Prior-sessions convention, applied unchanged: S21 (2026-05-23) graded
-# vtr_mcml A 65.57 vs B 65.32 (|d|=0.25 < 0.5) CARD_NEUTRAL; S22 graded
-# spam-filter B 437.45 vs A 442.28 (-4.83) HARMFUL. jul06's
-# meaningful_accept_ns gate follows the same "don't act on sub-noise
-# deltas" philosophy on the WNS side.
+# Treat fmax deltas below 0.5 MHz as measurement noise and use the same
+# threshold for the never-worse check. WNS acceptance follows the same principle.
 MEANINGFUL_FMAX_DELTA_MHZ = 0.5
 
 # Never-worse tolerance = the same threshold: a regression at or beyond
@@ -55,16 +32,12 @@ MEANINGFUL_FMAX_DELTA_MHZ = 0.5
 # optimizer/route_gate.py).
 NEVER_WORSE_EPS_MHZ = MEANINGFUL_FMAX_DELTA_MHZ
 
-# DEBUG-WALL convention (user-endorsed jul04, feedback_debug_wall_convention):
-# local mechanism validation at MAX_WALL 8000-9000 (~2.5x the eval box's
-# speed ratio). Behavior-only evidence.
+# DEBUG-WALL convention: local mechanism validation at MAX_WALL 8000-9000
+# (~2.5x the eval machine's speed ratio). Behavior-only evidence.
 DEBUG_WALL_DEFAULT_S = 8500
 
-# ---------------------------------------------------------------------------
 # Wrapper log-line grammar (print sites in scripts/multi_restart_optimize.py;
-# formats verified verbatim against the official beta harness logs at
-# final_round/beta_final_results/logs_x/ and the jul19 AWS boom leg).
-# ---------------------------------------------------------------------------
+# formats verified verbatim against official harness logs).
 _BUDGET_RE = re.compile(
     r"^\[multi-restart\] attempt (\d+): budget (\d+(?:\.\d+)?)s -> ", re.M)
 _RESULT_RE = re.compile(
@@ -87,24 +60,20 @@ def _to_float(tok: str) -> Optional[float]:
 
 
 def parse_attempt_wall(mr_summary: dict, harness_log_text: str) -> list[dict]:
-    """Attribute wall per attempt (Pitfall 4).
+    """Attribute elapsed wall time and result metadata to individual attempts.
 
-    Sources, in preference order per field:
-    - elapsed_s: mr_summary attempts[].elapsed (agent-side runtime) when
-      present; else log-only inference from the wrapper's remaining-wall
-      markers: attempt i's remaining-at-launch is its `budget Xs` line
-      (UNLESS a split-aware cap line marks that budget as a cap, not
-      `remaining`), and remaining after the last attempt comes from the
-      `stop: remaining Xs < floor` or `winner-polish: Xs stranded` line.
-      elapsed_i = remaining_i - remaining_{i+1}. When neither source can
-      attribute an attempt, elapsed_s is None — NEVER fabricated, and
-      NEVER taken from the scorecard's whole-wrapper wall_time_seconds.
-    - budget_s: the `attempt N: budget Xs` log line (None without a log).
-    - fmax/status: mr_summary record first, else the `attempt N -> fmax=
-      ... status=...` log line.
+    For each field, prefer the restart summary over wrapper-log inference.
+    Infer elapsed time from consecutive remaining-wall markers only when the
+    launch budget represents remaining time rather than a split-aware cap.
 
-    Returns [{attempt, budget_s, elapsed_s, fmax, status, elapsed_source}]
-    sorted by attempt; elapsed_source is "summary", "log_delta" or None.
+    Leave elapsed time as `None` when neither source supports attribution;
+    never substitute whole-wrapper wall time. Parse budgets only from attempt
+    launch lines, and prefer summary values for frequency and status before log
+    values.
+
+    Return records sorted by attempt number with `attempt`, `budget_s`,
+    `elapsed_s`, `fmax`, `status`, and `elapsed_source`. The source is
+    `summary`, `log_delta`, or `None`.
     """
     text = harness_log_text or ""
     budgets = {int(m.group(1)): float(m.group(2))
@@ -156,8 +125,8 @@ def parse_attempt_wall(mr_summary: dict, harness_log_text: str) -> list[dict]:
 
 
 def draw_count(mr_summary: dict) -> int:
-    """Number of attempts actually LAUNCHED (len(attempts)) — the D4
-    metric: did the split let a second draw fire?"""
+    """Number of attempts actually LAUNCHED (len(attempts)) — the
+    --split-aware metric: did the split let a second draw fire?"""
     return len(mr_summary.get("attempts") or [])
 
 
@@ -176,20 +145,27 @@ def _chosen_fmax(mr_summary: dict) -> Optional[float]:
 
 def grade_pair(off_summary: dict, on_summary: dict, *,
                eps_mhz: float = NEVER_WORSE_EPS_MHZ) -> dict:
-    """Grade an OFF-baseline vs mechanism-ON pair (BEHAVIOR evidence only).
+    """Grade an OFF-baseline vs mechanism-ON pair (behavior evidence only).
 
-    - wall_reclaimed_s (D3): OFF total attempt wall minus ON total attempt
-      wall (per-attempt attribution, Pitfall 4) — positive when ON hands
-      wall back.
-    - attempts_delta (D4): ON draws minus OFF draws — positive when the
-      split let extra attempts fire.
+    - wall_reclaimed_s (wall handback): OFF total attempt wall minus ON
+      total attempt wall (per-attempt attribution) — positive when ON
+      hands wall back.
+    - attempts_delta (restart split): ON draws minus OFF draws — positive
+      when the split let extra attempts fire.
     - never_worse: ON's chosen fmax must stay above OFF's minus eps;
       the -eps boundary itself FAILS (ties break toward HARMFUL, the
       locked prefer-refusing bias).
-    - label: NEUTRAL when |delta| < MEANINGFUL_FMAX_DELTA_MHZ (S21
-      convention), HELPS at >= +0.5, HARMFUL at <= -0.5 or when ON lost
-      its output entirely.
+    - label: NEUTRAL when |delta| < MEANINGFUL_FMAX_DELTA_MHZ, HELPS at
+      >= +0.5, HARMFUL at <= -0.5 or when ON lost its output entirely.
     """
+    if not off_summary:
+        # An absent OFF summary is a failed baseline, not a baseline of
+        # None: the `off_fmax is None` branch below would grade every
+        # mechanism HELPS/never_worse off a run that never produced a
+        # number. Callers must skip grading instead.
+        raise ValueError("grade_pair: empty OFF summary — the baseline run "
+                         "produced no mr_summary, so there is nothing to "
+                         "grade against")
     off_fmax = _chosen_fmax(off_summary)
     on_fmax = _chosen_fmax(on_summary)
     off_wall = _attempt_wall_s(off_summary)
@@ -227,21 +203,18 @@ def grade_pair(off_summary: dict, on_summary: dict, *,
                              else None),
         "never_worse": never_worse,
         "label": label,
-        # T-04-03 mitigation: local DEBUG-WALL numbers are behavior
-        # evidence only; score claims come only from eval/AWS.
+        # Local DEBUG-WALL numbers are behavior evidence only; score
+        # claims come only from eval-parity runs.
         "evidence_scope": "BEHAVIOR_ONLY_LOCAL_DEBUG_WALL",
     }
 
 
-# ---------------------------------------------------------------------------
-# Variant matrix (kill switches from 04-01; make-var names pinned by tests
-# against Makefile:336-337's $(if $(SPLIT_AWARE),...) / $(if $(WALL_HANDBACK),
-# ...) threading).
-# ---------------------------------------------------------------------------
+# Variant matrix (make-var names pinned by tests against the Makefile's
+# $(if $(SPLIT_AWARE),...) / $(if $(WALL_HANDBACK),...) threading).
 VARIANTS = {
     "off": (),                                   # baseline, both flags off
-    "handback": ("WALL_HANDBACK=1",),            # D3 only
-    "split": ("SPLIT_AWARE=1",),                 # D4 only
+    "handback": ("WALL_HANDBACK=1",),            # wall handback only
+    "split": ("SPLIT_AWARE=1",),                 # restart split only
     "both": ("WALL_HANDBACK=1", "SPLIT_AWARE=1"),
 }
 
@@ -251,10 +224,8 @@ def variant_make_args(variant: str) -> list[str]:
     return list(VARIANTS[variant])
 
 
-# ---------------------------------------------------------------------------
 # Thin orchestration (__main__ only — no logic worth unit-testing with
 # Vivado mocked; parsing/grading above stays pure).
-# ---------------------------------------------------------------------------
 
 def run_variant(dcp: Path, variant: str, max_wall: int, repo: Path,
                 log_path: Path) -> tuple[dict, str]:
@@ -262,7 +233,7 @@ def run_variant(dcp: Path, variant: str, max_wall: int, repo: Path,
 
     The wrapper writes mr_summary_<stem>.json into repo/.planning_baseline/
     inside a bare try/except — the dir must EXIST or the summary is
-    silently dropped (multi_restart_optimize.py:500-504), so create it
+    silently dropped (the summary write in multi_restart_optimize.py), so create it
     first. Stdout+stderr are captured to log_path for the log-side
     attribution channel.
     """
@@ -295,8 +266,8 @@ def run_variant(dcp: Path, variant: str, max_wall: int, repo: Path,
 
 def evidence_row(design: str, variant: str, summary: dict,
                  log_text: str) -> str:
-    """One markdown evidence row: per-attempt attributed wall (Pitfall 4),
-    draw count, chosen fmax. BEHAVIOR evidence only."""
+    """One markdown evidence row: per-attempt attributed wall, draw count,
+    chosen fmax. Behavior evidence only."""
     rows = parse_attempt_wall(summary, log_text)
     per_attempt = "; ".join(
         f"a{r['attempt']}={r['elapsed_s']:.0f}s({r['elapsed_source']})"
@@ -337,22 +308,33 @@ def main(argv=None) -> int:
         row = evidence_row(design, variant, summary, log_text)
         print(f"[ab-wall] {row}", flush=True)
         lines.append(row)
+    graded_without_baseline = False
     if "off" in summaries:
-        for variant in a.variants:
-            if variant == "off" or not summaries[variant]:
-                continue
-            verdict = grade_pair(summaries["off"], summaries[variant])
-            print(f"[ab-wall] grade off-vs-{variant}: "
-                  f"{json.dumps(verdict)}", flush=True)
-            lines.append(f"<!-- grade off-vs-{variant}: "
-                         f"{json.dumps(verdict)} -->")
+        if not summaries["off"]:
+            # run_variant returns {} for an unreadable summary. Grading
+            # against it is worse than not grading: every mechanism would
+            # come out HELPS/never_worse on evidence that does not exist.
+            graded_without_baseline = True
+            msg = ("OFF baseline produced no mr_summary; grading skipped "
+                   "(no baseline to compare against)")
+            print(f"[ab-wall] ERROR: {msg}", flush=True)
+            lines.append(f"<!-- grade skipped: {msg} -->")
+        else:
+            for variant in a.variants:
+                if variant == "off" or not summaries[variant]:
+                    continue
+                verdict = grade_pair(summaries["off"], summaries[variant])
+                print(f"[ab-wall] grade off-vs-{variant}: "
+                      f"{json.dumps(verdict)}", flush=True)
+                lines.append(f"<!-- grade off-vs-{variant}: "
+                             f"{json.dumps(verdict)} -->")
     if a.out is not None:
         if a.out.is_dir():
             a.out = a.out / f"ab_evidence_{design}.md"
         with a.out.open("a") as fh:
             fh.write(header + "\n".join(lines) + "\n")
         print(f"[ab-wall] evidence appended -> {a.out}", flush=True)
-    return 0
+    return 1 if graded_without_baseline else 0
 
 
 if __name__ == "__main__":

@@ -1,9 +1,0 @@
-{
-  "input": "/mnt/d/fpl26_optimization_contest/t5_cells/vexriscv_replace__sigterm__20260720_235145/vexriscv_re-place_2025.1.dcp",
-  "final_output": "/mnt/d/fpl26_optimization_contest/t5_cells/vexriscv_replace__sigterm__20260720_235145/vexriscv_re-place_2025.1_optimized.dcp",
-  "attempts": [],
-  "chosen": null,
-  "total_wall": 900.0,
-  "llm_cost_total": 0.0,
-  "cost_ceiling": 0.8
-}

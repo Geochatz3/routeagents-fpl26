@@ -1,22 +1,12 @@
-"""Unit tests for scripts/ab_wall_economics (04-02 Task 1, R-AB).
+"""Test wall-time attribution, draw counting, and paired-run grading.
 
-Per-attempt wall attribution (Pitfall 4/5) + draw count + A/B pair grading.
-
-Fixtures are REAL captured evidence:
-- `[multi-restart]` log excerpts copied VERBATIM from the official beta
-  harness logs (final_round/beta_final_results/logs_x/*.harness.log,
-  eval 2026-07-14) and the AWS boom leg (final_round/aws_boom_leg_jul19/
-  results/boomleg_run.log, 2026-07-19).
-- mr_summary dicts are schema-exact to the writer in
-  scripts/multi_restart_optimize.py::run() ({input, final_output,
-  attempts[{i, fmax, status, cost, elapsed, output, exists, run_dir}],
-  chosen, total_wall}), populated with the values evidenced by those same
-  real logs. (The beta eval box's .planning_baseline/mr_summary_*.json
-  files were never retrieved — only logs + scorecard.json came home — so
-  the dict half of each fixture is reconstructed to the exact schema.)
+Fixtures preserve the summary schema written by the multi-restart optimizer,
+including attempt timing, status, cost, output, and selection fields.
 """
 import os
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.ab_wall_economics import (  # noqa: E402
@@ -27,11 +17,8 @@ from scripts.ab_wall_economics import (  # noqa: E402
     variant_make_args,
 )
 
-# ---------------------------------------------------------------------------
-# REAL fixture: amd_mini-isp beta harness log (the ONLY beta design where
-# attempt 2 fired). Verbatim lines 3, 1689-1691, 2163-2168 of
-# final_round/beta_final_results/logs_x/amd_mini-isp_2025.1.harness.log.
-# ---------------------------------------------------------------------------
+# Fixture for a wrapper log in which the second attempt runs.
+# It preserves the line structure consumed by the attribution parser.
 MINI_ISP_LOG = """\
 [multi-restart] attempt 1: budget 3500s -> /tmp/mr_input_3540_1.dcp
 [multi-restart] attempt 1 -> fmax=404.20371867421176 status=VALID_OPTIMIZED cost=$0.0 cum_cost=$0.00 exists=True
@@ -45,17 +32,14 @@ MINI_ISP_LOG = """\
 [multi-restart] polish: POLISH_VERDICT=NO_GAIN
 """
 
-# Official scorecard.json wall_time_seconds for amd_mini-isp — the WHOLE
-# wrapper process (attempt 1 + attempt 2 + winner_polish + setup). Pitfall 4:
-# per-attempt attribution must NEVER equal / be sourced from this number.
+# Total wrapper wall time includes all attempts, winner polish, and setup.
+# Per-attempt attribution must not use this aggregate value.
 MINI_ISP_SCORECARD_WALL_S = 2058.17
 MINI_ISP_FMAX = 404.20371867421176
 
-# Schema-exact mr_summary (writer: multi_restart_optimize.py::run()).
-# elapsed = agent-side total_runtime_seconds (token_usage.json), which is
-# systematically SMALLER than the wrapper's budget-delta (excludes make/
-# subprocess overhead) — the fixture uses realistic values just under the
-# real budget deltas (3500-2285=1215s, 2285-1488=797s).
+# The fixture matches the run-summary schema.
+# `elapsed` is agent runtime in seconds and excludes wrapper setup and
+# subprocess overhead, so it remains below budget-delta wall time.
 MINI_ISP_MR_SUMMARY = {
     "input": "/tmp/mr_input.dcp",
     "final_output": "/tmp/fpl26contest-validation/benchmarks/amd_mini-isp_2025.1/input_optimized.dcp",
@@ -75,11 +59,7 @@ MINI_ISP_MR_SUMMARY = {
     "total_wall": 3500.0,
 }
 
-# ---------------------------------------------------------------------------
-# REAL fixture: boom_soc_2025.1_v2 beta harness log — attempt 2 never fired
-# (floor gate). Verbatim lines 3, 321-324 of
-# final_round/beta_final_results/logs_x/boom_soc_2025.1_v2.harness.log.
-# ---------------------------------------------------------------------------
+# Fixture for a wrapper log in which the floor gate suppresses attempt 2.
 BOOM_BETA_LOG = """\
 [multi-restart] attempt 1: budget 3500s -> /tmp/mr_input_148356_1.dcp
 [multi-restart] attempt 1 -> fmax=77.15454054471107 status=VALID_FALLBACK_BASELINE cost=$0.06782515 cum_cost=$0.07 exists=True
@@ -88,26 +68,19 @@ BOOM_BETA_LOG = """\
 [multi-restart] BEST = attempt 1 fmax=77.15454054471107 -> /tmp/fpl26contest-validation/benchmarks/boom_soc_2025.1_v2/input_optimized.dcp
 """
 
-# ---------------------------------------------------------------------------
-# REAL fixture: boom leg 1 (AWS, 2026-07-19) — TWO attempts, second one a
-# fallback draw. Verbatim lines 3, 322-324, 615-618 of
-# final_round/aws_boom_leg_jul19/results/boomleg_run.log.
-# ---------------------------------------------------------------------------
 BOOMLEG_LOG = """\
 [multi-restart] attempt 1: budget 3500s -> /tmp/mr_boom_soc_2025.1_v2_4082_1.dcp
 [multi-restart] attempt 1 -> fmax=79.91688643810436 status=VALID_OPTIMIZED cost=$0.061444 cum_cost=$0.06 exists=True
-[multi-restart] refreshed scored output (attempt 1, fmax=79.91688643810436) -> /home/ubuntu/harness/fpl26_optimization_contest/fpl26_contest_benchmarks/boom_soc_2025.1_v2_optimized.dcp
+[multi-restart] refreshed scored output (attempt 1, fmax=79.91688643810436) -> /tmp/fpl26contest-validation/benchmarks/boom_soc_2025.1_v2_optimized.dcp
 [multi-restart] attempt 2: budget 1542s -> /tmp/mr_boom_soc_2025.1_v2_4082_2.dcp
 [multi-restart] attempt 2 -> fmax=77.15454054471107 status=VALID_FALLBACK_BASELINE cost=$0.04087455 cum_cost=$0.10 exists=True
-[multi-restart] refreshed scored output (attempt 1, fmax=79.91688643810436) -> /home/ubuntu/harness/fpl26_optimization_contest/fpl26_contest_benchmarks/boom_soc_2025.1_v2_optimized.dcp
+[multi-restart] refreshed scored output (attempt 1, fmax=79.91688643810436) -> /tmp/fpl26contest-validation/benchmarks/boom_soc_2025.1_v2_optimized.dcp
 [multi-restart] stop: remaining 287s < floor 1200s
-[multi-restart] BEST = attempt 1 fmax=79.91688643810436 -> /home/ubuntu/harness/fpl26_optimization_contest/fpl26_contest_benchmarks/boom_soc_2025.1_v2_optimized.dcp
+[multi-restart] BEST = attempt 1 fmax=79.91688643810436 -> /tmp/fpl26contest-validation/benchmarks/boom_soc_2025.1_v2_optimized.dcp
 """
 
-# Format-exact split-aware cap lines (print sites:
-# multi_restart_optimize.py:438-440 + 445). When attempt 1 is capped its
-# budget line is the CAP, not `remaining` — budget-delta inference is
-# invalid for that attempt (would yield garbage like 1800-1650=150s).
+# A split-aware cap replaces the normal remaining-budget value.
+# Budget-delta inference is therefore invalid for capped attempts.
 SPLIT_CAP_LOG = """\
 [multi-restart] split-aware: attempt 1 capped to 1800s (size class small; D4 restart split)
 [multi-restart] attempt 1: budget 1800s -> /tmp/mr_x_1.dcp
@@ -172,10 +145,8 @@ class TestParseAttemptWall:
             assert elapsed, "attribution produced no per-attempt wall"
             for e in elapsed:
                 assert abs(e - MINI_ISP_SCORECARD_WALL_S) > 500.0
-            # The SUM of attributed attempts sits below the whole-wrapper
-            # number by exactly the setup + winner-polish overhead (real
-            # gap: 2058.17 - (1215+797) = 46.17s) — close but never equal;
-            # Pitfall 5 reconciliation is this overhead, not noise.
+            # Attributed attempt time excludes wrapper setup and winner-polish
+            # overhead, so its sum remains below total wrapper wall time.
             assert abs(sum(elapsed) - MINI_ISP_SCORECARD_WALL_S) > 10.0
 
     def test_split_cap_invalidates_budget_delta(self):
@@ -232,7 +203,7 @@ class TestGradePair:
         assert v["fmax_delta_mhz"] == 0.0
 
     def test_s21_sub_threshold_delta_is_neutral(self):
-        # Real S21 vtr_mcml pair: A 65.57 / B 65.32 -> |d|=0.25 < 0.5.
+        # A 0.25 MHz paired delta is below the 0.5 MHz meaningful-change threshold.
         v = grade_pair(_mk_summary(65.57), _mk_summary(65.32))
         assert v["label"] == "NEUTRAL"
         assert v["never_worse"] is True
@@ -280,10 +251,55 @@ class TestGradePair:
         v = grade_pair(_mk_summary(100.0), _mk_summary(100.0))
         assert "BEHAVIOR" in v["evidence_scope"]
 
+    def test_empty_off_summary_refuses_to_grade(self):
+        # run_variant returns {} when the OFF run left no readable
+        # mr_summary. Falling through to the `off_fmax is None` branch
+        # would label every mechanism HELPS/never_worse on no evidence.
+        with pytest.raises(ValueError, match="empty OFF summary"):
+            grade_pair({}, _mk_summary(100.0))
+
+    def test_off_that_ran_but_produced_no_fmax_still_grades(self):
+        # A real OFF run that found no usable fmax is a genuine ON win --
+        # that branch stays.
+        v = grade_pair(_mk_summary(None), _mk_summary(100.0))
+        assert v["label"] == "HELPS"
+        assert v["never_worse"] is True
+
+
+class TestFailedBaselineSkipsGrading:
+    """main() must not emit a verdict when the OFF baseline never ran."""
+
+    def _run(self, tmp_path, monkeypatch, off_summary):
+        import scripts.ab_wall_economics as abw
+
+        def fake_run_variant(dcp, variant, max_wall, repo, log_path):
+            summary = off_summary if variant == "off" else _mk_summary(100.0)
+            return summary, ""
+
+        monkeypatch.setattr(abw, "run_variant", fake_run_variant)
+        out = tmp_path / "evidence.md"
+        rc = abw.main([str(tmp_path / "design.dcp"),
+                       "--variants", "off", "split",
+                       "--out", str(out)])
+        return rc, out.read_text()
+
+    def test_empty_off_summary_writes_no_verdict(self, tmp_path, monkeypatch):
+        rc, text = self._run(tmp_path, monkeypatch, {})
+        assert rc == 1
+        assert "grade skipped" in text
+        assert "HELPS" not in text
+        assert "never_worse" not in text
+
+    def test_readable_off_summary_still_grades(self, tmp_path, monkeypatch):
+        rc, text = self._run(tmp_path, monkeypatch, _mk_summary(100.0))
+        assert rc == 0
+        assert "grade off-vs-split" in text
+        assert "grade skipped" not in text
+
 
 class TestVariantMatrix:
     def test_make_var_spelling(self):
-        # Pin the exact make-variable names threaded by Makefile:336-337.
+        # Pin the exact make-variable names the ship targets thread.
         assert variant_make_args("off") == []
         assert variant_make_args("handback") == ["WALL_HANDBACK=1"]
         assert variant_make_args("split") == ["SPLIT_AWARE=1"]

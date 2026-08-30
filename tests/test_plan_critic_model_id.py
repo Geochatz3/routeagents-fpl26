@@ -1,20 +1,9 @@
-"""The PLAN CRITIC's model ID must be one the API actually accepts.
+"""Test that the plan critic derives its default model identifier from the
+exercised fallback model.
 
-aug02: `FPL26_PLAN_CRITIC` had been a silent no-op for its entire life. The
-default model was hardcoded to "google/gemini-3.1-flash", which is NOT a valid
-OpenRouter model ID. Every call returned HTTP 400; the module fails open by
-design, so the run continued and the log said only
-
-    plan-critic: call failed (BadRequestError ... 'is not a valid model ID')
-
-That is why the flag shows 0 usable rows across 209 corpus runs AND a dedicated
-6-row A/B: the A/B armed it, it tried 5+ times per run, and every call died.
-
-A model ID cannot be validated offline, so these tests pin the STRUCTURE that
-makes it wrong-by-construction to drift again: the critic's default is DERIVED
-from FALLBACK_MODEL, which the resilience path already exercises against the live
-API, so a bad ID would break the fallback long before it silently broke a critic
-that fails open.
+Model identifiers cannot be validated offline, and critic failures are
+intentionally non-fatal. Sharing the fallback identifier prevents an invalid
+default from silently disabling the critic.
 """
 import re
 import sys
@@ -25,8 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import dcp_optimizer  # noqa: E402
+from tests.source_corpus import dcp_source_lines, dcp_source_text
 
-KNOWN_BAD = "google/gemini-3.1-flash"   # 400s on OpenRouter, verified aug02
+KNOWN_BAD = "google/gemini-3.1-flash"   # 400s on OpenRouter, verified
 
 
 class PlanCriticModelId(unittest.TestCase):
@@ -41,7 +31,7 @@ class PlanCriticModelId(unittest.TestCase):
 
     def test_no_bare_bad_literal_in_code(self):
         """The string may appear in a comment explaining the bug, never in code."""
-        src = (ROOT / "dcp_optimizer.py").read_text().splitlines()
+        src = dcp_source_lines()
         offenders = [
             (i + 1, ln.strip())
             for i, ln in enumerate(src)

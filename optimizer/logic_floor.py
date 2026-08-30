@@ -1,37 +1,21 @@
-"""Logic-floor attestation (v5.5) — the physics termination predicate.
+"""Detect when timing is limited by immutable logic and optimization should stop.
 
-WHY (mechanism, k3 seat aug09): achieved period = logic (frozen by the
-netlist and the silicon) + net (placement-dependent) + uncertainty − skew.
-When the worst paths are measurably at that state — logic-dominated, net at
-the per-hop routing floor, the residual harvestable bound small — no
-placement/route/phys_opt move can pay for the wall it costs, so the run
-should finalize immediately. The 16-design STOP-honor census (aug09) shows
-why this must be a PHYSICS predicate and not a timer: the timer signal loses
-on 10/16 designs (digit tail +54 alpha, vexriscv +42.9) because their
-mid-run paths are net/congestion-dominated; this predicate refuses there by
-construction.
+Achieved period combines netlist- and silicon-fixed logic delay with
+placement-dependent net delay, uncertainty, and skew. Attestation requires
+logic-dominated critical paths, routing near its per-hop floor, and little
+residual harvestable gain. This physics-based test does not fire on net- or
+congestion-dominated paths that remain improvable.
 
-SCOPE: evaluated ONLY after the B3 small-floor sibling was ADOPTED. Since
-v5.5.3 the B3 funnel is gated by affordability (cost cap 550s) plus the
-PHYSICS admission below — not the removed 85s wall-clock pr cap. Every
-guard failure is NO-FIRE: the run falls through to normal v5.4.2 behavior.
+Evaluation occurs only after the small-floor result is adopted and its
+affordability and admission checks pass. Any failed or missing guard yields no
+attestation.
 
-Thresholds (k3, fixed — an EV*probability form was rejected as
-unidentifiable from n=1):
-  - bound_alpha <= 10.0 MHz over the top-32 setup paths, net floor 45 ps/hop
-    (mini-ISP's own 3-router-converged routing measures 51.4 ps/hop at zero
-    congestion; 45 sits 12% below anything achieved => the bound
-    OVER-estimates harvestable alpha, the fail-safe direction).
-    mini-ISP: 7.83 MHz (28% margin). corescore-class mid-run: >= 14.5 (1.45x)
-    — and corescore can never reach this predicate (B3 does not arm there).
-  - worst-path logic fraction >= 0.80 (mini-ISP 84.2%).
-  - hard-macro share of the worst path's logic delay >= 0.50: 84% logic in a
-    LUT chain is retimeable and ILS would earn there — only DSP/BRAM/URAM
-    internal delay is unbreakable. mini-ISP's 1.911 ns is DSP-internal.
-  - two-independent-solve agreement: |wns_B1 − wns_B3| <= 0.08 ns (the live
-    analog of the 3-router convergence; geometry alone must not attest).
-  - coverage: the 32nd path's slack >= WNS + 0.100 ns, else the near-critical
-    population is too large to attest from a 32-path window.
+Fixed admission thresholds are:
+- At most 10 MHz of harvestable gain across the top 32 setup paths, using a 45 ps per-hop net floor that conservatively overestimates available gain.
+- A worst-path logic-delay fraction of at least 0.80.
+- At least 0.50 of worst-path logic delay inside DSP, block RAM, or URAM macros; LUT-chain delay remains optimizable.
+- Agreement between two independent solves within 0.08 ns.
+- The 32nd path's slack at least 0.100 ns above WNS, ensuring adequate coverage of the near-critical population.
 """
 from __future__ import annotations
 
@@ -47,17 +31,12 @@ LOGIC_FLOOR_NET_FLOOR_NS_PER_HOP = 0.045
 LOGIC_FLOOR_COVERAGE_MARGIN_NS = 0.100
 LOGIC_FLOOR_NPATHS = 32
 
-# One Tcl call, emitting one LFPATH line per path plus LFMETA. Every value
-# the python side needs is printed explicitly; any missing/garbled line is a
-# parse miss => NO-FIRE.
-# ONE LINE, semicolon-joined — the vivado_run_tcl transport sendline/expects a
-# single prompt; a multi-line payload returns at the first embedded newline
-# and leaves the remaining commands' prompts in the pexpect buffer, desyncing
-# every subsequent call (v5.5 review-1 BLOCKER 1). Cell classification uses
-# the RESOURCE TYPE token that precedes the (Prop_...) arc name — real 2025.1
-# grammar is `LUT3 (Prop_A6LUT_SLICEL_I2_O)` / `DSP_ALU (Prop_DSP_ALU_...)`
-# with the Incr/Path numbers on the FOLLOWING line (\s crosses the newline)
-# (review-1 BLOCKER 2, fixed against captured real report text).
+# Emit one LFPATH record per path and one LFMETA record in a single Tcl call.
+# Missing or malformed records make the check decline rather than infer data.
+# The transport requires one semicolon-joined line; embedded newlines return
+# early and leave prompts buffered, desynchronizing later calls.
+# Resource types precede Prop_* arc names, while delay values follow on the
+# next line, so the parser pattern must span that newline.
 LOGIC_FLOOR_TCL = (
     'set lf_clk [get_clocks -quiet {%CLK%}]; '
     'if {[llength $lf_clk] == 0} { set lf_clk [lindex [get_clocks] 0] }; '
@@ -89,7 +68,7 @@ LOGIC_FLOOR_TCL = (
 
 def _tool_error_text(resp_text: str) -> bool:
     """True iff the tool response looks like a failure, matched against the
-    REAL error grammar this codebase documents (r2 finding F1: a bare
+    REAL error grammar this codebase documents (a bare
     case-sensitive "Error" substring matches none of it): JSON '{"error"...}',
     'TCL ERROR:', 'ERROR: [Common 17-...', 'ERROR: [Vivado ...', and the
     transport's 'Error: Command timed out'. 'error:' is matched
@@ -167,28 +146,16 @@ def evaluate_logic_floor(
             False, f"coverage: only {len(paths)}/{npaths_requested} paths "
                    f"parsed (fail-safe)")
     wns = paths[0].slack
-    # Consistency guard (review-1 finding 7): the measured worst slack must
-    # BE the B3 value we are attesting — a wrong-group or stale-timing read
-    # must never attest silently.
+    # Consistency guard: the measured worst slack must BE the B3 value being
+    # attested. A wrong-group or stale-timing read must never attest silently.
     if abs(wns - wns_b3) > 0.010:
         return LogicFloorVerdict(
             False, f"worst-path slack {wns:.3f} disagrees with B3 "
                    f"{wns_b3:.3f} (wrong group / stale timing — fail-safe)")
-    # TRUNCATED-WINDOW TREATMENT (v5.5.2, decided on the live box6
-    # measurement): the original plan FAILED when path[N-1] sat within 100ps
-    # of WNS ("population too large to attest"). Measured reality on the
-    # lever's own design: mini-ISP's top-32 are ALL within 16 mils of WNS
-    # (the DSP family is wide), yet every path bounds at -0.805 +/- 0.001 —
-    # the old gate no-fired on the exact state it exists for. And the fear
-    # was directionally wrong: an UNSEEN path has slack >= paths[-1].slack,
-    # and bound_i >= slack_i always, so unseen paths can only DRAG the
-    # achievable WNS DOWN (less harvest), never above the window's min
-    # bound. The window min-bound therefore remains an OVER-estimate of
-    # harvestable alpha — exactly what a <=10 MHz fire test needs. The
-    # dense-window FAIL is removed; the short-parse FAIL above stays (a
-    # window we could not even read is still distrusted).
-    # min-over-window bound: slack each path could reach if its net delay
-    # were driven to hops * 45ps (an over-estimate of harvestable gain).
+    # A truncated timing window remains conservative because unseen paths have
+    # slack no worse than the last reported path, while each computed bound
+    # overestimates achievable slack. An incomplete parse still refuses the check.
+    # The per-path net-delay floor is 45 ps per hop.
     bound_slack = None
     for p in paths:
         b = p.slack + max(
@@ -238,21 +205,14 @@ async def run_logic_floor_attestation(
     recover_dcp: Optional[str] = None,
     timeout_s: float = 120.0,
 ) -> LogicFloorVerdict:
-    """One Tcl round-trip + the pure evaluation. Never raises: any tool
-    error/timeout/parse failure is NO-FIRE.
+    """Runs the logic-floor attestation and returns a fail-closed result.
 
-    routed=True is supplied to the evaluator BY CONTRACT: the caller invokes
-    this only on a state the B3 adoption gate just measured fully routed
-    (unrouted==0 + hold), and nothing runs in the session between adoption
-    and this call. (The Tcl-side route check was dropped in v5.5.1 — the
-    naive `*fully routed*` match hits report_route_status's label line
-    regardless of errors, review-1 finding 4.)
-
-    Recovery (review-1 finding 5): if the Tcl did not complete — timeout or
-    a transport desync — the session may hold a wedged command or stale
-    buffered output that would poison the NEXT tool calls. Best-effort:
-    restart Vivado and reopen the banked candidate (recover_dcp) so the
-    session again holds exactly the state downstream stages expect.
+    Tool errors, timeouts, and parse failures do not fire the attestation and
+    never propagate. The evaluator receives `routed=True` because this runs
+    immediately after the adoption gate verifies a fully routed state, with no
+    intervening session operations. If Tcl does not complete, the function
+    restarts the tool and best-effort reopens `recover_dcp` so downstream
+    stages see the expected banked state.
     """
     incomplete = False
     try:
@@ -295,56 +255,23 @@ async def run_logic_floor_attestation(
                     f"wedge handling.")
 
 
-# ---------------------------------------------------------------------------
-# v5.5.3 — B3 ADMISSION by physics (replaces the wall-clock anchor-class cap)
-#
-# WHY (AWS eval-parity, aug10): the 85s measured-pr cap was calibrated on the
-# dev-cloud boxes (mini-ISP MEASURED 75-78s across every archived draw
-# jul26→aug08; vexriscv 92-97s). On the CONTEST instance (m7a.2xlarge) the
-# same probes measure mini-ISP 145s (~1.9x the dev measurement) and vexriscv
-# 130s — the separation INVERTS, so no wall-clock cap can admit the
-# floor-bound design and refuse the re-place design on the hardware that
-# scores. Wall time is a property of the box; the class we mean is a
-# property of the DESIGN. The admission therefore asks the design directly:
-# are the B1 solve's worst paths already hard-macro-dominated and near the
-# structural floor? mini-ISP at B1 (-0.904, measured IDENTICALLY on dev and
-# AWS): logic 84%, macro ~0.94+, bound ~7.5 MHz => ADMIT (any hardware).
-# vexriscv at B1 (-0.785, LUT re-place fabric): macro << 0.50 => REFUSE
-# (any hardware). Fail-closed everywhere: a refusal is exactly the
-# pre-v5.5.3 decline path.
-#
-# Thresholds are RELAXED vs the exit attestation (B1 sits ~54ps above the
-# B3 floor, so its harvestable bound is larger) but keep the same fail-safe
-# direction: bound over-estimates harvest; macro/logic ask for the same
-# structural dominance the exit test proves at the floor.
-# BOUND THRESHOLD 18 (corrected by the AWS gate's own first measurement,
-# aug10 04:26Z): the original 12 was derived from the FLOOR-state path shape
-# (bound ~7.5 MHz), but at B1 the design sits ~54ps ABOVE its floor and the
-# harvest B3 itself recovers is part of the B1 bound — the aug10 AWS gate
-# measured bound_alpha = 14.38 MHz at B1 (logic 0.828, macro 0.974,
-# wns -0.904, the predicted values) and correctly-but-wrongly refused.
-# 18 = measured 14.38 + ~25% margin; with the window min-bound fixed at the
-# measured -0.819, admission holds for B1 draws down to ~-0.925 (-0.904 ->
-# 14.38, -0.92 -> 16.98; -0.93 -> 18.6 REFUSES). The EXIT attestation
-# (<=10 MHz at the floor) is unchanged and still solely decides termination;
-# an over-admitted design costs one MUX-protected B3 leg (acknowledged R3).
-# ---------------------------------------------------------------------------
+# Admit the later optimization stage from path physics rather than wall time,
+# which depends on the host. Admission requires hard-macro-dominated paths
+# whose estimated remaining timing gain is near the structural floor.
+# The gain bound is deliberately optimistic, so uncertainty causes refusal.
+# The 18 MHz limit allows the expected pre-floor gap; the logic and macro
+# fractions enforce structural dominance, and 16 paths provide minimum coverage.
+# Over-admission costs one protected optimization leg; exit attestation remains
+# the sole authority for terminating at the floor.
 LOGIC_FLOOR_B1_MAX_BOUND_ALPHA_MHZ = 18.0
 LOGIC_FLOOR_B1_MIN_LOGIC_FRAC = 0.70
 LOGIC_FLOOR_B1_MIN_MACRO_FRAC = 0.50
 LOGIC_FLOOR_B1_MIN_NPATHS = 16
-# Coverage floor is 16 (vs the exit test's strict 32): the admission only
-# needs the WINDOW MINIMUM bound, and dropping parsed paths can only
-# raise bound_slack => raise bound_alpha => make admission HARDER (the
-# fail-safe direction); the exit test keeps 32 because it terminates the
-# run. A garbled worst line additionally trips the wrong-state sanity
-# check against the banked WNS. (r2 finding F5 documentation.)
-# Wrong-state guard: the session's worst slack must be NEAR the banked value
-# (B2 may have left a slightly different-but-equivalent solve open; 0.10 ns
-# tolerates that while still refusing to attest an unrelated design state).
-# On a wrong-state refusal the ASYNC wrapper reopens the banked candidate
-# (a known fully-routed artifact) and re-attests ONCE — so B2 drift can
-# never silently disarm the admission on its target design (r1 finding 4).
+# Admission accepts 16 parsed paths because omitted paths can only make its
+# gain estimate larger and therefore make admission harder. Exit attestation
+# still requires 32 paths because it can terminate the run.
+# The open session's worst slack must be within 0.10 ns of the banked value.
+# On mismatch, the async wrapper reopens the banked candidate and retries once.
 LOGIC_FLOOR_B1_WORST_SANITY_NS = 0.10
 _B1_WRONG_STATE_MARK = "wrong state"
 
@@ -355,14 +282,13 @@ def evaluate_b1_admission(
     period_ns: float,
     wns_banked: Optional[float],
 ) -> LogicFloorVerdict:
-    """Pure B3-admission core. fire == ADMIT. Every failure => REFUSE.
+    """Evaluates admission and returns either admit or refuse.
 
-    State integrity contract (r1 finding 3 — no false 'routed' claim): this
-    core cannot see route status. Integrity is enforced by (a) the
-    worst-slack sanity window against the BANKED measured value, (b) the
-    coverage minimum, and (c) the async wrapper's reopen-banked-and-reattest
-    path, which attests the banked artifact itself — a state the B3
-    adoption gate measured fully routed before writing."""
+    Every failed check produces refusal. The evaluator cannot inspect route
+    status directly, so state integrity depends on the worst-slack sanity
+    window against the banked measurement, minimum coverage, and the wrapper
+    reopening and reattesting the banked routed artifact.
+    """
     if wns_banked is None:
         return LogicFloorVerdict(False, "no banked WNS to sanity-check "
                                         "against (fail closed)")
@@ -423,19 +349,15 @@ async def run_b1_admission_attestation(
     recover_dcp: Optional[str] = None,
     timeout_s: float = 120.0,
 ) -> LogicFloorVerdict:
-    """Tcl round-trip(s) + evaluate_b1_admission. Never raises; any tool
-    error/timeout/parse failure REFUSES admission (pre-v5.5.3 behavior).
+    """Runs tool-backed admission attestation and returns a fail-closed decision.
 
-    WRONG-STATE RECOVERY (r1 finding 4): if the first attestation refuses
-    because the session's worst slack is not the banked value (B2 left a
-    drifted solve open), reopen the BANKED candidate (recover_dcp — a state
-    the adoption gate measured fully routed before writing) and re-attest
-    ONCE. B2 drift therefore cannot silently disarm the admission; only a
-    genuinely non-floor-class design (or a tool failure) refuses.
-
-    Wedge-recovery contract on an incomplete Tcl matches
-    run_logic_floor_attestation: restart Vivado, best-effort reopen the
-    banked candidate so downstream stages see the state they expect."""
+    Tool errors, timeouts, and parse failures refuse admission and never
+    propagate. If the first attestation finds worst slack inconsistent with the
+    banked value, the function reopens `recover_dcp` and reattests once to
+    eliminate session drift. If Tcl does not complete, it restarts the tool and
+    best-effort reopens the banked candidate so downstream stages see the
+    expected state.
+    """
     incomplete = False
 
     async def _attest_once() -> LogicFloorVerdict:

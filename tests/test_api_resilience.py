@@ -1,16 +1,8 @@
-"""Unit tests for R-D2-1 / R-D2-4 API resilience.
+"""Test API error classification and deadline-aware backoff scheduling.
 
-Part 1 (this file, pure): optimizer.api_resilience — the error classifier
-and the deadline-aware backoff scheduler.  Pure functions, no live
-optimizer, no clock, NO real sleeps (test_recipe_router.py style).
-
-Evidence the classification pins down (02-CONTEXT.md, two live repros):
-- official eval mini-isp 2026-07-14 18:09:02 — key-level 401 storm
-  (openai.AuthenticationError, body {'error': {'message': 'User not
-  found.', 'code': 401}}) was misclassified as MODEL-unavailable and
-  spuriously pinned the fallback model for the rest of the run;
-- local boom_debugwall_run1 2026-07-19 18:53:02 — same shape, key never
-  recovered, run finalized baseline in 9 min.
+The tests use pure functions without network access, optimizer execution, clock
+advancement, or real sleeps. Authentication failures remain key-level errors
+and must not trigger model-unavailable fallback behavior.
 """
 from __future__ import annotations
 
@@ -38,15 +30,12 @@ from dcp_optimizer import (
 )
 
 
-# ---------------------------------------------------------------------------
 # classify_api_error — precedence: prompt_limit → key_auth → transient →
 # model_unavailable → other
-# ---------------------------------------------------------------------------
 
 class ClassifyApiErrorTests(unittest.TestCase):
 
     def test_key_auth_user_not_found_401(self):
-        # The exact eval-log shape (mini-isp 18:09:02).
         self.assertEqual(
             classify_api_error(
                 "AuthenticationError: Error code: 401 - {'error': "
@@ -75,10 +64,8 @@ class ClassifyApiErrorTests(unittest.TestCase):
             "key_auth")
 
     def test_ordering_guard_user_not_found_is_key_auth(self):
-        # "user not found" CONTAINS the substring "not found" which is a
-        # model_unavailable signature — the key_auth check must run FIRST
-        # so a key-level outage can never masquerade as a model-404
-        # (T-02-02; this is the exact eval misclassification).
+        # Key-auth classification must precede the broader "not found"
+        # model-unavailable check to avoid misclassifying account errors.
         self.assertEqual(classify_api_error("User not found."), "key_auth")
 
     def test_model_unavailable_404(self):
@@ -126,9 +113,7 @@ class ClassifyApiErrorTests(unittest.TestCase):
             classify_api_error("invalid request: bad tool schema"), "other")
 
 
-# ---------------------------------------------------------------------------
 # compute_backoff_sleep — schedule, saturation, episode cap, deadline clamp
-# ---------------------------------------------------------------------------
 
 class ComputeBackoffSleepTests(unittest.TestCase):
 
@@ -191,14 +176,9 @@ class ComputeBackoffSleepTests(unittest.TestCase):
                 self.assertGreaterEqual(v, 0.0)
 
 
-# ---------------------------------------------------------------------------
-# Part 2 (call path): _create_completion_with_fallback with the R-D2-1/
-# R-D2-4 resilience wired in.  _make_optimizer/_FakeSession pattern from
-# tests/test_budget_enforcement.py, adapted: we monkeypatch opt._chat_create
-# with a scripted stand-in and opt._backoff_sleep with a no-op recorder —
-# NO network, NO real sleeps.  _budget_deadline is driven directly to
-# control _budget_remaining() (mocked clock).
-# ---------------------------------------------------------------------------
+# These tests script the API boundary and replace backoff sleeps with a
+# recorder. A controlled deadline drives budget calculations without
+# network access or real delays.
 
 _AUTH_401 = ("Error code: 401 - {'error': {'message': 'User not found.', "
              "'code': 401}}")
@@ -316,10 +296,9 @@ class ResilienceCallPathTests(unittest.TestCase):
         self.assertEqual(self.sleeps, [15.0, 30.0])
 
     def test_key_auth_never_pins_fallback_cap_then_propagate(self):
-        # A key-level storm NEVER trips the transient pin escape.  The
-        # full schedule runs (15+30+60+120+240 = 465s), then the saturated
-        # next step would blow the 600s episode cap -> propagate to the
-        # LLM-dead path (T-02-03).
+        # Key-auth failures exhaust the retry schedule without triggering the
+        # transient-model escape. Once the episode cap admits no further
+        # delay, the error propagates to the API-dead path.
         chat = _AlwaysFail(_AUTH_401)
         self.opt._chat_create = chat
         with self.assertRaises(Exception):
@@ -330,11 +309,9 @@ class ResilienceCallPathTests(unittest.TestCase):
         self.assertEqual(self.opt._consecutive_transient_failures, 0)
 
     def test_deadline_aware_single_clamped_sleep_then_propagate(self):
-        # With remaining budget just above the finalize guard (60s), the
-        # first sleep is clamped to the positive remainder (~5s); after it
-        # 'elapses' (mocked clock: the recorder consumes the deadline) no
-        # room is left -> compute_backoff_sleep returns None -> propagate.
-        # The finalize path always survives (T-02-01).
+        # With 65 s left, backoff may consume only the roughly 5 s above the
+        # 60 s finalization reserve. Further backoff then fails closed and
+        # propagates, preserving the reserve for finalization.
         self.opt._budget_deadline = _time.time() + 65.0
 
         def rec(d):
@@ -351,7 +328,7 @@ class ResilienceCallPathTests(unittest.TestCase):
         self.assertEqual(self.opt.model, DEFAULT_MODEL)
 
     def test_prompt_limit_402_path_unchanged(self):
-        # 402 prompt-cap handling (prompt guard, jul03) never enters
+        # 402 prompt-cap handling (the prompt guard) never enters
         # backoff: prune-and-retry as before.
         chat = _ScriptedChat([Exception(_PROMPT_402), {"ok": DEFAULT_MODEL}])
         self.opt._chat_create = chat

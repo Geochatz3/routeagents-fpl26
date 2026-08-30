@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "RouteAgents: a measured playbook for post-route FPGA timing optimization (FPL'26 contest submission)"
+authors:
+  - family-names: "Chatzitsompanis"
+    given-names: "Georgios"
+type: software
+license: Apache-2.0
+version: 5.5.3
+date-released: "2026-08-10"
+abstract: >-
+  Submission to the FPL'26 Agentic FPGA Backend Optimization Contest,
+  scoring 369.9 over 7 evaluation benchmarks with no validation failures.
+  RouteAgents raises the Fmax of placed-and-routed Vivado designs under a
+  wall-clock and LLM-cost budget using a library of 42 optimization plays,
+  each carrying a measured trigger and a measured exclusion mined from an
+  attributed run corpus. A router assigns a play class from measured design
+  features alone; within that class a language model selects the operands.
+  A control layer makes running them at full aggression affordable: a
+  monotone validated bank, termination on an attested delay bound, and a
+  stop rule derived algebraically from the scoring function.
+keywords:
+  - FPGA
+  - timing optimization
+  - LLM agents
+  - Vivado
+  - RapidWright

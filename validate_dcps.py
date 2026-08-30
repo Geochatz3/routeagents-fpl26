@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Portions of this file consist of AI-generated content.
-# SPDX-License-Identifier: Apache 2.0
+# SPDX-License-Identifier: Apache-2.0
 
 """
 FPGA Design Equivalence Validator
@@ -201,7 +201,7 @@ class DCPValidator:
         
         # Create temporary directory for intermediate files in workspace
         # (avoids /tmp running out of space for large designs)
-        # Local ops override (jul03): FPL26_RUN_DIR_BASE redirects the large
+        # Local ops override: FPL26_RUN_DIR_BASE redirects the large
         # dcp_validation_* work dirs off the full C drive; unset (eval/contest)
         # -> identical upstream behavior.
         workspace_dir = Path(os.environ.get("FPL26_RUN_DIR_BASE") or Path(__file__).parent)
@@ -490,7 +490,8 @@ class DCPValidator:
         with open(verilog_path, 'r') as f:
             content = f.read(200000)  # Check first 200KB
         
-        # Look for SIP modules, encrypted IP, or hard IP blocks that require special libraries
+        # Look for SIP modules, encrypted IP, or hard IP blocks that require
+        # special libraries
         sip_patterns = [
             r'GTYE4_CHANNEL',       # GTY transceivers
             r'GTYE4_COMMON',        # GTY common blocks
@@ -532,23 +533,21 @@ class DCPValidator:
         return False
     
     # Tcl helper that emits the top-level clock port names of the currently
-    # open design between sentinel markers. Sourced into Vivado on demand.
+    # open design between sentinel markers.  Sourced into Vivado on demand.
     #
     # Two strategies, applied in order, with results de-duplicated:
     #   1. ``all_fanin -startpoints_only`` from every pin in the clock
-    #      networks back to primary inputs - this handles the common case
-    #      where create_clock is bound to an internal pin (e.g. a BUFG
-    #      output) rather than a top-level port, which is the case for
-    #      Chisel-style designs (e.g. boom_soc whose clock object source
-    #      is empty but whose actual port is ``clock_uncore_clock``).
-    #   2. Trace primary inputs feeding the I pin of any global clock
-    #      buffer (BUFG*, IBUFG*) - this catches designs that have no
-    #      ``create_clock`` constraints at all but still have a clearly
-    #      identifiable clock input port.
+    #      networks back to primary inputs.  This handles the common case
+    #      where create_clock is bound to an internal pin, such as a global
+    #      buffer output, rather than to a top-level port — as generated
+    #      RTL flows often do.
+    #   2. Trace primary inputs feeding the I pin of any global clock buffer.
+    #      This catches designs with no create_clock constraints at all that
+    #      still have a clearly identifiable clock input port.
     #
     # The marker strings printed at runtime are assembled with ``format``
-    # rather than written as string literals so they don't appear verbatim
-    # in this source - if they did, Vivado's echo of the proc body during
+    # rather than written as string literals, so they do not appear verbatim
+    # in this source: if they did, Vivado's echo of the proc body during
     # ``source`` would falsely match the Python-side regex.
     _CLOCK_PORT_DETECT_TCL = r"""
 proc __vd_emit_clock_port {sp seenVar} {
@@ -633,7 +632,7 @@ proc __vd_find_clock_ports {} {
             if not name or not valid.match(name):
                 continue
             # Strip a single trailing bus index so bit-level port objects
-            # like "clk[0]" collapse to the bus name "clk" we parsed from
+            # like "clk[0]" collapse to the bus name "clk" parsed from
             # the Verilog port list.
             name = re.sub(r'\[\d+\]$', '', name)
             if name and name not in seen:
@@ -668,7 +667,7 @@ proc __vd_find_clock_ports {} {
                 
                 module_name = module_match.group(1)
                 
-                # Check if this is the module we're looking for
+                # Check whether this is the target module
                 if target_module_name and module_name != target_module_name:
                     i += 1
                     continue
@@ -679,8 +678,9 @@ proc __vd_find_clock_ports {} {
                     i += 1
                 i += 1  # Skip the "); line
                 
-                # Now parse port declarations (input/output/inout lines)
-                # Store as list of dicts with 'name' and 'width' (e.g., [63:0] or None for single bit)
+                # Now parse port declarations (input/output/inout lines) Store
+                # as list of dicts with 'name' and 'width' (e.g., [63:0] or
+                # None for single bit)
                 ports = {"inputs": [], "outputs": [], "inouts": []}
                 
                 while i < len(lines):
@@ -723,7 +723,7 @@ proc __vd_find_clock_ports {} {
             
             i += 1
         
-        # If we get here, we didn't find the target module
+        # Reaching here means the target module was not found
         if target_module_name:
             raise ValueError(f"Could not find module '{target_module_name}' in {verilog_path}")
         else:
@@ -731,13 +731,12 @@ proc __vd_find_clock_ports {} {
     
     def generate_testbench(self, golden_info: dict, revised_info: dict, tb_path: Path,
                            clock_names: Optional[list] = None):
-        """Generate Verilog testbench for comparing two designs.
+        """Generate a Verilog testbench that compares two designs.
 
-        ``clock_names`` is the authoritative list of top-level clock port names
-        as reported by Vivado's ``get_clocks``/``get_ports`` traversal. When
-        provided we use it directly; otherwise we fall back to a name-based
-        heuristic (which fails for Chisel/Rocket-Chip-style designs whose
-        clocks are named ``clock`` rather than ``clk``).
+        `clock_names` is the authoritative list of top-level clock ports
+        reported by the Vivado clock and port traversal. When omitted, a
+        name-based heuristic is used; that fallback can miss clock ports whose
+        names do not contain `clk`.
         """
         golden_module = golden_info["module_name"]
         revised_module = revised_info["module_name"] + "_revised"  # Use renamed module
@@ -751,7 +750,7 @@ proc __vd_find_clock_ports {} {
             print("⚠ Warning: Design has no outputs - limited verification possible")
         
         # Identify clocks. Prefer the constraint-based list from Vivado; fall
-        # back to a broadened substring heuristic only if Vivado gave us
+        # back to a broadened substring heuristic only if Vivado returned
         # nothing (e.g. an unconstrained design with no SDC).
         clocks: list = []
         if clock_names:
@@ -951,7 +950,7 @@ proc __vd_find_clock_ports {} {
                     payload_inputs = [input_by_name[pn] for pn in payload_names if pn in input_by_name]
             elif name.endswith('_valid') and not name.endswith('_tvalid') and not name.endswith('_cmd_valid'):
                 # Generic valid/ready pair (e.g. s_valid/s_ready in custom FIR filters).
-                # Only recognised when a matching _ready output is present so we
+                # Only recognised when a matching _ready output is present, so this
                 # don't misclassify single-bit control strobes.
                 prefix = name[:-len('_valid')]
                 ready_out = f"{prefix}_ready"
@@ -1176,7 +1175,9 @@ proc __vd_find_clock_ports {} {
             return ',\n        '.join(connections)
         
         def generate_fallback_random_assignments() -> str:
-            """Generate plain LFSR stimulus for any input not covered by a reactive driver."""
+            """Generate plain LFSR stimulus for any input not covered by a
+            reactive driver.
+            """
             stim_lines = []
             lfsr_bit_index = 0
             for port in regular_inputs:
@@ -1402,7 +1403,8 @@ proc __vd_find_clock_ports {} {
                 lines.append(f"                if (env_{iface_id}_delay > 0) begin")
                 lines.append(f"                    env_{iface_id}_delay = env_{iface_id}_delay - 1;")
                 if is_ibus_burst:
-                    # Burst mode: deliver one word per cycle; clear pending when all 8 are done
+                    # Burst mode: deliver one word per cycle; clear pending
+                    # when all 8 are done
                     lines.append(f"                end else if (env_{iface_id}_burst_remaining > 0) begin")
                     lines.append(f"                    env_{iface_id}_burst_remaining = env_{iface_id}_burst_remaining - 1;")
                     lines.append(f"                    if (env_{iface_id}_burst_remaining == 0) begin")
@@ -1418,7 +1420,8 @@ proc __vd_find_clock_ports {} {
                 lines.append(f"                env_{iface_id}_seed = lfsr ^ 32'h{seed_mask:08X};")
                 if is_ibus_burst:
                     lines.append(f"                env_{iface_id}_burst_remaining = 8;")
-                    # Pre-arm DSP injection state so first rsp word carries state=1 (ADDI)
+                    # Pre-arm DSP injection state so first rsp word carries
+                    # state=1 (ADDI)
                     lines.append(f"                dsp_inj_state <= 3'd1;")
                     lines.append(f"                dsp_inj_rd1  <= (lfsr[5:1]   == 5'd0) ? 5'd1 : lfsr[5:1];")
                     lines.append(f"                dsp_inj_rd2  <= (lfsr[10:6]  == 5'd0) ? 5'd2 : lfsr[10:6];")
@@ -1450,7 +1453,8 @@ proc __vd_find_clock_ports {} {
                 lines.append("            end")
             if dsp_cpu_iface:
                 if icache_bootstrap:
-                    # Burst mode: state machine is pre-armed at cmd-fire; just advance per word.
+                    # Burst mode: state machine is pre-armed at cmd-fire; just
+                    # advance per word.
                     lines += [
                         "            // DSP RV32M injection state machine (burst mode: pre-armed at cmd-fire)",
                         "            if (dsp_inj_state != 3'd0 && dsp_inj_fire) begin",
@@ -1542,14 +1546,16 @@ proc __vd_find_clock_ports {} {
                         addr16 = f"golden_{addr_out}"
                     else:
                         addr16 = f"golden_{addr_out}[15:0]"
-                    # Four independent primes and offsets; per-interface salt via XOR with idx
+                    # Four independent primes and offsets; per-interface salt
+                    # via XOR with idx
                     byte_primes = [0xA15B, 0x6C3D, 0x9E37, 0x4F2B]
                     byte_offsets = [0xA500, 0x5A00, 0x3C00, 0xC300]
                     byte_primes  = [(p ^ (idx * 0x0101) | 1) & 0xFFFF for p in byte_primes]
                     byte_offsets = [(o ^ (idx * 0x1010)) & 0xFFFF for o in byte_offsets]
-                    # Build {byte3, byte2, byte1, byte0} — byte3 is MSB of the 32-bit word.
-                    # Mask to [0,7] (3 bits) so rasterization stays fast enough to drain the
-                    # FIFO within the simulation comparison window.
+                    # Build {byte3, byte2, byte1, byte0} — byte3 is MSB of the
+                    # 32-bit word. Mask to [0,7] (3 bits) so rasterization
+                    # stays fast enough to drain the FIFO within the simulation
+                    # comparison window.
                     parts_msb_first = []
                     for b in range(3, -1, -1):
                         p = byte_primes[b]
@@ -1559,7 +1565,8 @@ proc __vd_find_clock_ports {} {
                         )
                     lines.append(f"            {q_in} <= {{{', '.join(parts_msb_first)}}};")
                 else:
-                    # Wide ports (e.g., 64-bit optical-flow frames): full-width multiply-XOR hash.
+                    # Wide ports (e.g., 64-bit optical-flow frames): full-width
+                    # multiply-XOR hash.
                     q_mask = (1 << q_width) - 1
                     prime  = 0x9E3779B97F4A7C15 & q_mask
                     salt   = (0xA5A5A5A5A5A5A5A5 ^ (idx * 0x1F1F1F1F1F1F1F1F)) & q_mask
@@ -2288,13 +2295,14 @@ endmodule
 
     @staticmethod
     def _detect_icache_bootstrap(golden_verilog_text: str) -> Optional[dict]:
-        """Detect VexRiscv InstructionCache — signals that burst iBus bootstrap is needed.
+        """Detect an instruction-cache hierarchy that requires burst iBus
+        bootstrapping.
 
-        Returns a dict with instance info if the cache hierarchy is present,
-        else None.  When non-None, the testbench must deliver 8 consecutive
-        iBus_rsp_valid pulses per cmd (one per cache-line word); the CPU
-        boots naturally after the icache flush completes (~256 cycles
-        post-reset) without any external forcing of lineLoader_valid.
+        Returns instance metadata when present, otherwise None. When detected,
+        the testbench must provide eight consecutive iBus_rsp_valid pulses per
+        command, one for each cache-line word. The CPU then boots after the
+        instruction-cache flush completes, about 256 cycles after reset,
+        without externally forcing lineLoader_valid.
         """
         if ('IBusCachedPlugin_cache' in golden_verilog_text
                 and 'lineLoader_valid' in golden_verilog_text):
@@ -2303,12 +2311,14 @@ endmodule
 
     @staticmethod
     def _detect_tilelink_boom(golden_verilog_text: str) -> bool:
-        """Detect BoomSoC TileLink instruction bus — signals 64-bit DSP stimulus is needed.
+        """Detect BoomSoC TileLink instruction bus — signals 64-bit DSP stimulus
+        is needed.
 
-        Requires three markers that co-occur only in BoomSoC post-implementation netlists:
-          - DSP48E2: multiply unit is present
-          - d_bits_data: TileLink D-channel data port exposed at top level
-          - BoomCore: BoomSoC top-level module, absent from all other TileLink+DSP designs
+        Requires three markers that co-occur only in BoomSoC
+        post-implementation netlists:
+                  - DSP48E2: multiply unit is present
+                  - d_bits_data: TileLink D-channel data port exposed at top level
+                  - BoomCore: BoomSoC top-level module, absent from all other TileLink+DSP designs
         """
         return (
             'DSP48E2' in golden_verilog_text
@@ -2364,7 +2374,7 @@ endmodule
         })
         print(f"✓ Revised model exported: {revised_v.name}")
 
-        # Query clock ports for the revised design as well, mainly so we can
+        # Query clock ports for the revised design as well, mainly to
         # detect mismatches that would invalidate the testbench (the testbench
         # is built from golden's port list, but revised must agree).
         revised_clocks = await self._query_clock_ports_from_vivado()
@@ -2485,17 +2495,18 @@ endmodule
                 f"Found {len(declared_module_names)} module declarations in revised netlist"
             )
             
-            # Pass 2: per-line scan rewriting both declarations and instantiations
-            # of declared modules to use the "_revised" suffix. We use a per-line
-            # scan with set-membership lookups (O(file size)) rather than a giant
-            # alternation regex, which is intractably slow on big benchmarks
-            # (e.g. corescore_500_mod has ~6700 user modules in a 71 MB netlist).
+            # Pass 2: a per-line scan rewriting both declarations and
+            # instantiations of declared modules to use the "_revised" suffix.
+            # A per-line scan with set-membership lookups is linear in file
+            # size, where a single large alternation regex is intractably slow
+            # on a netlist with thousands of user modules.
             #
-            # Lines we care about in Vivado funcsim output:
+            # The relevant lines in the simulation netlist:
             #   "  module NAME"               -> declaration to rename
             #   "  NAME inst_name (..."       -> instantiation to rename
-            # Anything else (port lists, assigns, wires, comments, primitives
-            # like LUT6/FDRE which are NOT in declared_module_names) is left alone.
+            # Anything else — port lists, assigns, wires, comments, and
+            # library primitives, which are not declared modules — is left
+            # alone.
             if declared_module_names:
                 renamed_lines = []
                 suffix = "_revised"
@@ -2555,11 +2566,11 @@ endmodule
             # design size and num_vectors.
             xvlog_timeout_s = 1800   # 30 min
             xelab_timeout_s = 3600   # 60 min - elaborates both designs
-            # xsim: per-cycle cost is roughly proportional to the number of
-            # primitive cells. Two copies of a 100k-LUT design (e.g.
-            # corescore_500_mod) measured ~0.3s/cycle. We add a generous baseline
-            # for kernel init and cap below by 60 min so small designs still get
-            # a comfortable budget.
+            # Simulator cost per cycle is roughly proportional to the number
+            # of primitive cells, and the testbench holds two copies of the
+            # design.  A generous baseline is added for kernel init, and the
+            # result is capped so that small designs still get a comfortable
+            # budget.
             def xsim_timeout_for(vector_count: int) -> int:
                 return max(3600, 600 + int(vector_count * 1.0))
             
@@ -2582,8 +2593,8 @@ endmodule
             
             # Elaborate with UNISIM library reference.
             #
-            # We pass "--debug off" because the testbench reports results via
-            # $display; we never inspect waveforms, so the per-signal debug
+            # "--debug off" is passed because the testbench reports results via
+            # $display; waveforms are never inspected, so the per-signal debug
             # instrumentation that "-debug typical" enables is pure overhead
             # (relevant for smaller benchmarks where it dominates).
             #

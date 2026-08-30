@@ -1,9 +1,9 @@
-"""Pure API-error classifier + deadline-aware backoff scheduler
-(R-D2-1 exponential wall-aware backoff, R-D2-4 no spurious model fallback).
+"""Pure API-error classifier + deadline-aware backoff scheduler:
+exponential wall-aware backoff, and no spurious model fallback on
+key-level errors.
 
-The failure this prevents (TWO live reproductions, 02-CONTEXT.md):
-official eval mini-isp 2026-07-14 18:09:02 and local boom_debugwall_run1
-2026-07-19 18:53:02 — a KEY-level 401 storm (AuthenticationError, body
+The failure this prevents (two live reproductions confirmed the failure
+mode): a KEY-level 401 storm (AuthenticationError, body
 {'error': {'message': 'User not found.', 'code': 401}}) was string-matched
 as a MODEL-unavailable error and instantly switched the run to the fallback
 model — but the fallback shares the same dead key and also 401s, so the run
@@ -21,30 +21,22 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 
-# ---------------------------------------------------------------------------
-# Constants (evidence-commented, route_gate-style)
-# ---------------------------------------------------------------------------
+# Tunables. Each constant is followed by the measurement that set it.
 
 # Exponential per-episode schedule (~15/30/60/120/240s), saturating at the
 # last step.  Sum = 465s, so the 600s cap below allows the full ladder plus
 # part of one saturated step before giving up.
 API_BACKOFF_SCHEDULE_S = (15.0, 30.0, 60.0, 120.0, 240.0)
 
-# Per-episode total backoff cap.  02-CONTEXT.md: wall cost of backoff is
-# cheap insurance — 10 min of 401-storm backoff costs gamma ~= 0.17h ~= 1.7%
-# of alpha, vs losing the whole LLM path (the mini-isp eval key self-
-# recovered minutes later; a run that kept retrying scored 89.316 by luck).
-# After the cap the caller falls through to the existing "LLM dead"
-# propagation — never loops backoff forever (T-02-03).
+# Cap total API backoff at 600 s per episode to allow short-lived recovery
+# without retrying indefinitely. Exhaustion propagates the existing LLM
+# failure to the caller.
 API_BACKOFF_EPISODE_CAP_S = 600.0
 
 
-# Signature tables.  Classification lowercases once and checks in STRICT
-# precedence order: prompt_limit -> key_auth -> transient ->
-# model_unavailable -> other.  key_auth MUST precede model_unavailable:
-# "user not found" contains the bare substring "not found" (a model
-# signature), which is exactly how the eval-day 401 storm was misrouted to
-# the fallback model (T-02-02).
+# Classify lowercased messages in this order: prompt limit, key authentication,
+# transient failure, model unavailability, then other. Authentication must
+# precede model checks because "user not found" contains "not found".
 _PROMPT_LIMIT_SIGS = ("prompt tokens limit exceeded",)
 
 _KEY_AUTH_SIGS = (
@@ -66,11 +58,9 @@ _TRANSIENT_SIGS = (
     "apiconnectionerror", "internal server error",
 )
 
-# Model-level unavailability: these justify a one-shot fallback-model
-# switch.  The bare "not found" only fires when key_auth did NOT already
-# match (precedence order guarantees this).  The auth signatures
-# ("unauthorized", "401", "403", "permission") were REMOVED from this list
-# on 2026-07-20 — they are key-level, not model-level (R-D2-4).
+# Model-level unavailability permits a one-shot fallback-model switch.
+# The bare "not found" signature applies only after authentication checks;
+# authorization and permission failures are key-level errors.
 _MODEL_UNAVAILABLE_SIGS = (
     "not found", "404", "model_not_found", "no endpoints",
     "no allowed providers", "is not a valid model", "does not exist",
@@ -120,10 +110,10 @@ def compute_backoff_sleep(
 
     - step = schedule[min(attempt, len-1)] (saturates, never IndexError);
     - episode cap: if backoff_used_s + step would exceed episode_cap_s,
-      return None — fall through to the existing LLM-dead path (T-02-03);
+      return None — fall through to the existing LLM-dead path;
     - deadline clamp: room = remaining_budget_s - finalize_guard_s; if no
-      positive room, return None (the finalize path must always survive,
-      T-02-01); otherwise the sleep is min(step, room), clamped so it never
+      positive room, return None (the finalize path must always
+      survive); otherwise the sleep is min(step, room), clamped so it never
       pushes past remaining-wall-minus-reserve;
     - result is always >= 0 and finite (an inf budget yields the plain
       step; a NaN budget fails CLOSED with None).

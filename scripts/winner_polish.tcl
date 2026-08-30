@@ -1,12 +1,17 @@
 # winner_polish.tcl — never-worse phys_opt polish of the multi-restart winner.
 #
 # Runs in `vivado -mode batch` on wall the wrapper would otherwise strand below
-# its attempt floor (jun10 audit: 723-940s/run). Opens the shipped DCP, runs one
+# its attempt floor. Opens the shipped DCP, runs one
 # post-route phys_opt pass, and writes the polished DCP ONLY if WNS strictly
 # improved AND the design is still fully routed. The wrapper replaces the scored
 # file only on the IMPROVED verdict, so the floor is the unpolished winner.
 #
 # Usage: vivado -mode batch -source winner_polish.tcl -tclargs <in.dcp> <out.dcp> [directive]
+
+# Both timing probes return the empty string when the query came back
+# empty. Empty is NOT a slack value: returning 0.0 here would beat any
+# negative baseline and publish a fabricated IMPROVED verdict, on which the
+# wrapper replaces the SCORED artifact. Unmeasurable means stop, not improved.
 proc wns_now {} {
     # Mirror the agent's target-clock-aware WNS: prefer the contest clock.
     set clk [get_clocks -quiet *fpl26contest*]
@@ -15,13 +20,13 @@ proc wns_now {} {
     } else {
         set tp [get_timing_paths -quiet -max_paths 1 -slack_lesser_than 999]
     }
-    if {[llength $tp] == 0} { return 0.0 }
+    if {[llength $tp] == 0} { return "" }
     return [get_property SLACK [lindex $tp 0]]
 }
 
 proc whs_now {} {
     set tp [get_timing_paths -quiet -hold -max_paths 1 -slack_lesser_than 999]
-    if {[llength $tp] == 0} { return 99.0 }
+    if {[llength $tp] == 0} { return "" }
     return [get_property SLACK [lindex $tp 0]]
 }
 proc fully_routed {} {
@@ -53,6 +58,10 @@ if {[catch {
     open_checkpoint $in_dcp
     set base [wns_now]
     set base_whs [whs_now]
+    # No readable baseline means no comparison is possible: refuse rather
+    # than polish against an assumed number.
+    if {$base eq ""} { error "no_baseline_setup_timing" }
+    if {$base_whs eq ""} { error "no_baseline_hold_timing" }
     puts "POLISH_BASE_WNS=$base (whs $base_whs)"
     set best $base
     set wrote 0
@@ -63,6 +72,10 @@ if {[catch {
         }
         phys_opt_design -directive $directive
         set new [wns_now]
+        if {$new eq ""} {
+            puts "POLISH_PASS=$pass wns=unmeasurable — stopping ladder"
+            break
+        }
         puts "POLISH_PASS=$pass wns=$new (best $best)"
         if {![fully_routed]} {
             # A pass broke routing: anything already written is still valid
@@ -74,6 +87,10 @@ if {[catch {
             # Hold-safety: the validator gates hold_passed — never persist a
             # pass that broke hold (write only if WHS clean or not-worse).
             set whs [whs_now]
+            if {$whs eq ""} {
+                puts "POLISH_PASS=$pass hold_unmeasurable — not persisted"
+                break
+            }
             if {$whs < 0 && $whs < $base_whs} {
                 puts "POLISH_PASS=$pass hold_dirty whs=$whs — not persisted"
                 break

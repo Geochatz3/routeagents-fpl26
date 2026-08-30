@@ -1,38 +1,22 @@
-"""FRESH-STATE ROUTE-LOTTERY PRE-SWEEP tests (jul23 panel Q3 fantasy #1).
+"""Test fresh-state route pre-sweep selection, budgeting, and recovery.
 
-Mechanism under test (dcp_optimizer.py): when --fresh-presweep-draws /
-FPL26_FRESH_PRESWEEP_DRAWS resolves to K in 1..3, perform_initial_analysis
-takes K banked route re-rolls on the PRISTINE input state at step 0
-(after the entry WNS is measured, before all remaining Phase-1 feature
-capture and the recipe/LLM loop) and keeps the best draw — never-worse
-vs entry — as the pipeline entry state.
+A resolved draw count of 1–3 reroutes the pristine step-zero state after entry
+WNS measurement and before feature capture or optimization. The best valid draw
+becomes the pipeline entry state, but never if it is worse than the original.
 
-Evidence being encoded (farm_validation_jul22/report.md §3): a bare
-`route_design -unroute` + `route_design -directive AggressiveExplore`
-re-roll from the PRISTINE organizer state gains +0.070 (fir) / +0.306
-(vtr) / +0.075 (optical) deterministically, 10/10 hold-clean; the
-re-roll decays (or regresses) on optimized states — hence step 0 only.
+Zero or unset disables the feature without tool calls. CLI values override
+environment values; invalid or negative values disable it, and positive values
+are clamped to 1–3.
 
-Load-bearing invariants:
-  - DEFAULT OFF (0/unset): ZERO tool calls, zero behavior change;
-  - resolver follows the house convention (CLI wins over env;
-    unparseable/negative keeps the default OFF; K clamped 1..3);
-  - budget gate: first-draw-measures — draw 1 capped at 0.12 x wall,
-    its OBSERVED cost gates draws 2..K
-    (spent + observed * 1.3 <= 0.2 x wall);
-  - banking discipline: tracker-first routed gate + hold gate
-    (whs < 0 rejects; whs None fails OPEN loud, auto-bank precedent);
-    adoption goes through the exact eager-mirror path;
-  - a worse/failed draw re-opens the PRISTINE input DCP; the pipeline
-    is NEVER handed a worse-than-entry state (hand-off re-opens the
-    banked best_valid mirror when a later draw was rejected after an
-    adoption);
-  - initial_wns stays PRISTINE (improvement accounting); the recipe
-    router / pathology feature view sees the POST-sweep WNS.
+The first draw is capped at 12% of wall time. Later draws require spent + 1.3 ×
+observed_cost <= 20% of wall time, bounding speculative routing.
 
-Harness style mirrors tests/test_tail_reserve.py /
-tests/test_tail_controller.py: stubbed sessions / scripted draws, NO
-Vivado, NO RapidWright, NO network, NO real sleeps.
+Banking requires a tracker-confirmed routed state and whs >= 0; unknown hold
+slack fails open with a warning. Adoption uses the eager-mirror path.
+
+Rejected draws reopen the pristine state. Handoff reopens the banked best-valid
+mirror when necessary. Initial WNS remains the pristine measurement, while
+downstream features see the post-sweep WNS.
 """
 from __future__ import annotations
 
@@ -96,18 +80,13 @@ def _make_optimizer(tmp_path: Path, *, draws: int = 0,
     opt.initial_wns = initial_wns
     opt.best_wns = initial_wns
     opt.max_wall_seconds = max_wall
-    # jul23 panel #2: production default is CANDIDATE mode (adopt-entry is
-    # DEAD 5/5).  These legacy tests pin the adopt-entry KILL-SWITCH path so
-    # they keep exercising the preserved hand-off/bank mechanics unchanged;
-    # candidate-mode behaviour is covered by CandidateModeTests below +
-    # tests/test_mux_compare.py.
+    # This fixture enables adopt-entry mode to exercise its handoff and banking
+    # mechanics.
     opt._presweep_adopt_entry = True
     return opt
 
 
-# ---------------------------------------------------------------------------
 # Resolver convention (house style: CLI wins over env; invalid keeps default)
-# ---------------------------------------------------------------------------
 
 class ResolverTests(unittest.TestCase):
 
@@ -160,9 +139,7 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(resolve_fresh_presweep_draws(None), 0)
 
 
-# ---------------------------------------------------------------------------
 # Budget gate: first-draw-measures (pure function)
-# ---------------------------------------------------------------------------
 
 class DrawAllowanceTests(unittest.TestCase):
     # Shape for a 3300 s wall: budget 660 s, first-draw timeout 396 s.
@@ -234,9 +211,7 @@ class DrawAllowanceTests(unittest.TestCase):
         self.assertEqual(reason, "no_cost_sample")
 
 
-# ---------------------------------------------------------------------------
 # OFF = zero calls / entry gating
-# ---------------------------------------------------------------------------
 
 class OffAndGatingTests(unittest.TestCase):
 
@@ -285,9 +260,7 @@ class OffAndGatingTests(unittest.TestCase):
         self.assertIn("timing already met", "\n".join(logs.output))
 
 
-# ---------------------------------------------------------------------------
 # Sweep driver: adopt / reject / error, budget, never-hand-off-worse
-# ---------------------------------------------------------------------------
 
 class _SweepHarness(unittest.TestCase):
     """Drives _run_fresh_presweep with a scripted _presweep_execute_draw
@@ -582,11 +555,9 @@ class HandOffTests(_SweepHarness):
         self.assertEqual(opt._phase1_wns_for_features(), -2.0)
 
 
-# ---------------------------------------------------------------------------
-# INSURED-COMPARE candidate mode (jul23 panel #2, drill #1) — the
+# INSURED-COMPARE candidate mode — the
 # production DEFAULT: the pre-sweep REGISTERS its best draw as a FINAL
 # candidate and hands the pipeline a PRISTINE entry (never adopts).
-# ---------------------------------------------------------------------------
 
 class CandidateModeTests(_SweepHarness):
 
@@ -643,9 +614,7 @@ class CandidateModeTests(_SweepHarness):
         self.assertIn("registered=False", logs)
 
 
-# ---------------------------------------------------------------------------
 # Feature view (requirement 4) + autobank suppression + allowance shift
-# ---------------------------------------------------------------------------
 
 class FeatureViewTests(_SweepHarness):
 
@@ -683,7 +652,7 @@ class FeatureViewTests(_SweepHarness):
         self.assertNotIn("vivado_report_timing_summary", called)
 
     def test_phase1_allowance_shifted_by_sweep_elapsed(self):
-        # Pre-sweep spend must NOT consume the C1-T4a Phase-1 allowance:
+        # Pre-sweep spend must NOT consume the Phase-1 allowance:
         # the anchor shifts forward by the sweep's elapsed time.
         opt = _make_optimizer(self.tmp_path, draws=1, initial_wns=-2.0)
         opt._phase1_start_ts = 500.0
@@ -723,9 +692,7 @@ class FeatureViewTests(_SweepHarness):
         self.assertFalse(opt._tail_ctrl_suppress_autobank)
 
 
-# ---------------------------------------------------------------------------
 # Draw executor: op forms, error envelopes, hold probe dispatch (94e53bd)
-# ---------------------------------------------------------------------------
 
 class ExecuteDrawTests(unittest.TestCase):
 
@@ -820,10 +787,8 @@ class ExecuteDrawTests(unittest.TestCase):
         self.assertEqual(err, "wns_unmeasurable")
 
     def test_hold_probe_uses_call_tool_not_prefixed_dispatch(self):
-        # 94e53bd regression guard: _measure_hold must receive
-        # self.call_tool (full tool names) — the prefixing
-        # _call_vivado_tool dispatched the probe to the nonexistent
-        # "vivado_vivado_run_tcl" and silently failed open.
+        # Hold probes require `self.call_tool`, which accepts full tool names.
+        # The prefixing wrapper would double-prefix names and fail open silently.
         opt = self._opt()
         received = {}
 
@@ -840,11 +805,8 @@ class ExecuteDrawTests(unittest.TestCase):
              mock.patch("optimizer.ils_polish._measure_hold",
                         side_effect=fake_measure_hold):
             _async(opt._presweep_execute_draw("bare", 130.0))
-            # Assert INSIDE the patch context (opt.call_tool is the
-            # patched-in mock here; on exit it reverts to the bound
-            # method).  The probe must have received exactly the
-            # object bound at opt.call_tool — never a name-prefixing
-            # wrapper like _call_vivado_tool.
+            # Check identity inside the patch context, while `opt.call_tool` is the mock.
+            # The probe must receive that callable rather than a name-prefixing wrapper.
             self.assertIs(received["fn"], opt.call_tool)
 
     def test_hold_probe_failure_fails_open_to_none(self):

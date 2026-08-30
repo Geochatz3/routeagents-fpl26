@@ -94,10 +94,8 @@ class PathologyIntegrationTests(unittest.TestCase):
                                  f"expected numbered recipe list, got {block}")
 
     def test_block_filters_blocked_recipes_for_corescore(self):
-        # corescore_500_mod is on the scheduler.dispatch harmful list
-        # for recipe_cell_replacement.  When _build_pathology_block is
-        # called with that design name, the recipe must be filtered
-        # out of the RECOMMENDED list and listed under BLOCKED.
+        # A recipe on the scheduler's per-design denylist must be removed
+        # from the recommended set and reported as blocked.
         self.opt.critical_path_spread_info = {
             "avg_distance": 200.0, "max_distance": 250, "paths_analyzed": 10,
         }
@@ -114,8 +112,8 @@ class PathologyIntegrationTests(unittest.TestCase):
         self.assertIn("recipe_cell_replacement", joined)
 
     def test_block_keeps_recipes_when_design_safe(self):
-        # boom_soc has applicability "unknown" → not blocked → all
-        # classifier-recommended recipes should appear in RECOMMENDED.
+        # Unknown applicability fails open, so every classifier-recommended recipe
+        # remains in the recommended set.
         self.opt.critical_path_spread_info = {
             "avg_distance": 200.0, "max_distance": 250, "paths_analyzed": 10,
         }

@@ -1,8 +1,8 @@
 """Pure route-time predictor + feasibility assessment for destructive
-re-routes (R-D1-2, the D1 fix).
+re-routes.
 
 Predicts how long a routed-state-DESTROYING re-route (post `-unroute` /
-post `place_design`) will take on THIS design on THIS box, and assesses
+post `place_design`) will take on THIS design on THIS machine, and assesses
 whether it — plus the banking that must follow it — fits in the remaining
 wall budget. Feature-keyed only: prior heavy-op timings this run (via
 optimizer.ils_polish.derive_cost_anchors) and the design's primitive cell
@@ -10,20 +10,22 @@ count. NO design-name conditionals, NO IO, NO Vivado — a pure function
 mirroring the PhaseOneFeatures / decide_recipe_path contract in
 optimizer/recipe_router.py so it can be unit-tested exhaustively.
 
-The failure this prevents (official beta eval, 2026-07-14, 379,380-cell
-design, effective window 3199s): the LLM ran `route_design -unroute` with
-1650s remaining, then a full AggressiveExplore re-route that was
-budget-killed at its 1632.9s allowance → design left unrouted → α=0
-despite a completed 1387.8s improving phys_opt. The old flat guard
-(DEFAULT_RISKY_RUNTIME_S = 600) was off by ≥2.7x; this predictor SCALES.
+The failure this prevents, observed on an evaluation run of a
+379,380-cell design with an effective 3199s window: the agent ran
+`route_design -unroute` with 1650s remaining, then a full
+AggressiveExplore re-route that was budget-killed at its 1632.9s
+allowance, leaving the design unrouted (α=0) despite a completed
+1387.8s improving phys_opt. A flat guard (DEFAULT_RISKY_RUNTIME_S =
+600) was off by ≥2.7x there; this predictor scales instead.
 
-Locked bias (01-CONTEXT.md): over-refusing costs a gamble, under-refusing
+Locked bias: over-refusing costs a gamble, under-refusing
 costs a zero — PREFER REFUSING. Hence max() over both candidates and a
 reserve+margin subtraction. Do NOT weaken K or the cells rate without new
 cross-design evidence.
 
-All calibration numbers below are from the eval-box op-timing ADDENDUM
-(01-RESEARCH.md, mined from all five official 2026-07-14 harness logs).
+All calibration numbers below come from heavy-op timings mined from five
+evaluation-harness logs, so the evidence is thin: treat them as
+conservative floors, not as a characterisation of the tool.
 """
 from __future__ import annotations
 
@@ -33,85 +35,42 @@ from typing import List, Optional
 from optimizer.ils_polish import derive_cost_anchors
 
 
-# ---------------------------------------------------------------------------
-# Constants (evidence-commented, recipe_router-style)
-# ---------------------------------------------------------------------------
+# Tunables. Each constant is followed by the measurement that set it.
 
-# K=2.0 is VALIDATED against the single complete full-reroute data point in
-# the ADDENDUM: 84,422-cell design, largest completed phys_opt 47.6s →
-# predicted 2.0 × 47.6 = 95.2s vs 94.95s observed full route after
-# place_design. It is NOT a uniform upper bound on the route/phys_opt ratio
-# (observed span: 12k-cell design ≈ 3.0, 84k-cell ≈ 2–4, all above 2.0; the
-# 379k-cell D1 design gives only an incomplete ≥1.18) — the cells-scaled
-# floor below is the backstop for ratios above 2. On the D1 failure itself
-# the K-branch refuses regardless: 2.0 × 1387.8 = 2775.6s > 1650s remaining.
+# Estimate a destructive full reroute as twice the longest completed heavy
+# operation. This is not an upper bound; the cell-scaled floor covers cases
+# where routing grows more expensive than that ratio.
 HEAVY_OP_MULTIPLIER_K = 2.0
 
-# Conservative full-re-route floor in seconds per primitive cell.
-# Derivation: the D1 design's killed AggressiveExplore re-route gives
-# ≥1632.9s on 379,380 cells = ≥0.0043 s/cell as a LOWER BOUND (the run was
-# killed incomplete; the true cost is unknown and higher). 0.006 ≈ 1.4×
-# that lower bound, per the locked "prefer refusing" bias. A floor at or
-# below 0.0043 would still allow the cold-start gamble: e.g. 0.004 gives a
-# 1517.5s floor that PASSES at ~1700–2000s remaining while the real need is
-# ≥1633s and likely higher. At 0.006 the floor is 379,380 × 0.006 = 2276.3s
-# and cold-start destroying ops on designs of that class are refused below
-# ~2426s remaining (floor + reserve + margin). The 84k-cell design's
-# measured 0.0011 s/cell (default-class directive) confirms small/mid
-# designs stay comfortably feasible under this rate (size × directive
-# scaling is super-linear; the rate must cover the aggressive-directive
-# large-design corner, not the average).
+# Apply a conservative full-reroute floor of 0.006 seconds per primitive cell.
+# The rate targets large designs with aggressive directives, where runtime
+# scales superlinearly, and biases uncertain feasibility toward refusal.
 CELLS_SCALED_RATE_S = 0.006
 
-# Post-re-route banking envelope: WNS measure + report_route_status +
-# write_checkpoint + EDIF mirror. The eval-box timing report on the D1
-# design took ~52s alone but the DESTROYING-op decision point only needs
-# the incremental banking tail after a successful route (report + mirror,
-# ~25–30s observed on the mirror machinery's [mirror] enter/exit spans).
-# The WNS-measure cost on big designs is already inside SAFETY_MARGIN_S.
+# Reserve 30 seconds after rerouting for timing and route checks, checkpoint
+# banking, and EDIF mirroring. Large-design WNS measurement variability is
+# covered separately by the safety margin.
 BANKING_RESERVE_S = 30.0
 
-# Conservative margin subtracted from the remaining wall before comparing.
-# Covers the finalize/lifecycle tail and measurement slop on large designs
-# (~52s timing report on the D1 design) — same spirit as the existing
-# finalize reserve and R3_REMAINING_WALL_MIN_S wall-feasibility precedents
-# (recipe_router.py), but SCALED prediction + margin instead of a flat
-# constant, which CONTEXT.md flags as insufficient when unscaled.
+# Subtract 120 seconds for finalization, lifecycle overhead, and timing
+# measurement variability before testing feasibility. The reroute prediction
+# remains size-scaled because a flat wall-time threshold is insufficient.
 SAFETY_MARGIN_S = 120.0
 
 
-# ---------------------------------------------------------------------------
-# Bare re-route (state-PRESERVING) cost basis — drill jul21 D1-null:
-# +0.094 boom_v2 deterministic; meta: undirected beats directed.
-# ---------------------------------------------------------------------------
-# Measured preserving ratio (drill1_vivado_full.log, boom_v2, same box &
-# session): bare route_design from the banked ROUTED state = 1199s
-# (line 1570) vs the full AggressiveExplore re-route from unrouted =
-# 3871s (line 1061) → ratio 0.31.  0.5 ships ≈1.6× headroom over that
-# single-design measurement.  A factor ≥ ~0.7 makes the gate refuse on
-# the leg-2 eval trace (route sample 1620s, ~1300s remaining post-bank)
-# and the lever becomes dead code at eval — the K=2 destructive basis
-# refused BOTH there (2×1620=3240) and at DEBUG-WALL (7200 vs 2375).
+# A bare reroute starts from the banked routed state and preserves recoverability.
+# Estimate it at half the destructive reroute cost, leaving headroom relative
+# to the expected routed-state runtime.
 PRESERVING_ROUTE_FACTOR = 0.5
 
-# Slimmer margin stack than the destructive gate ON PURPOSE (risk
-# posture, coordinator-sanctioned jul21): the destructive gate's
-# failure mode is α:=0 (unrouted design shipped), so it stacks 30s
-# banking + 120s margin on a doubled prediction.  The bare re-route is
-# INSURED — state-preserving, banked disk mirror untouched, an overrun
-# is budget-timeout-killed and finalize ships the banked best via the
-# emergency path — so failure costs only the tail wall (γ penalty,
-# −0.1·α·γ scale), while success is a deterministic +0.094-class α
-# gain.  30s banking (measure + mirror tail, same as destructive) +
-# 60s margin (measurement slop only; no finalize tail here — the
-# _budget_deadline already excludes the 300s finalize reserve).
+# State-preserving reroutes use a smaller margin than destructive operations.
+# The banked disk artifact remains untouched, and a timeout falls back to that
+# candidate rather than leaving finalization with an unrouted design.
+# Reserve 30 seconds for measurement and mirroring plus 60 seconds for runtime
+# variability; the budget deadline already excludes the finalization reserve.
 PRESERVING_BANKING_RESERVE_S = 30.0
 PRESERVING_SAFETY_MARGIN_S = 60.0
 
-
-# ---------------------------------------------------------------------------
-# Result type
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class RerouteAssessment:
@@ -131,23 +90,19 @@ class RerouteAssessment:
     reason: str
 
 
-# ---------------------------------------------------------------------------
-# Pure functions
-# ---------------------------------------------------------------------------
-
 def predict_reroute_seconds(
     tool_call_details: List[dict],
     input_cell_count: Optional[int],
     k: float = HEAVY_OP_MULTIPLIER_K,
     cells_rate_s: float = CELLS_SCALED_RATE_S,
 ) -> float:
-    """Predict a destructive full re-route's duration on this design/box.
+    """Predict a destructive full re-route's duration on this design/machine.
 
     predicted = max(k × largest completed heavy-op time this run,
                     input_cell_count × cells_rate_s)
 
     The K-branch uses the run's own completed place/route/phys_opt timings
-    as an on-box speed signal (via derive_cost_anchors — reused, not
+    as an on-machine speed signal (via derive_cost_anchors — reused, not
     reimplemented). The cells-scaled branch is a conservative floor that
     covers COLD-START (no heavy op completed yet this run) — the exact
     gamble the K-branch cannot see. The result never drops below the
@@ -164,10 +119,8 @@ def predict_reroute_seconds(
     if cells < 0:
         cells = 0.0
     if largest_heavy_op_s <= 0.0 and cells <= 0.0:
-        # Double-blind case (jul20 external review S2): cell-count
-        # measurement failed AND no heavy op has completed — max(0, 0)
-        # would declare every destructive re-route "feasible" exactly
-        # when we know nothing. Prefer-refusing bias: no data, no gamble.
+        # If both cell count and completed-operation history are unavailable,
+        # return an infinite estimate so destructive reroutes fail closed.
         return float("inf")
     return max(k * largest_heavy_op_s, cells * cells_rate_s)
 
@@ -176,25 +129,14 @@ def predict_preserving_reroute_seconds(
     tool_call_details: List[dict],
     preserve_factor: float = PRESERVING_ROUTE_FACTOR,
 ) -> float:
-    """Predict a state-PRESERVING bare re-route's duration on this
-    design/box (drill jul21 D1-null: +0.094 boom_v2 deterministic;
-    meta: undirected beats directed).
+    """Estimate the duration in seconds of a state-preserving bare reroute.
 
-    predicted = observed single-stage route_design sample this run
-                (derive_cost_anchors maxes — the same sample source the
-                destructive predictor's K-branch uses) × preserve_factor
-
-    NO K=2 doubling and NO cells-scaled floor: those exist because a
-    DESTROYED state must be fully rebuildable in-window (overrun there
-    = unrouted design = α:=0).  A bare route_design on a routed design
-    is insured — see PRESERVING_ROUTE_FACTOR above for the measured
-    basis and risk posture.
-
-    No route sample this run → inf (honest skip: without an on-box
-    route sample the op cannot be sized — same prefer-refusing
-    double-blind posture as the destructive predictor; the designs this
-    lever targets have banked a route by construction, so a missing
-    sample means the history itself is broken).
+    The estimate multiplies the current run's single-stage routing sample by
+    `PRESERVING_ROUTE_FACTOR`. It applies neither the destructive predictor's
+    two-cycle multiplier nor its cell-scaled floor because the existing routed
+    state remains recoverable after an overrun. Returns infinity when no
+    routing sample is available, causing the budget gate to skip an operation
+    that cannot be sized for the current environment.
     """
     safe_history = [tc for tc in (tool_call_details or [])
                     if isinstance(tc, dict)]
@@ -277,7 +219,7 @@ def assess_destructive_reroute(
                ≤ remaining_wall_s − safety_margin_s
 
     Biased toward refusal by construction (max() predictor, reserve and
-    margin on the budget side). The caller (gate wiring, Plan 03) turns an
+    margin on the budget side). The caller (the gate wiring) turns an
     infeasible verdict into a steering message toward bankable incremental
     alternatives; this function only judges.
     """

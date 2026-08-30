@@ -1,28 +1,10 @@
-"""FPL26_DEEP_FIRST_SIZEGATED — deep-replace[first] for the ILS-size-gated class.
+"""Test the size-gated first deep-replacement policy.
 
-MEASURED (same build 60109c7b, 8-CPU capped, 3500 s wall, gate_ab_jul27.sh):
-
-    ispd16   ship defaults                   alpha  +24.11  (band-gated at FIRST)
-             FIRST_BANDED=0                  alpha  +22.85  (band cleared, then
-                                                             refused on cost)
-             FIRST_BANDED=0 + NO_DOUBLE_RESERVE=1
-                                             alpha +115.37  VALID_OPTIMIZED
-    boom_v1  ship defaults                   alpha  +41.43
-             same two flags                  alpha  +41.43  IDENTICAL (no-op)
-
-The two gates that blocked ispd16, both read from live logs:
-  1. DEEP-extreme band = `failing >= 100k AND |WNS| >= 10 ns`, fitted on boom
-     (|WNS| 19.16). ispd16 has MORE failing endpoints than boom (242,906 vs
-     217,988) but |WNS| 7.75, so it misses on the |WNS| half alone.
-  2. Affordability refused by a MARGIN: need 2315 x 1.3 + 300 = 3309 s vs
-     3049 s remaining, while the chain ACTUALLY took 1976 s.
-
-Neither raw flag is safe globally — FIRST_BANDED=0 re-arms corescore where the
-stage costs ~63 MHz, and NO_DOUBLE_RESERVE=1 changes affordability for every
-design. The size gate confines both to the class where ILS never arms.
-
-These tests drive the real helper and the real decision method (checklist item
-15: a test that does not enter the changed code proves nothing).
+The exception is limited to very large, broadly failing designs and preserves
+the failing-endpoint floor, preventing shallow near-met designs from arming an
+expensive replacement. Affordability uses the class-specific estimate without
+relaxing global cost reserves. Tests execute the production helper and decision
+path.
 """
 from __future__ import annotations
 
@@ -39,12 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dcp_optimizer as d
 from dcp_optimizer import DCPOptimizer, deep_first_sizegated_enabled
 from optimizer.ils_polish import DEFAULT_MAX_CELLS, ILSPolishConfig
-# The band's OWN failing-endpoint threshold — the size gate reuses it rather
-# than fitting a new cut. Its definition comment already reads
-# "boom_soc 217k, ispd16 243k; gates to huge designs only".
+# Reuse the band's failing-endpoint threshold instead of adding another cutoff;
+# the resulting size gate limits this path to very large designs.
 from optimizer.recipe_router import R1_FAILING_ENDPOINTS_MIN
 
-# Measured primitive cell counts (tests/test_mid_tail_floor.py, same corpus).
+# Measured primitive cell counts, from the same corpus as the other
+# size-gated fixtures in this suite.
 CELLS = {"vexriscv_v1": 3_373, "mini_isp": 8_414, "3d": 30_874,
          "optical": 84_422, "finn": 157_166, "corescore": 252_741,
          "boom_v1": 379_048, "ispd16": 532_160}
@@ -109,7 +91,7 @@ class FlagDisciplineTests(_EnvClean):
         self.assertEqual(
             mk.count("FPL26_DEEP_FIRST_SIZEGATED=$(if $(DEEP_FIRST_SIZEGATED)"),
             2, "both the wrapper and the || fallback branch must arm it, or "
-               "an A/B is unattributable (jul30 'Makefile not in ship surface')")
+               "an A/B is unattributable")
 
 
 class SizeGateSeparationTests(_EnvClean):
@@ -134,7 +116,7 @@ def _make_opt(tmp: Path, cells, max_cells="REAL") -> DCPOptimizer:
 
     A MagicMock makes every attribute truthy, which silently satisfies the
     stage's own enable gates AND hides the real max_cells — so the lever's
-    entire scope constant went untested (review aug06). Here the config is
+    entire scope constant went untested. Here the config is
     real; only the two enable flags are set, exactly as the ship path does
     (Makefile FPL26_DEEP_REPLACE / _FIRST both arm), and max_cells keeps its
     production default unless a test is deliberately probing an unknown one.
@@ -238,18 +220,14 @@ class DecisionPathTests(_EnvClean):
         self.assertTrue(kw.get("require_physics_band"))
         self.assertFalse(kw.get("reserve_already_in_deadline"))
 
-    # --- the aug06 review BLOCKER: size alone is not enough ---------------
+    # --- size alone is not enough -----------------------------------
 
     def test_large_but_SHALLOW_hidden_design_is_refused(self):
-        """THE blocker. corescore's physics at a size-gated cell count.
+        """Reject large but shallow designs from first-stage deep replacement.
 
-        Waiving the band on cell count ALONE also waives its |WNS| floor, so a
-        hidden 400k-cell near-met benchmark would arm a full re-place at FIRST
-        — corescore's exact profile, where that stage is measured to cost
-        ~63 MHz (+80.94 without vs +17.56 with). At FIRST the loss is the whole
-        downstream pipeline's alpha, not just gamma. The band's own
-        failing-endpoint half (R1_FAILING_ENDPOINTS_MIN, no new constant)
-        excludes it while preserving ispd16.
+        Cell count alone must not waive the failing-endpoint floor. That floor
+        prevents near-met designs from triggering a costly full replacement
+        while retaining the size-gated path for broadly failing designs.
         """
         kw = self._call(400_000, flag=True,
                         failing=FAILING["corescore"], wns=-1.24)
@@ -285,21 +263,18 @@ class DecisionPathTests(_EnvClean):
         self.assertLess(FAILING["corescore"], R1_FAILING_ENDPOINTS_MIN)
 
     def test_real_ils_config_supplies_the_scope_constant(self):
-        """Pin the REAL max_cells, not a mock (review aug06)."""
+        """Pin the REAL max_cells, not a mock."""
         opt = DCPOptimizer(api_key="test", run_dir=self.tmp_path)
         self.assertEqual(opt._ils_polish_cfg.max_cells, 300_000)
         self.assertEqual(DEFAULT_MAX_CELLS, 300_000)
 
 
 class ArmArithmeticTests(unittest.TestCase):
-    """Execute the REAL affordability comparison, not a stub.
+    """Exercise the production affordability comparison near its threshold.
 
-    Every other test here stubs deep_replace_should_run and asserts its kwargs,
-    so the actual `remaining >= need` decision was never exercised. The margin
-    is thin and worth pinning: MEASURED across six ispd16 runs on four boxes
-    over two days, the remaining wall at the deep-replace[first] hook was
-        3049 / 3051 / 3052 / 3058 / 3059 / 3059 s   (a 10 s spread)
-    against need = 532,160 cells x 0.00435 x 1.3 = 3009.4 s.
+    The decision compares remaining wall time with cell count × 0.00435 seconds
+    per cell × 1.3. The coefficient is the production cost model, and 1.3
+    supplies its safety margin.
     """
 
     def _need(self, cells):

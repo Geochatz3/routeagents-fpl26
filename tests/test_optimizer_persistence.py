@@ -1,6 +1,9 @@
-"""Test the optimizer's strategy-memory persistence path with a mocked
-optimizer state.  We don't spawn Vivado/MCP; we just simulate a finished
-run and verify the record lands in the configured memory file."""
+"""Verify persistence of completed-run strategy memory.
+
+A mocked optimizer state simulates completion and confirms that the resulting
+record is written to the configured memory file without starting external tools
+or services.
+"""
 from __future__ import annotations
 
 import json

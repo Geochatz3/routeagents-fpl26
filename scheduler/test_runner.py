@@ -1,8 +1,6 @@
-"""Tests for scheduler/runner.py — log parsing + extra_args dispatch.
+"""Test scheduler log parsing and candidate-specific extra-argument dispatch.
 
-Pure offline; doesn't spawn subprocesses.  We just verify the parser
-extracts headline metrics from a representative recipe stdout dump and
-that _extra_args_for routes correctly per candidate name.
+The tests use representative stdout fixtures and do not spawn subprocesses.
 """
 from __future__ import annotations
 
@@ -37,7 +35,7 @@ class ExtraArgsTests(unittest.TestCase):
 class ParseRecipeLogTests(unittest.TestCase):
     def test_extracts_headline_metrics_from_recipe_json(self):
         # recipes/cell_replacement.py prints a JSON blob via json.dumps
-        # (default=str) at the end.  We need to recover delta_fmax_mhz +
+        # (default=str) at the end.  delta_fmax_mhz must be recovered along with
         # final_fmax_mhz at minimum.
         recipe_blob = {
             "status": "success",

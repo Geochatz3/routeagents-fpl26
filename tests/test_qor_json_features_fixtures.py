@@ -89,11 +89,10 @@ class RealFixtureTests(unittest.TestCase):
                 self.assertEqual(len(d[k]), 4, f"{fx.name} {k}")
 
     def test_no_design_name_leak_in_parsed_output(self):
-        """Parser output must never contain a benchmark name.
+        """Ensure parsed output never exposes design identifiers.
 
-        We anonymised fixtures so the input itself doesn't carry names,
-        but this test enforces the invariant *over the parser output*
-        regardless of input.
+        Fixtures are anonymized, but the invariant applies to parser output
+        regardless of the input contents.
         """
         forbidden = {
             "logicnets", "vexriscv", "rosetta", "corescore", "boom_soc",

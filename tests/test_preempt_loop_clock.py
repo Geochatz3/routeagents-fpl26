@@ -1,12 +1,8 @@
-"""The ILS-polish preempt must judge the LLM LOOP, not the time before it.
+"""Verify that stagnation preemption measures only time spent in the LLM loop.
 
-jul26 regression: optimize() anchors last_improvement_time at start_time, so the
-stagnation clock counted PRE-loop stages. With FPL26_DEEP_REPLACE_FIRST=1 the
-place+route probe ran 580s against a 240s threshold, and the preempt fired 138 ms
-into iteration 1 with ZERO LLM calls. corescore shipped +16.13 against a
-parity-proven +79.49. The preempt fired on exactly four designs that night —
-corescore, optical-flow, spam-filter, finn — and those four are exactly the
-designs that came in under their artifact-verified records.
+Pre-loop placement and routing stages may be long and must not consume the
+loop's stagnation allowance. The improvement clock therefore starts when the
+loop begins.
 """
 import os
 import time
@@ -27,10 +23,10 @@ def test_preempt_still_fires_when_the_loop_itself_stalls():
 
 
 def test_preempt_does_not_fire_on_a_loop_that_has_not_run_yet():
-    """corescore's case: 580s of pre-loop deep-replace, then iteration 1.
+    """Ensure pre-loop work cannot preempt an LLM loop before its first iteration.
 
-    After re-anchoring at loop start, seconds_since_improve is ~0 and the gate
-    correctly reads the loop as productive rather than stalled.
+    The improvement clock is anchored at loop entry, so elapsed pre-loop time
+    is excluded from the stagnation decision.
     """
     trig, why = should_trigger(cells=250_000, remaining_s=2400,
                                seconds_since_improve=0.14, best_wns=-1.238,
@@ -62,13 +58,24 @@ def test_ils_is_not_starved_when_the_loop_ends_with_timing_unmet():
 
 
 def test_reanchor_has_a_kill_switch():
-    """FPL26_PREEMPT_LOOP_CLOCK=0 restores the pre-jul27 behaviour."""
+    """The kill switch must accept every house falsy spelling.
+
+    This asserted `os.environ.get(...) != "0"` — a restatement of the
+    comparison, true whatever the implementation did. It now calls the
+    resolver the run actually consults, which is what makes `off`/`false`
+    regressing back to a bare `!= "0"` a failure here."""
+    from optimizer.config_resolution import resolve_preempt_loop_clock_enabled
+
     prev = os.environ.get("FPL26_PREEMPT_LOOP_CLOCK")
     try:
-        os.environ["FPL26_PREEMPT_LOOP_CLOCK"] = "0"
-        assert os.environ.get("FPL26_PREEMPT_LOOP_CLOCK", "1") == "0"
-        os.environ["FPL26_PREEMPT_LOOP_CLOCK"] = "1"
-        assert os.environ.get("FPL26_PREEMPT_LOOP_CLOCK", "1") != "0"
+        os.environ.pop("FPL26_PREEMPT_LOOP_CLOCK", None)
+        assert resolve_preempt_loop_clock_enabled() is True, "default is ON"
+        for off in ("0", "false", "FALSE", "no", "off", " Off "):
+            os.environ["FPL26_PREEMPT_LOOP_CLOCK"] = off
+            assert resolve_preempt_loop_clock_enabled() is False, off
+        for on in ("1", "true", "yes", "on", ""):
+            os.environ["FPL26_PREEMPT_LOOP_CLOCK"] = on
+            assert resolve_preempt_loop_clock_enabled() is True, on
     finally:
         if prev is None:
             os.environ.pop("FPL26_PREEMPT_LOOP_CLOCK", None)
@@ -84,13 +91,13 @@ def test_reanchor_only_moves_the_clock_forward():
     assert (time.time() - loop_start) < (time.time() - run_start)
 
 
-# --- R3 reroute chain (opt-in, jul27) -------------------------------------
+# --- R3 reroute chain (opt-in) -------------------------------------
 
 def test_r3_reroute_chain_is_off_by_default():
-    """finn also routes to R3 and its +61.96 record does not use this chain.
+    """Ensure the optional reroute chain remains disabled by default.
 
-    Default-off is what keeps R3's 4-step contract (asserted by
-    test_finn_triggers_r3_class_g) intact.
+    The default preserves the existing four-step routing contract unless the
+    chain is explicitly enabled.
     """
     import os
     from optimizer.recipe_router import _r3_reroute_chain

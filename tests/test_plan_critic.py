@@ -1,4 +1,4 @@
-"""Tests for the cheap pre-flight plan critic (jul25 panel, 4/5 seats).
+"""Tests for the cheap pre-flight plan critic.
 
 The critic must be (a) advisory-only — never able to block, (b) cheap — gated
 on genuine beta headroom, (c) inert when malformed.
@@ -32,7 +32,7 @@ def test_disabled_is_a_hard_noop():
 
 
 def test_boom_soc_profile_arms():
-    """boom_soc spent $0.357 of ~$1 — exactly the underuse the panel flagged."""
+    """boom_soc spent $0.357 of ~$1 — exactly the underuse this targets."""
     run, why = _gate(spent_usd=0.357)
     assert run is True and "armed" in why
 

@@ -1,22 +1,9 @@
-"""No function may load a NAME that resolves to nothing. (aug08)
+"""Detect unresolved names loaded inside functions in the audited modules.
 
-THE BUG THIS PINS: dcp_optimizer.py:13623 tested
-``res.verdict == VERDICT_ERROR`` inside the deep-replace wedged-session
-recovery, but the in-function import one screen up brought in only
-``DEEP_REPLACE_COST_MARGIN, VERDICT_ADOPTED, deep_replace_should_run,
-run_deep_replace_sibling``. The resulting NameError was swallowed by the
-enclosing ``except Exception`` and logged as "(ignored)" — so a guard written
-to stop a wedged Vivado session from finalizing a whole benchmark at alpha 0
-fired in 17 of 17 gate-16 runs and its body executed ZERO times.
-
-An unresolved constant inside a try/except is not a runtime condition; it is
-code that has never run. This test is the static census for that class: every
-uppercase Name loaded in any function of the audited files must resolve to a
-local binding, an in-function import, a module global, or a builtin.
-
-Validated against the shipped #13 tree (31e9f53): exactly one hit, the
-VERDICT_ERROR line — and zero false positives across dcp_optimizer.py,
-optimizer/ and scripts/.
+Each uppercase name must resolve to a local binding, an in-function import, a
+module global, or a builtin. Static validation is required because a broad
+exception handler can mask an unresolved name and silently disable recovery
+logic.
 """
 from __future__ import annotations
 
@@ -109,7 +96,7 @@ class NoUnresolvedNamesTests(unittest.TestCase):
                          + "\n".join(hits))
 
     def test_verdict_error_is_imported_where_the_guard_uses_it(self):
-        """The specific aug08 fix: the recovery guard's import list must
+        """The specific fix: the recovery guard's import list must
         carry VERDICT_ERROR, in the same method that compares against it."""
         import inspect
 
@@ -126,7 +113,8 @@ class NoUnresolvedNamesTests(unittest.TestCase):
                 for al in node.names:
                     imported.add(al.asname or al.name)
         self.assertIn("VERDICT_ERROR", imported,
-                      "the guard at ~:13623 compares against VERDICT_ERROR; "
+                      "the wedged-session guard compares against "
+                      "VERDICT_ERROR; "
                       "it must appear in the in-function import list or the "
                       "recovery body dies on a NameError as it did 17/17 in "
                       "the shipped #13 gate")

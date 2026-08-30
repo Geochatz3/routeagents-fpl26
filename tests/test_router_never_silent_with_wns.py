@@ -1,48 +1,10 @@
-"""The router must never go silent on a design whose WNS it can measure.
+"""Verify that measurable WNS always produces routing guidance.
 
-WHY THIS MATTERS FOR THE FINAL ROUND. The final round scores HIDDEN designs, and
-`decide_recipe_path()` covers five narrow calibrated islands (R1-R4, R7) that were
-fitted on the thirteen public benchmarks — not a partition of the feature space.
-When nothing matches, the plan reaches this consumer in dcp_optimizer.py:
-
-    if plan.rule_id == "FALLBACK" and not plan.blocks:
-        return []          # _build_recipe_router_block
-
-An empty return means the LLM receives NO routing guidance and freelances, which
-the router's own `_degraded_feature_route` docstring names as "the LLM-freelancing
-pattern that zeroed the boom class". That is failing OPEN into the most expensive
-branch, on exactly the designs we have never seen.
-
-The jul25 OOB safety floor closed most of it: an uncovered design is routed to an
-already-proven shared plan builder (route-first for a DEEP-extreme miss, otherwise
-the placement-preserving sweep), never to a new technique, and with
-`place_design -unplace` blocked.
-
-MEASURED ON OUR OWN CORPUS: at iteration 1 with a healthy wall, all twelve designs
-with banked features route to a calibrated rule (R1 x1, R2 x1, R3 x3, R4 x6,
-R7 x1) — zero OOB, zero FALLBACK. Eight of those were checked against the
-`rule_id=` line in a banked agent.log, not just reconstructed, and every one
-matches.
-
-BUT R3 IS FEASIBILITY-GATED, so its three designs are only CONDITIONALLY in band:
-finn, amd_mini-isp and vexriscv fall to the OOB floor under wall pressure
-(< ~1500 s at routing time), memory dominance, or a cell count that prices Explore
-out. Live logs show memory_dominated=None across the corpus and nothing near 1M
-cells, which leaves wall pressure as the one trigger that can fire on our own
-designs today — including amd_mini-isp, which is SCORED. So "the OOB floor is
-unreachable from our corpus" is wrong; it is unreachable only while the wall is
-healthy. That is also the cheapest way to live-confirm the floor: MAX_WALL=1200 on
-mini-ISP, native constraint, ~20 minutes.
-
-WHAT THIS FILE PINS is the one property that does not depend on how you sample the
-space: **silence requires an unmeasurable WNS.** With a WNS in hand the router
-always emits either actions or blocks, so the LLM is never left unguided on a
-design we could measure. Verified here over randomised features far wider than
-anything realistic; a 120k-sample sweep found zero violations.
-
-It deliberately does NOT pin a coverage PERCENTAGE. The historical "32.4% of
-reachable feature space" figure came from a sampling range that is not recorded,
-so any percentage here would be a property of the sampler, not of the router.
+Calibrated rules do not cover every feature combination, and feasibility checks
+may reject a matching rule under wall-time, memory, or size pressure. In those
+cases the out-of-band safety floor selects an existing route-first or
+placement-preserving plan and blocks `place_design -unplace`. An empty plan is
+permitted only when WNS is unavailable, preventing unguided routing.
 """
 from __future__ import annotations
 
@@ -117,7 +79,7 @@ def test_named_out_of_band_shapes_get_guidance(wns, period, failing):
 def test_an_unmeasurable_wns_is_the_only_way_to_get_silence():
     """The residual hole, stated rather than hidden.
 
-    With no WNS there is no region to reason about, and the jul25 design note is
+    With no WNS there is no region to reason about, and the design note is
     explicit that dressing that up as a decision would be dishonest. So silence
     here is intended — but it must remain the ONLY route to silence.
     """
@@ -151,21 +113,9 @@ def test_out_of_band_plans_never_unplace():
     assert checked > 100, f"only {checked} OOB samples — the sweep stopped covering it"
 
 
-# ---------------------------------------------------------------------------
-# R3 is FEASIBILITY-gated, so its designs are only CONDITIONALLY in band.
-#
-# The corpus table says finn / amd_mini-isp / vexriscv route to R3, and the live
-# logs agree. But R3 checks that it can afford what it proposes, so those three
-# fall through to the OOB floor under wall pressure, memory dominance, or a cell
-# count that prices Explore out. Live logs show memory_dominated=None everywhere
-# and no design near 1M cells, which leaves WALL PRESSURE as the one trigger that
-# can fire on our own corpus today — on amd_mini-isp, a SCORED benchmark.
-#
-# This matters twice over: it is the cheapest way to live-confirm the OOB floor
-# (MAX_WALL=1200 on mini-ISP, native constraint, ~20 min), and it means "OOB is
-# unreachable from our corpus" — which an earlier version of this file's docstring
-# implied — is wrong.
-# ---------------------------------------------------------------------------
+# R3 routing is conditional on affordability.
+# Wall pressure, memory dominance, or excessive cell count sends an
+# otherwise matching design to the out-of-band floor.
 
 # (name, measured initial Fmax MHz, measured clock period ns, failing endpoints)
 R3_DESIGNS = [

@@ -1,25 +1,10 @@
-"""The optimization summary must NEVER be able to fail a run (aug06 incident).
+"""Tests that optimization summary generation cannot fail an otherwise valid run.
 
-WHAT HAPPENED (observed live on shipped v4.1.2 `60109c7b`, ispd16, contest wall):
+Tool-call records from safety paths may omit `elapsed_time`. Summary readers
+treat missing timing as unavailable rather than raising, so reporting cannot
+trigger recovery or discard a completed artifact.
 
-    [constraint-guard] *** TIMING CONSTRAINTS CHANGED *** clock count 1 -> 0
-    [LIFECYCLE] shipped-artifact identity recorded: size=146681810 md5=0349c750...
-    Fatal error: 'elapsed_time'
-      File "dcp_optimizer.py", line 17017, in _print_optimization_summary
-        total_tool_time = sum(detail['elapsed_time'] for detail in self.tool_call_details)
-    KeyError: 'elapsed_time'
-    [LIFECYCLE] EMERGENCY_NO_OP (fatal_KeyError)
-    make[1]: *** [Makefile:426: run_optimizer_contest] Error 1
-    [multi-restart] no usable attempt output — internal budgeted fallback
-    => VALID_FALLBACK_BASELINE, Fmax Improvement +0.00
-
-A COMPLETED, VALID, 0-route-error artifact was discarded because a *reporting*
-function raised. The two guard appends that create such an entry are the only
-`tool_call_details` writers that omit timing, and they are precisely the
-safety-mechanism paths — so the guard firing is what zeroed the benchmark.
-
-These tests drive the REAL methods (checklist item 15: a test that does not
-enter the changed code proves nothing).
+The tests exercise the production summary methods rather than substitutes.
 """
 from __future__ import annotations
 
@@ -33,6 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dcp_optimizer import DCPOptimizer
+from tests.source_corpus import (dcp_source_lines, dcp_source_text,
+                                 optimizer_class_source)
 
 
 def _async(coro):
@@ -132,21 +119,25 @@ class SummaryNeverFailsRunTests(unittest.TestCase):
         Source-level, because these branches need a live Vivado session to
         reach; the behavioural tests above cover the readers.
         """
-        src = inspect.getsource(DCPOptimizer)
+        src = optimizer_class_source(DCPOptimizer)
         for marker in ('"status": "refused_constraint_edit"',
                        '"status": "CONSTRAINTS_CHANGED"'):
             self.assertIn(marker, src, f"append site vanished: {marker}")
             block = src.split(marker, 1)[1][:400]
             self.assertIn('"elapsed_time"', block,
-                          f"{marker} appends no elapsed_time — the aug06 crash "
+                          f"{marker} appends no elapsed_time — the crash "
                           f"is reintroduced")
 
     def test_no_unguarded_elapsed_time_subscript_remains(self):
-        """No reader may subscript the key raw again."""
-        src = Path(__file__).resolve().parent.parent / "dcp_optimizer.py"
+        """Ensures elapsed-time readers tolerate records without timing data.
+
+        The check scans all optimizer implementation files for raw
+        `elapsed_time` subscripts because readers are distributed across the
+        package.
+        """
         offenders = [
             f"{i}: {ln.strip()}"
-            for i, ln in enumerate(src.read_text(errors="ignore").splitlines(), 1)
+            for i, ln in enumerate(dcp_source_lines(errors="ignore"), 1)
             if "['elapsed_time']" in ln or '["elapsed_time"]' in ln
         ]
         self.assertEqual(offenders, [],
@@ -154,8 +145,7 @@ class SummaryNeverFailsRunTests(unittest.TestCase):
 
     def test_summary_call_sites_are_all_the_safe_wrapper(self):
         """Every call site must hit the wrapper, never the inner directly."""
-        src = (Path(__file__).resolve().parent.parent
-               / "dcp_optimizer.py").read_text(errors="ignore")
+        src = dcp_source_text(errors="ignore")
         inner_calls = src.count("self._print_optimization_summary_inner(")
         self.assertEqual(inner_calls, 1,
                          "the inner body must be called exactly once — from "

@@ -1,10 +1,9 @@
-"""Phantom-best guard (jul05, preview #10 v2 score-0 incident).
+"""Verify that unrouted timing estimates cannot become the published best result.
 
-A WNS measured on an UNROUTED design is an estimate; accepting it as best
-lets the eager mirror publish an unrouted checkpoint that the harness cannot
-measure (attempt #10: estimated -0.824 post-place beat every real routed
-result; shipped DCP had 3488/3488 nets unrouted -> vivado_measurement_failed,
-design score 0). _routed_ok_for_best gates every main-loop best update."""
+Timing measured before routing is only an estimate and may appear better than
+valid routed results. `_routed_ok_for_best` therefore gates every main-loop
+best update so the selected checkpoint remains measurable and fully routed.
+"""
 import asyncio
 import os
 import sys
@@ -47,10 +46,9 @@ def test_rejects_routing_errors():
 
 
 def test_fails_closed_on_error_envelope():
-    # jul20 whole-file review S1: a probe hiccup must REJECT the
-    # best-accept — a rejected real improvement recurs at the next
-    # measurement, but an accepted phantom is protected forever by
-    # never-worse and scores 0 (the tail-of-wall timeout regime).
+    # Best-state acceptance fails closed when the verification probe reports
+    # an error. This prevents an unverified result from becoming protected
+    # by the never-worse guard.
     assert _probe('{"error": "tool_timed_out_budget"}') is False
 
 
@@ -66,11 +64,9 @@ def test_fails_closed_on_exception():
 
 
 def test_rejects_unplaced_design_via_tracker():
-    # jul23 wave-4 Q1/Q4: an UNPLACED design (place_design -unplace)
-    # reports NEITHER regex line — the report text looks "clean" — but
-    # the in-process routed-state tracker flipped False.  The tracker
-    # check must reject BEFORE the report heuristics (the phantom shipped
-    # a near-MET unplaced DCP on logicnets and spam otherwise).
+    # An unplaced design may omit both report patterns and appear valid.
+    # The in-process routed-state tracker must reject it before any report
+    # probe runs.
     import asyncio
     import dcp_optimizer as do
 

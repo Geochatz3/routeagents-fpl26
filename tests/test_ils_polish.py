@@ -15,21 +15,15 @@ def _default_rotation(monkeypatch):
     """Pin every test in this module to the DEFAULT rotation.
 
     These tests assert properties of the shipped combo rotation (indices,
-    exhaustion, pristine_rot == cycles). The jul27 place-retry extension
+    exhaustion, pristine_rot == cycles). The place-retry extension
     (FPL26_ILS_PLACE_RETRY) deliberately breaks the cycles==rotation-advance
     invariant with one out-of-order forced pick, so a test of DEFAULT behaviour
     must not depend on whether that variable happens to be set in the ambient
     environment. The extension's own tests arm it explicitly.
     """
     monkeypatch.delenv("FPL26_ILS_PLACE_RETRY", raising=False)
-    # jul28: same reason, for every later extension. A test of DEFAULT behaviour
-    # must not depend on which flags happen to be exported in the shell that runs
-    # it — the armed suite is run deliberately, arm by arm, by the release check.
-    # jul29: four of these flipped to DEFAULT ON, because the eval path never armed
-    # them and every gain we had measured was therefore not in the submission (see
-    # optimizer/ils_polish.py). This fixture's INTENT has always been "start disarmed";
-    # that used to be implied by the default and must now be stated. Setting "0" keeps
-    # every pre-jul29 test in this file meaning exactly what it meant when written.
+    # Force optional ILS features off so these tests are independent of the
+    # caller's environment and exercise the disarmed baseline.
     monkeypatch.setenv("FPL26_ILS_PLACE_RETRY_LADDER", "0")
     monkeypatch.setenv("FPL26_ILS_INCR_ROUTE", "0")
     monkeypatch.setenv("FPL26_ILS_MEASURED_BASIS", "0")
@@ -39,8 +33,6 @@ def _default_rotation(monkeypatch):
     monkeypatch.delenv("FPL26_ILS_INCR_ROUTE_TERMINAL", raising=False)
     monkeypatch.delenv("FPL26_ILS_LADDER_STOP_ON_ACCEPT", raising=False)
     monkeypatch.delenv("FPL26_ILS_LADDER_ORDER", raising=False)
-
-
 
 
 def _trig(**kw):
@@ -100,13 +92,8 @@ def test_result_summary_skip_vs_improved():
 
 
 def test_combos_winners_first():
-    # Explore (most historical accepts) leads; LASTMILE (2/2 validated
-    # accepts on plateaued states, jun12) second so the K=2 futility window
-    # covers both operator classes; ROUTE_REROLL (jul21 plateau probe, fir
-    # +0.070ns/+9.5MHz hold-improving) third — near-met designs reach it
-    # early, deep-WNS designs gate-skip it INLINE so their effective order
-    # is unchanged; ROUTE_ONLY (jul02: broadest breadth result, 8/12)
-    # fourth; ExtraTimingOpt next.
+    # Explore and LASTMILE lead so the two-cycle futility window covers both
+    # operator classes. ROUTE_REROLL follows but is skipped for deep negative slack.
     from optimizer.ils_polish import LASTMILE_PD, ROUTE_ONLY_PD, ROUTE_REROLL_PD
     assert ILS_COMBOS[0][0] == "Explore"
     assert ILS_COMBOS[1][0] == LASTMILE_PD
@@ -242,10 +229,12 @@ def test_dual_seed_config_defaults():
 
 
 def test_final_seed_futility_stop_default():
-    """jun12 wall-penalty fix: the FINAL/sole seed defaults to a K=2 futility
-    stop (score = alpha*(1-0.1*gamma): non-accepting tail cycles cost up to
-    10% of alpha; replay over 10 AWS runs = +9.65 score, zero forfeited
-    accepts). 0 must remain expressible as the legacy kill switch."""
+    """Verify that the final or sole seed uses a two-cycle futility stop by
+    default.
+
+    Non-accepting tail cycles incur a wall-time penalty, while 0 remains an
+    explicit immediate-stop setting.
+    """
     c = ILSPolishConfig()
     assert c.final_seed_no_improve_stop == 2
     c2 = ILSPolishConfig(final_seed_no_improve_stop=0)
@@ -253,9 +242,12 @@ def test_final_seed_futility_stop_default():
 
 
 def test_run_ils_polish_heavy_cmds_carry_large_timeout():
-    """Regression (local spam 2026-06-08): place/route/phys_opt must pass a
-    timeout >300s, else the MCP server's 300s default kills each step on a large
-    design and the cycle returns wns=None. Capture the timeouts actually sent."""
+    """Verify that heavy implementation commands receive timeouts longer than 300
+    seconds.
+
+    The explicit timeout must exceed the server's 300-second default, which can
+    terminate long-running steps and leave WNS unavailable.
+    """
     seen = {}
     async def fake(tool, args):
         cmd = args.get("command", "")
@@ -288,7 +280,7 @@ def test_should_trigger_at_exit():
     c = ILSPolishConfig(enabled=True, max_cells=300_000, exit_min_remaining_s=600.0)
     # stuck + budget + small -> fire
     assert ex(cells=4000, remaining_s=1300, best_wns=-0.9, cfg=c)[0] is True
-    # timing MET + surplus budget -> fire in met-surplus mode (jul04:
+    # timing MET + surplus budget -> fire in met-surplus mode (:
     # positive slack still buys alpha; fmax = 1/(T - wns))
     t_met, why_met = ex(cells=4000, remaining_s=1300, best_wns=0.1, cfg=c)
     assert t_met is True and "met-surplus" in why_met
@@ -333,10 +325,8 @@ def test_seed_gate_threshold_boundary():
     assert choose_ils_seed(initial_wns=-1.0, recipe_wns=-0.94, cfg=_cfg_seed())[0] == "recipe_best"  # gain 0.06
 
 def test_seed_gate_default_covers_llm_dribble():
-    # jul03 preview attempt-4: with the prompt guard keeping the LLM alive, v2's
-    # LLM dribbled +0.061 over 30 min, crossing the old 0.05 floor and skipping
-    # the raw seed (-0.84 capture lost; alpha 17.48 -> 9.88). The DEFAULT floor
-    # must classify a marginal dribble as STUCK.
+    # The 0.15 ns floor treats small recipe gains as stuck rather than replacing
+    # the raw seed.
     c = ILSPolishConfig()
     assert c.stuck_recipe_gain_ns == 0.15
     kind, gain = choose_ils_seed(initial_wns=-0.946, recipe_wns=-0.885, cfg=c)
@@ -474,10 +464,10 @@ def test_ws2_combo_offset_continues_rotation():
         deadline_ts=_t.time() + 5.0, wns_tcl="SLACK", cfg=CFG_RUN,
         log=lambda m: None, no_improve_stop=2, combo_offset=4))
     # offset=4 (first place-directive combo past the ROUTE_REROLL/ROUTE_ONLY
-    # sentinels since the jul21 insertion): rotation must continue from
+    # sentinels since the insertion): rotation must continue from
     # there, not restart at 0.
     assert placed[0] == ILS_COMBOS[4][0]
-    # jul05 reorder (+jul21 shift): idx5 is now the PARTIAL_RUIN sentinel
+    # reorder (+shift): idx5 is now the PARTIAL_RUIN sentinel
     # (noops under this fake and advances). The invariant under test is
     # offset CONTINUATION — the rotation must not restart at combo 0.
     assert ILS_COMBOS[0][0] not in placed[:2]
@@ -506,11 +496,9 @@ def test_ws1a_rotation_exhausted_stops_no_repeat():
         fake, best_dcp_path="/tmp/x.dcp", baseline_wns=-0.2,
         deadline_ts=_t.time() + 30.0, wns_tcl="SLACK", cfg=cfg,
         log=lambda m: None))
-    # PARTIAL_RUIN places WITHOUT a directive and ROUTE_ONLY/ROUTE_REROLL
-    # never place (baseline -0.2 is near-met, so the jul21 re-roll gate lets
-    # ROUTE_REROLL run — it consumes a cycle but adds no directive place),
-    # so directive-style places = all combos minus three; rotation must
-    # still exhaust exactly once.
+    # PARTIAL_RUIN places without a directive; ROUTE_ONLY and ROUTE_REROLL do not place.
+    # The near-met baseline admits ROUTE_REROLL, so it consumes a cycle without
+    # adding a directive. Rotation must still exhaust all remaining combinations once.
     assert len(placed) == len(ILS_COMBOS) - 3      # each directive combo once
     assert len(set(placed)) == len(ILS_COMBOS) - 3 # no repeats
     assert any("rotation exhausted" in n for n in res.notes)
@@ -596,7 +584,7 @@ def test_partial_ruin_combo_dispatch():
     incremental place_design — never full `place_design -unplace`.
 
     Needs an explicit HIGH spread: CFG_RUN leaves
-    critical_path_avg_spread_tiles at its None default, and since aug05 that
+    critical_path_avg_spread_tiles at its None default, and since that
     fails closed for partial-ruin, so the sentinel would never dispatch and
     this test would assert against an empty command list. The subject here is
     the DISPATCH SHAPE, not the gate — the gate has its own tests above.
@@ -631,7 +619,7 @@ def test_partial_ruin_combo_dispatch():
 
 def test_route_only_combo_dispatch():
     """The __ROUTE_ONLY__ sentinel combo must unroute + re-route the EXISTING
-    placement — never touch place_design in any form (jul02 DRILL H lever)."""
+    placement — never touch place_design in any form."""
     import time as _t
     from optimizer.ils_polish import ROUTE_ONLY_PD, ILS_COMBOS as _C
     offset = next(i for i, c in enumerate(_C) if c[0] == ROUTE_ONLY_PD)
@@ -658,10 +646,11 @@ def test_route_only_combo_dispatch():
 
 
 def test_route_only_accepts_exactly_zero_hold():
-    """whs=0.0 must be ACCEPTED by the combo hold gate (floor -0.001): the
-    official scorecard gate passes hold at exactly zero (jul02 preview,
-    hold_passed=true at whs_ns=0.0) — a stricter floor here would forfeit
-    ispd16-class route-only wins the validator would have scored."""
+    """Accept exactly zero hold slack through the combined hold gate.
+
+    The gate uses a -0.001 ns floor, matching score validation and preserving
+    valid route-only improvements.
+    """
     import time as _t
     from optimizer.ils_polish import ROUTE_ONLY_PD, ILS_COMBOS as _C
     offset = next(i for i, c in enumerate(_C) if c[0] == ROUTE_ONLY_PD)
@@ -691,10 +680,8 @@ def test_partial_ruin_combo_present_before_tail():
     from optimizer.ils_polish import PARTIAL_RUIN_PD, ILS_COMBOS as _C
     names = [c[0] for c in _C]
     assert PARTIAL_RUIN_PD in names
-    # jul05 promotion (climbON_a forensics): the cheap probe-validated
-    # finisher sits IMMEDIATELY after ExtraTimingOpt so the proven
-    # ExtraTimingOpt->PARTIAL_RUIN chain executes on any budget, ahead of
-    # the expensive low-hit AltSpread/ExtraNetDelay pair.
+    # PARTIAL_RUIN must immediately follow ExtraTimingOpt so the finisher chain
+    # runs before more expensive operators, even under tight budgets.
     assert names.index(PARTIAL_RUIN_PD) == names.index("ExtraTimingOpt") + 1
     assert names.index(PARTIAL_RUIN_PD) < names.index("AltSpreadLogic_high")
 
@@ -758,10 +745,11 @@ def test_sa_explore_off_by_default_keeps_greedy():
 
 
 def test_lastmile_combo_in_rotation():
-    """jun12: LASTMILE must sit INSIDE the K=2 futility window (index 1) —
-    at index >=2 it would be unreachable on a run whose first two cycles
-    don't accept, and it has the strongest accept evidence of any combo on
-    plateaued states (v2 +0.152ns, logicnets +0.059ns, both validated)."""
+    """Keep LASTMILE at index 1, inside the two-cycle futility window.
+
+    Placing it later makes the plateau-oriented combination unreachable when
+    neither of the first two cycles is accepted.
+    """
     from optimizer.ils_polish import LASTMILE_PD
     pds = [c[0] for c in ILS_COMBOS]
     assert pds.index(LASTMILE_PD) == 1
@@ -802,11 +790,11 @@ def test_lastmile_cycle_dispatches_recipe_not_ruin():
 
 
 def test_cold_start_anchor_skips_unaffordable_full_ruin():
-    """jun12 corundum drill: with no observed combo costs the picker chose
-    combo 0 (full ruin) even when it could not complete in the window. With
-    an expected_heavy_cycle_s anchor, an unaffordable Explore cycle must fall
-    through to an affordable combo — since jul02 the cheapest affordable at
-    the earliest rotation index is ROUTE_ONLY (0.6x prior, no place step)."""
+    """Verify cold-start selection skips an unaffordable full-ruin cycle.
+
+    When observed costs are unavailable, the heavy-cycle anchor estimates
+    affordability and selection falls through to the earliest affordable combo.
+    """
     first_heavy = []
     async def fake_call_tool(tool, args):
         cmd = args.get("command", "")
@@ -822,12 +810,9 @@ def test_cold_start_anchor_skips_unaffordable_full_ruin():
             return "-2.0"
         return "ok"
     import time as _t
-    # Window 1500s; anchor 1800s -> Explore est 1800 (unaffordable),
-    # LASTMILE 4500, ExtraTimingOpt 2520, AltSpread 3600, ExtraNetDelay
-    # 5400 (all out); affordable: ROUTE_REROLL 0.55*1800=990 (index 2,
-    # eligible at near-met baseline -0.5), ROUTE_ONLY 0.6*1800=1080
-    # (index 3) and partial-ruin 0.7*1800=1260 -> first cycle MUST be an
-    # unroute + re-route (ROUTE_REROLL, the earliest affordable).
+    # With a 1,500 s window and 1,800 s anchor, earlier operators are unaffordable.
+    # At near-met WNS, ROUTE_REROLL costs 990 s and is the first affordable
+    # eligible operator, so the single cycle performs an unroute and reroute.
     cfg = ILSPolishConfig(enabled=True, max_cells=300_000,
                           min_remaining_s=1100.0, stagnation_seconds=600.0,
                           min_cycle_seconds=0.0, max_cycles=1,
@@ -897,7 +882,7 @@ def test_cold_start_anchor_affordable_keeps_explore_first():
 
 
 def test_tool_ok_rejects_tcl_error_output():
-    """jun12 campaign: the MCP server reports Vivado-side failures as plain
+    """campaign: the MCP server reports Vivado-side failures as plain
     'TCL ERROR: <msg>' output, not a client error envelope — an instantly
     erroring write_checkpoint passed _tool_ok and produced a PHANTOM accept
     (recorded wns with a stale file on disk)."""
@@ -934,7 +919,7 @@ def test_phantom_accept_blocked_by_tcl_error_write():
 
 
 def test_lastmile_session_poisoning_restart():
-    """jun12 batch repro: after `place_design -directive LastMile`, the
+    """batch repro: after `place_design -directive LastMile`, the
     Vivado SESSION can no longer run a full placement (even on a freshly
     opened checkpoint) — affects AWS too. The loop must restart Vivado
     between a LASTMILE cycle and the next cycle, and on exit if the last
@@ -979,17 +964,16 @@ def test_lastmile_session_poisoning_restart():
 
 
 def test_lastmile_skipped_far_from_closure():
-    """jun13 overnight: place_design -directive LastMile FAILS on
-    far-from-closure designs (3d at -2.1ns: 'Place design failed'). The
-    LASTMILE combo must be skipped when the current best is below
-    lastmile_min_wns_ns, and the cycle must run a real (non-LASTMILE)
-    combo instead."""
+    """Verify LastMile is skipped when timing is far from closure.
+
+    Below `lastmile_min_wns_ns`, the cycle must select and run a non-LastMile combo.
+    """
     from optimizer.ils_polish import LASTMILE_PD
     placed = []
     async def fake_call_tool(tool, args):
         cmd = args.get("command", "")
         # real work = any place OR route directive (the combo after LASTMILE
-        # is ROUTE_ONLY since jul02, which never places)
+        # is ROUTE_ONLY, which never places)
         if ("place_design -directive" in cmd or "directive LastMile" in cmd
                 or cmd.startswith("route_design -directive")):
             placed.append(cmd)
@@ -1052,7 +1036,7 @@ def test_lastmile_allowed_near_closure():
 
 
 def test_write_checkpoint_retry_recovers_transient_failure():
-    """jun13: a single transient write_checkpoint failure (WSL /mnt/c
+    """: a single transient write_checkpoint failure (WSL /mnt/c
     flakiness) must NOT lose a real accept — retry once before discard."""
     state = {"wc": 0}
     async def fake_call_tool(tool, args):
@@ -1105,10 +1089,11 @@ def test_write_checkpoint_double_failure_still_discards():
 
 
 def test_lastmile_allowed_at_proven_win_baselines():
-    """REGRESSION (jun13): the gate must NOT block LASTMILE at its proven-win
-    baselines (logicnets -0.496, v2 -0.799/-0.946, mini-isp -0.882) — an
-    earlier -0.30 gate blocked LASTMILE on ALL contest designs (every one
-    ends < -0.30). Gate is -1.0; -0.9 (worst proven win class) must pass."""
+    """Verify LastMile remains eligible when WNS is above -1.0 ns.
+
+    The cutoff restricts the directive to designs sufficiently close to timing
+    closure without excluding viable near-threshold cases.
+    """
     from optimizer.ils_polish import LASTMILE_PD
     placed = []
     async def fake_call_tool(tool, args):
@@ -1139,20 +1124,19 @@ def test_lastmile_allowed_at_proven_win_baselines():
         "LASTMILE gated out at -0.9 (a proven-win baseline) — gate too tight"
 
 
-# ---- fanout_polish_accept (jun14 DRILL D): strict-hold never-worse gate ----
+# ---- fanout_polish_accept: strict-hold never-worse gate ----
 FCFG = ILSPolishConfig()   # defaults: accept_margin_ns=0.002, fanout floor=0.010
 
 
 def test_fanout_accept_hold_safe_gain():
-    # logicnets-class: real setup gain, hold safe (whs 0.068) -> ACCEPT
+    # A setup improvement with 0.068 ns hold slack is accepted.
     ok, why = fanout_polish_accept(new_wns=-0.572, best_wns=-0.601, unrouted=0,
                                    whs=0.068, base_whs=0.068, cfg=FCFG)
     assert ok, why
 
 
 def test_fanout_reject_hold_marginal():
-    # ispd16-class: big setup gain BUT hold eroded to ~0.000 (< 0.010 floor)
-    # -> REJECT (validator gates hold_passed; a reject is free/never-worse).
+    # A setup gain is rejected when hold slack falls below the 0.010 ns strict floor.
     ok, why = fanout_polish_accept(new_wns=-6.770, best_wns=-7.752, unrouted=0,
                                    whs=0.000, base_whs=0.003, cfg=FCFG)
     assert not ok and "strict floor" in why
@@ -1197,7 +1181,7 @@ def test_fanout_floor_boundary():
     assert not ok_below
 
 
-# ---- cell-count guard (jul03, GitHub #36): LASTMILE accepts vs validator band ----
+# ---- cell-count guard: LASTMILE accepts vs validator band ----
 
 def _lastmile_accept_calltool(cell_count):
     """LASTMILE cycle that would accept (-0.2 vs baseline -0.5, hold clean);
@@ -1244,10 +1228,8 @@ def test_cell_guard_allows_in_band():
 
 
 def test_cell_guard_allows_legit_shrink_post_pr41():
-    # jul13 relaxation (upstream PR #41 removed the validator's hard Check-4
-    # gate): a legitimate -lut_opt shrink to 90k (-10%, would have FAILED the
-    # old [0.975x, 1.45x] guard) is now accepted — counts are info-only
-    # upstream, our band is sanity-only.
+    # This pins acceptance of a legitimate 10% cell-count reduction; the bound
+    # is a sanity check rather than a strict preservation requirement.
     res = _run_lastmile(cell_count=90_000, golden=100_000)
     assert res.accepted == 1 and res.best_wns == -0.2
 
@@ -1257,12 +1239,9 @@ def test_cell_guard_fails_open_without_golden():
     assert res.accepted == 1                 # guard disabled, accept proceeds
 
 
-# ---- derive_cost_anchors (jul04 genericity audit): cold-start cost anchors ----
-# The full-cycle anchor (place+route) gates the ILS combo picker; the dedicated
-# fanout anchor (phys_opt+route = the polish's actual worst case) is the
-# fallback for the polish's cheap-design gate on route-only (R7) recipe paths,
-# which never place and thus left the polish self-gated on exactly the OOD
-# designs it should serve (corundum, jul04).
+# Full-cycle place-and-route cost gates ILS combination selection.
+# Fanout polish falls back to a phys-opt-plus-route anchor for route-only
+# recipes, which provide no placement sample.
 from optimizer.ils_polish import derive_cost_anchors
 
 
@@ -1310,11 +1289,8 @@ def test_anchor_r1_route_lever_path():
 
 
 def test_anchor_r7_closure_ladder_path():
-    # R7 closure-ladder shape, replayed from the REAL jul04 corundum OOD run
-    # (corundum_freeze_ood.log): granular vivado_phys_opt_design calls ONLY —
-    # no place, no route in the recipe phase. Old derivation -> anchor 0 ->
-    # "fanout-polish: skipped (cost anchor 0s ...)" live at 02:32:59. New:
-    # fanout anchor = max phys_opt sample (68s), well under the 600s gate.
+    # This fixture provides only granular phys-opt samples, with no place or route cost.
+    # The fallback fanout anchor is the maximum sample, 68 s, below the 600 s gate.
     tcs = [
         {"tool_name": "vivado_phys_opt_design", "elapsed_time": 64.0},
         {"tool_name": "vivado_phys_opt_design", "elapsed_time": 57.0},
@@ -1346,7 +1322,7 @@ def test_fanout_cost_anchor_default_unknown():
     assert ILSPolishConfig().fanout_cost_anchor_s == 0.0
 
 
-# ---- fanout-polish cheap-design gate: granular-anchor fallback (jul04) ----
+# ---- fanout-polish cheap-design gate: granular-anchor fallback ----
 
 def _fanout_gate_probe(expected, fan_anchor, deadline_offset=5000.0,
                        has_route=False):
@@ -1390,25 +1366,21 @@ def test_fanout_gate_falls_back_to_granular_anchor():
 def test_fanout_gate_granular_anchor_still_respects_cost_cap():
     # granular anchor above fanout_max_cycle_s (600) -> still gated out.
     assert _fanout_gate_probe(expected=0.0, fan_anchor=700.0) == 0
-    # ... even when complete (ispd16-class: route sample alone is huge).
+    # A complete cost sample still blocks fanout when routing alone exceeds the gate.
     assert _fanout_gate_probe(expected=2000.0, fan_anchor=700.0,
                               has_route=True) == 0
 
 
 def test_fanout_gate_incomplete_fan_anchor_keeps_full_cycle_basis():
-    # Without a route sample the potential reroute cost is unknowable: the
-    # full-cycle anchor stays the cost basis when it is known — a cheap
-    # phys_opt-only fan anchor must NOT resurrect the polish on a design
-    # whose full cycle is slow (>600s).
+    # Without a route sample, reroute cost is unknown.
+    # When a full-cycle anchor exists, it remains the cost basis; a cheap phys-opt
+    # anchor cannot admit fanout polish for a slow full cycle.
     assert _fanout_gate_probe(expected=1200.0, fan_anchor=300.0) == 0
 
 
 def test_fanout_gate_record_run_logicnets_replay():
-    # Preview #6 (RECORD, 2026-07-03) eval-box numbers: full-cycle anchor
-    # 489s (incl. 252s place the polish never runs), fan anchor 237s
-    # (phys_opt 85 + route 93 + 60) WITH route sample, 1194s remaining.
-    # Frozen code: need = 489*1.3+600 = 1236s > 1194 -> polish MISSED BY
-    # 42s on the record run. New basis: need = 237*1.3+600 = 908s -> FIRES.
+    # The gate prices a route-sampled probe from the 237 s fanout anchor,
+    # not the 489 s full-cycle estimate, leaving it affordable within 1,194 s.
     assert _fanout_gate_probe(expected=489.0, fan_anchor=237.0,
                               deadline_offset=1194.0, has_route=True) > 0
 
@@ -1421,7 +1393,7 @@ def test_fanout_gate_v2_eval_replay():
                               has_route=True) > 0
 
 
-# ---- corrective-seed local climb (jul04 preview #5-vs-#6 forensics) ----
+# ---- corrective-seed local climb ----
 
 def _wns_sequence_calltool(wns_seq):
     """Fake Vivado: each SLACK query pops the next WNS from wns_seq (the last
@@ -1457,10 +1429,9 @@ def _run_seq(wns_seq, max_cycles, baseline=-0.9, offset=0):
 
 
 def test_pristine_rot_freezes_at_first_accept():
-    # cycle 1 (idx0) measures -0.95: no accept vs -0.9; cycle 2 (idx1)
-    # measures -0.5: ACCEPT; cycle 3 (idx2) measures -1.2: no accept.
-    # NOTE each cycle issues ~2 SLACK queries (post-route + post-phys_opt);
-    # keep values pairwise identical so cycle outcomes are unambiguous.
+    # Each cycle performs two slack queries, so values are paired to keep
+    # the reject, accept, reject outcomes unambiguous.
+    # The second-cycle acceptance resets rotation; the final rejection advances it to 2.
     res = _run_seq([-0.95, -0.95, -0.5, -0.5, -1.2, -1.2], max_cycles=3)
     assert res.accepted >= 1
     # first accept happened on the cycle picked at rotation index 2 ->
@@ -1470,10 +1441,8 @@ def test_pristine_rot_freezes_at_first_accept():
 
 
 def test_pristine_rot_zero_accepts_equals_continue_semantics():
-    # no cycle accepts -> pristine_rot ends at the final rotation position,
-    # reproducing the old continue-rotation offset (spam-filter jun10 case).
-    # baseline in the tightened route-reroll band (jul22, 0.7) so no
-    # combo inline-skips and pristine_rot tracks executed cycles 1:1.
+    # With no accepted cycles, pristine_rot equals the number of executed cycles.
+    # The baseline avoids inline combo skips so each cycle advances rotation once.
     res = _run_seq([-1.5, -1.5, -1.4, -1.4, -1.3, -1.3], max_cycles=3,
                    baseline=-0.5)
     assert res.accepted == 0
@@ -1481,21 +1450,21 @@ def test_pristine_rot_zero_accepts_equals_continue_semantics():
 
 
 def test_corrective_local_climb_default_on():
-    # jul05: default ON after 3/3 live validation (v2 debug-wall runs,
+    # default ON after 3/3 live validation (v2 debug-wall runs,
     # shipped >= control every time); eval #5-vs-#6 forensics carry the
     # upside. False remains the kill switch.
     assert ILSPolishConfig().corrective_local_climb is True
 
 
-# ---- ROUTE_ONLY granular cold-start estimate (jul04 local v2 leg) ----
+# ---- ROUTE_ONLY granular cold-start estimate ----
 
 def test_cold_start_route_only_uses_granular_estimate():
-    """jul04 local-campaign v2 leg: place-dominated anchor (place 1568s of
+    """local-campaign v2 leg: place-dominated anchor (place 1568s of
     expected_heavy_cycle_s=1790s) priced ROUTE_ONLY at 0.6*1790=1074s in an
     875s window -> 'no affordable combo' -> ILS ran 0 cycles and shipped
     BASELINE, on the design where ROUTE_ONLY accepted in previews #5 AND #6.
     With the granular route+phys anchor (221s, has_route) an unroute +
-    re-route combo must be affordable and picked (since jul21 the first
+    re-route combo must be affordable and picked (since the first
     such combo at near-met baseline -0.5 is ROUTE_REROLL at idx2, basis
     221*1.3=287s; ROUTE_ONLY at idx3 keeps the 221s granular estimate)."""
     first_heavy = []
@@ -1548,7 +1517,7 @@ def test_cold_start_route_only_without_route_sample_keeps_prior():
     assert res.cycles == 0
 
 
-# ---- fanout-polish finalize reserve (jul04: five consecutive near-misses) ----
+# ---- fanout-polish finalize reserve (: five consecutive near-misses) ----
 
 def test_fanout_gate_eval7_v2_replay_fires_with_finalize_reserve():
     # Eval #7 v2: granular anchor 137 (no place sample in recipe), 731s
@@ -1559,7 +1528,7 @@ def test_fanout_gate_eval7_v2_replay_fires_with_finalize_reserve():
 
 
 def test_fanout_gate_reserve_still_skips_truly_tight():
-    # Local digit leg: 233s remaining cannot fit any attempt (need >= 478).
+    # With 233 s remaining, no attempt fits the 478 s minimum budget.
     assert _fanout_gate_probe(expected=0.0, fan_anchor=137.0,
                               deadline_offset=233.0, has_route=True) == 0
 
@@ -1567,10 +1536,12 @@ def test_fanout_gate_reserve_still_skips_truly_tight():
 # ---- combo-cost carry across seeds (GAP #4, eval #9 v2 forensics) ----
 
 def test_combo_cost_seed_makes_observed_cheap_combo_affordable():
-    """Eval #9 v2: the corrective seed's fresh cost table priced
-    ExtraTimingOpt off cold priors (1.4x anchor) and skipped it — even though
-    the raw seed had JUST measured it at 254s. With the observed table
-    threaded in, the combo must be affordable and picked."""
+    """Verify a freshly observed combo cost determines affordability during
+    corrective seeding.
+
+    Observed costs take precedence over cold-prior estimates so a measured
+    affordable combo remains selectable.
+    """
     import time as _t
     placed = []
     async def fake(tool, args):
@@ -1627,14 +1598,14 @@ def test_result_exports_observed_combo_costs():
     assert res.cycles == 1 and len(res.combo_cost) == 1
 
 
-# ---- LASTMILE final polish (jul06): accept gate ----
+# ---- LASTMILE final polish: accept gate ----
 from optimizer.ils_polish import lastmile_polish_accept
 
 LCFG = ILSPolishConfig(golden_cell_count=100_000)
 
 
 def test_lastmile_polish_accepts_probe_case():
-    # jun12 probe: v2 -0.799 -> -0.647, hold clean, cells in band
+    # probe: v2 -0.799 -> -0.647, hold clean, cells in band
     ok, why = lastmile_polish_accept(new_wns=-0.647, best_wns=-0.799,
                                      unrouted=0, whs=0.02, cell_count=101_000,
                                      cfg=LCFG)
@@ -1657,7 +1628,7 @@ def test_lastmile_polish_rejects_cell_band_violation():
 
 
 def test_lastmile_polish_allows_legit_shrink_post_pr41():
-    # jul13: -10% shrink is legal now (upstream PR #41; band is sanity-only)
+    # -10% shrink is legal now (upstream PR #41; band is sanity-only)
     ok, why = lastmile_polish_accept(new_wns=-0.647, best_wns=-0.799,
                                      unrouted=0, whs=0.02, cell_count=90_000,
                                      cfg=LCFG)
@@ -1682,12 +1653,8 @@ def test_lastmile_polish_default_on():
     assert ILSPolishConfig().lastmile_polish_enabled is True
 
 
-# ---- LASTMILE final-polish stage wrapper (jul06, c46e62e+bff156a) ----
-# Direct tests for DCPOptimizer._lastmile_polish_after_ils — the integrated
-# stage (entry/budget gates, step-error abort, the bff156a incremental
-# reroute retry, accept bookkeeping). Until now only the pure accept
-# function was covered; the retry branch shipped in #13 with zero direct
-# coverage (live jul06 v2 run predates bff156a).
+# Integrated final-polish wrapper coverage includes entry and budget gates,
+# step-error aborts, incremental reroute retry, and acceptance bookkeeping.
 
 def _lastmile_stage_stub(*, route_status_seq, slack_seq, hold="0.05",
                          cells="100000", fail_cmd_substr=None,
@@ -1772,7 +1739,7 @@ def test_lastmile_stage_accept_clean_first_measure():
 
 
 def test_lastmile_stage_retry_reroute_then_accept():
-    # jul06 v2 case + the bff156a fix: first measure sees 39 unrouted ->
+    # v2 case + the bff156a fix: first measure sees 39 unrouted ->
     # ONE bare incremental route_design -> second measure clean -> ACCEPT
     # judged on the SECOND measurement.
     stub, calls = _lastmile_stage_stub(
@@ -1836,7 +1803,7 @@ def test_lastmile_stage_step_error_aborts_before_measure():
 
 def test_lastmile_stage_write_failure_keeps_best():
     # Accept passes but write_checkpoint errors -> best NOT updated (the
-    # jun12 phantom-accept lesson applied to this stage).
+    # phantom-accept lesson applied to this stage).
     stub, calls = _lastmile_stage_stub(
         route_status_seq=[_RS_CLEAN], slack_seq=["-0.2"], write_fails=True)
     _drive_lastmile(stub, best_wns=-0.5)
@@ -1844,12 +1811,8 @@ def test_lastmile_stage_write_failure_keeps_best():
     assert stub._best_valid_dcp is None
 
 
-# ---- gain-weighted futility counter (jul06 #12-vs-#13 gamma forensics) ----
-# A micro-accept (gain < meaningful_accept_ns) is KEPT but counts as a futile
-# cycle: preview #13's +0.007ns accept reset the K=2 counter and bought 24min
-# of dead cycles (gamma 0.577->0.917, net -1.2 score vs #12). Corpus mining
-# (58 accepting seeds): micro-accepts are terminal 4/4 — never followed by a
-# meaningful accept in the same seed.
+# A gain below meaningful_accept_ns remains accepted but counts as futile,
+# preventing negligible gains from resetting the no-improvement counter.
 
 def _run_futility_seq(wns_seq, *, no_improve_stop=2, meaningful=None,
                       baseline=-0.5, max_cycles=6):
@@ -1914,11 +1877,8 @@ def test_meaningful_zero_restores_legacy_reset_on_any_accept():
     assert res.cycles == 3
 
 
-# ---- K3 spread gate on PARTIAL_RUIN (jul20 whole-history mining) ----
-# Held-out rule 2 (final_round/k3_history_mining_jul20.md): multi-cell
-# surgery on a co-located critical path (spread ~ 0) is 26/26 negative
-# (mean -1.10ns); on spread-diagnosed paths it is strongly positive.
-# The gate skips ONLY the PARTIAL_RUIN combo family; rotation continues.
+# Near-zero critical-path spread blocks only the PARTIAL_RUIN combo family.
+# Other combo families remain eligible and rotation continues.
 
 def _spread_gate_calltool(cmds):
     async def fake(tool, args):
@@ -1967,8 +1927,7 @@ def test_spread_gate_defaults():
 
 
 def test_spread_gate_fires_on_known_low_spread():
-    # optical-flow class measures ~15 tiles -> PARTIAL_RUIN never executes,
-    # every OTHER combo still runs (rotation continues around the skip).
+    # A ~15-tile spread gates partial ruin while rotation runs every other combination.
     res, cmds, logs = _run_spread(15.2)
     assert not _ran_partial_ruin(cmds)
     assert res.cycles == len(ILS_COMBOS) - 1     # all non-gated combos ran
@@ -1976,18 +1935,15 @@ def test_spread_gate_fires_on_known_low_spread():
     assert any("rotation exhausted" in n for n in res.notes)
     assert any("partial-ruin spread-gated" in n for n in res.notes)
     assert any("partial-ruin skipped: spread=15.2 < 30 "
-               "(K3 corpus 26/26 negative" in l for l in logs)
+               "(evidence corpus 26/26 negative" in l for l in logs)
 
 
 def test_spread_gate_fails_closed_when_spread_unknown():
-    """spread=None FAILS CLOSED for partial-ruin (aug05 gray-areas panel).
+    """Verify partial ruin is blocked when placement spread is unknown.
 
-    Was `test_spread_gate_inert_when_spread_unknown`, asserting the opposite.
-    The aug05 panel (qwen H4b, narrowed) deliberately inverted this: an
-    unmeasured spread is indistinguishable from the co-located class, which is
-    26/26 negative in the corpus (mean -1.10 ns), against a foregone upside of
-    +0.068 ns mean. See the K3 SPREAD GATE block in optimizer/ils_polish.py.
-    The ENDHIGH gate's None handling is deliberately NOT symmetric.
+    Unknown spread fails closed because it cannot be distinguished from the
+    risky co-located condition. The end-high gate intentionally handles unknown
+    values differently.
     """
     res, cmds, logs = _run_spread(None)
     assert not _ran_partial_ruin(cmds), (
@@ -2005,7 +1961,7 @@ def test_spread_gate_inert_when_spread_is_high():
 
 
 def test_spread_gate_inert_on_high_spread():
-    # 302 tiles (vexriscv-class): surgery corpus-positive -> gate must not fire.
+    # A wide ~302-tile spread keeps partial ruin enabled.
     res, cmds, _ = _run_spread(302.0)
     assert _ran_partial_ruin(cmds)
     assert res.cycles == len(ILS_COMBOS)
@@ -2026,13 +1982,8 @@ def test_spread_gate_boundary_is_strictly_below():
     assert not _ran_partial_ruin(cmds_under)
 
 
-# ---- __ROUTE_REROLL__ near-met route lottery re-roll (jul21 plateau probe) ----
-# Evidence (final_round/plateau_probe_jul21.md + drill_local_queue_jul21.md):
-# full `route_design -unroute` + `route_design -directive AggressiveExplore`
-# on the banked BEST fir state (near-met -0.195, route-share-dominated)
-# gained +0.070ns ~ +9.5MHz with hold IMPROVING (+0.044); 429s local ~ ~170s
-# eval. Deep-WNS states are owned by the bare-reroute tail loop (queue:
-# -10.676 state gained only +0.010) -> picker gate is near-met only.
+# Route reroll is limited to near-met, route-dominated states.
+# Deep negative slack remains assigned to the tail reroute loop.
 
 def _rr_calltool(cmds, *, hold="0.05", slack="-2.0"):
     async def fake(tool, args):
@@ -2088,7 +2039,7 @@ def _rr_fired(logs):
 def test_route_reroll_defaults():
     cfg = ILSPolishConfig()
     assert cfg.route_reroll_enabled is True          # probe-validated -> ON
-    assert cfg.route_reroll_max_wns_mag == 0.7       # probe jul22: bite only shallow; optical -0.842 measured negative
+    assert cfg.route_reroll_max_wns_mag == 0.7       # probe: bite only shallow; optical -0.842 measured negative
     assert cfg.route_cost_anchor_s == 0.0            # unknown until plumbed
 
 
@@ -2231,7 +2182,7 @@ def test_route_reroll_spread_gate_composition():
 
 
 def test_route_reroll_rotation_intact_for_other_combos():
-    """Freeze-style: the jul21 insertion must not reorder anything else —
+    """Freeze-style: the insertion must not reorder anything else —
     full expected order, sentinels included."""
     from optimizer.ils_polish import (LASTMILE_PD, ROUTE_ONLY_PD,
                                       ROUTE_REROLL_PD, PARTIAL_RUIN_PD)
@@ -2245,12 +2196,8 @@ def test_route_reroll_rotation_intact_for_other_combos():
     assert ILS_COMBOS[2][1] == "AggressiveExplore"   # the probe's directive
 
 
-# ---- PLACE-RETRY extension (jul27, opt-in FPL26_ILS_PLACE_RETRY) ----
-#
-# spam ships +0.00 at parity (VALID_FALLBACK_BASELINE whose artifact md5 equals the
-# INPUT md5) because ILS_COMBOS[0]=Explore REGRESSES it (-0.688 vs -0.686 baseline)
-# and futility stops the search with budget unspent. AltSpreadLogic_medium reaches
-# -0.598 (+17.51) at the same cycle cost and is absent from the rotation.
+# Place retry is opt-in and must not change the default combo ordering,
+# list length, or indices used by rotation-exhaustion accounting.
 
 def test_place_retry_default_off_is_byte_identical():
     """Unarmed the rotation must be EXACTLY the shipped one -- same list, same
@@ -2296,9 +2243,11 @@ def _capture_placed(monkeypatch, armed, wns="-0.95", baseline=-0.9, cycles=3):
 
 
 def test_place_retry_fires_on_regression(monkeypatch):
-    """Cycle 1 regresses -> the NEXT cycle uses the measured-better directive.
-    Without the jump the extension sits at the end of the rotation and futility
-    stops the search before ever reaching it."""
+    """Verify a regressing cycle schedules the measured-better directive next.
+
+    Immediate promotion prevents futility termination from making the directive
+    unreachable at the end of the rotation.
+    """
     from optimizer.ils_polish import PLACE_RETRY_TARGET
     placed, _ = _capture_placed(monkeypatch, armed=True)
     assert placed[0] == ILS_COMBOS[0][0] == "Explore"
@@ -2329,14 +2278,9 @@ def test_place_retry_does_not_corrupt_pristine_rot(monkeypatch):
     assert res.pristine_rot <= res.cycles
 
 
-# ---- MEASURED COST BASIS (jul28) -------------------------------------------
-# Replays optical-flow's LIVE numbers from gate_ab_jul27 (agent.log):
-#   cold-start anchor 672s | ILS window 2110s | cycle 1 Explore dt=225s
-#   baseline -0.924 | cycle-1 result -1.162 (a REGRESSION -> place-retry fires)
-# Unarmed, ExtraNetDelay_high prices at 3.0 x 672 = 2016s > 1885s remaining and
-# the forced pick is REFUSED -- which is why optical never reached the directive
-# its own sweep ranks first (+26.48). Armed, the basis becomes the MEASURED
-# 225s cycle and the same pick costs 776s, comfortably affordable.
+# A regressing first cycle activates place retry.
+# Retry pricing then uses the measured 225 s cycle instead of the 672 s
+# cold-start anchor, making the forced pick affordable within a 2,110 s window.
 OPTICAL_ANCHOR_S = 672.0
 OPTICAL_WINDOW_S = 2110.0
 OPTICAL_CYCLE_S = 225.0
@@ -2435,7 +2379,7 @@ def test_measured_basis_default_off_is_byte_identical():
     assert cold_start_basis(_C, 0.0) == OPTICAL_ANCHOR_S
 
 
-# ---- PROBE LADDER + INCREMENTAL RE-ROUTE (jul28) ---------------------------
+# ---- PROBE LADDER + INCREMENTAL RE-ROUTE ---------------------------
 
 def _capture_cmds(monkeypatch, env, wns_seq, cycles=5, baseline=-0.9):
     """Run the loop with a scripted WNS sequence; capture every issued command."""
@@ -2476,10 +2420,11 @@ def test_ladder_first_rung_is_exactly_the_shipped_target():
 
 
 def test_ladder_probes_every_rung_in_evidence_order(monkeypatch):
-    """Each rung is a separate forced cycle, in the declared order.
+    """Verify every retry-ladder rung runs as a separate forced cycle in declared
+    order.
 
-    spam's best directive (AltSpreadLogic_medium, +17.51) is rung 2; it is
-    unreachable with the single-rung retry because futility stops the search.
+    Preserving evidence order keeps later rungs reachable despite normal
+    futility termination.
     """
     from optimizer.ils_polish import PLACE_RETRY_LADDER
     _, placed, _ = _capture_cmds(
@@ -2501,7 +2446,7 @@ def test_ladder_disarmed_still_fires_only_the_single_rung(monkeypatch):
 
 
 def test_incr_route_absent_from_rotation_when_disarmed(monkeypatch):
-    """jul29: renamed from '..._unless_armed'. INCR_ROUTE is now DEFAULT ON, so the
+    """: renamed from '..._unless_armed'. INCR_ROUTE is now DEFAULT ON, so the
     property under test is that =0 restores the shipped rotation exactly."""
     from optimizer.ils_polish import active_combos, INCR_ROUTE_PD, ILS_COMBOS
     monkeypatch.setenv("FPL26_ILS_INCR_ROUTE", "0")
@@ -2558,12 +2503,8 @@ def test_incr_route_never_unroutes(monkeypatch):
     assert not any(c.startswith("place_design") for c in window), window
 
 
-# ---- RETRY BASELINE GATE (jul28) -------------------------------------------
-# Each row is (design, pristine baseline WNS, incumbent WNS, cycle-1 Explore WNS,
-# should the trigger fire). Baselines are read from each production log's own
-# "Initial Fmax: ... (WNS: ...)" line; spam and 3d come from their record docs.
-# The point of the gate: fire on the three designs whose records need it, stay
-# inert on designs where the RECIPE is good and Explore merely trails it.
+# Rows contain pristine baseline, incumbent, first-cycle WNS, and expected trigger.
+# Cases distinguish retry-worthy regressions from cycles that merely trail an incumbent.
 BASELINE_GATE_CORPUS = [
     ("spam",        -0.686,  -0.686,  -0.688,  True),
     ("3d",          -2.153,  -2.153,  -2.278,  True),
@@ -2626,7 +2567,7 @@ def test_without_the_gate_the_trigger_fires_on_nearly_everything(
     assert got is (c1 <= inc), f"{name}: unarmed trigger should track incumbent only"
 
 
-# ---- PANEL REFINEMENTS (jul28): ladder reserve + incr-route terminal --------
+# ---- PANEL REFINEMENTS: ladder reserve + incr-route terminal --------
 
 def _run_loop(monkeypatch, env, wns="-0.95", cycles=8, window=400.0,
               no_improve_stop=0, anchor=0.0, spread=None, failing=None,
@@ -2734,30 +2675,13 @@ def test_panel_refinements_are_default_off(monkeypatch):
     assert incr_route_terminal_enabled() is False
 
 
-# ---- SKIP-UNAFFORDABLE (jul31, digit) --------------------------------------
-# An unaffordable rung costs a whole cycle and hands it to generic rotation.
-# On digit that draw decided a 32 MHz spread: __LASTMILE__ (91s) kept the ladder
-# alive to ExtraNetDelay_low and +72.59; __ROUTE_ONLY__ (845s) ended it at +40.36.
-#
-# Window/anchor arithmetic used below: anchor 250s, window 400s.
-#   rung 1 ExtraNetDelay_high    prior 2.415 (measured) / 3.447 (legacy)
-#                                -> est >= 604s  > 400s remaining  UNAFFORDABLE
-#   rung 2 AltSpreadLogic_medium prior 1.05  -> est  262s  < 400s   AFFORDABLE
-# so rung 1 always refuses and rung 2 is always reachable, under either prior.
+# With a 250 s anchor and 400 s window, the first rung costs at least 604 s
+# under either prior, while the second costs 262 s.
+# Skipping the unaffordable rung must leave the affordable rung reachable.
 
 def test_skip_unaffordable_is_default_on_with_kill_switch(monkeypatch):
-    """aug02: PROMOTED to default-ON. Pins the NEW contract.
-
-    ⚠️ RECORD, verbatim, because this promotion is unusual: the never-worse gate
-    on corescore FAILED as pre-registered (treatment below control in 2 of 3
-    fired pairs, gaps 0.73 and 3.09 MHz). It was shipped anyway as an EXPLICIT
-    RISK-ACCEPTED DECISION BY THE USER, on the grounds that (a) both gaps are at
-    or under the measured 3.5 MHz noise floor, (b) the treatment values
-    {83.12, 83.12, 80.03} sit entirely inside corescore's historical flag-OFF
-    distribution — v2.0's own sweep drew 80.03 with no flag — so the control
-    column being lucky explains the pairs, and (c) the digit benefit removes a
-    17-28% chance of a -32 MHz collapse (EV ~ +5.4 MHz). This is a documented
-    trade, not a passed gate. finn was 6/6 identical at its MAX.
+    """Verify unaffordable-combo skipping defaults to enabled and supports an
+    explicit kill switch.
     """
     from optimizer.ils_polish import ladder_skip_unaffordable_enabled
     monkeypatch.delenv("FPL26_ILS_LADDER_SKIP_UNAFFORDABLE", raising=False)
@@ -2766,11 +2690,8 @@ def test_skip_unaffordable_is_default_on_with_kill_switch(monkeypatch):
     assert ladder_skip_unaffordable_enabled() is False, "=0 must stay a real kill switch"
 
 
-# ---- ExtraNetDelay_high DENSITY GATE (jul31) --------------------------------
-# Corpus densities (failing/spread), constant per design across 101 runs:
-#   ARMED   3d 1314   spam 808   optical 518        (accept 100% / 59% / 94%)
-#   BLOCKED vexriscv_v2 255  digit 175  mini-isp 86  vexriscv 36  logicnets 14
-# Threshold 363 = geometric midpoint of the 255->518 gap.
+# Density is the failing-endpoint count divided by path spread.
+# Threshold 363 is the geometric midpoint between blocked 255 and admitted 518.
 
 def _cfg_with(spread, failing):
     return ILSPolishConfig(enabled=True,
@@ -2779,7 +2700,7 @@ def _cfg_with(spread, failing):
 
 
 def test_endhigh_density_gate_is_default_on_with_a_kill_switch(monkeypatch):
-    """DEFAULT ON since jul31 (digit +72.59 and optical +32.38 on one build).
+    """DEFAULT ON (digit +72.59 and optical +32.38 on one build).
     The kill switch must still fully disarm it."""
     from optimizer.ils_polish import (endhigh_density_gate_enabled,
                                       endhigh_density_blocked)
@@ -2810,19 +2731,17 @@ def test_endhigh_density_arms_the_winners_and_blocks_the_losers(monkeypatch):
     for name, (sp, fa) in blocked.items():
         blk, why = endhigh_density_blocked(_cfg_with(sp, fa), 900.0, 1000.0)
         assert blk is True, f"{name} must be BLOCKED on a big bet: {why}"
-    # SMALL BET (share 0.2): NOTHING blocks -- this is what saves vexriscv's
-    # 4 accepts (share 0.15-0.21) and logicnets' 2 (0.51-0.52).
+    # The small-bet path bypasses density filtering at a 0.2 budget share.
     for name, (sp, fa) in {**armed, **blocked}.items():
         blk, why = endhigh_density_blocked(_cfg_with(sp, fa), 200.0, 1000.0)
         assert blk is False, f"{name} must ARM on a small bet: {why}"
 
 
 def test_endhigh_density_fails_open_on_every_unknown(monkeypatch):
-    """THE GUARD THAT MUST STILL FAIL.
+    """Verify the end-high density guard fails open when any required input is unknown.
 
-    Blocking ExtraNetDelay_high because a RapidWright spread analysis was
-    skipped would cost optical 17.7 points to avoid a 1300s waste. Every
-    uncertainty must therefore ARM, never block."""
+    Missing optional analysis must not block a potentially useful directive.
+    """
     from optimizer.ils_polish import endhigh_density_blocked
     monkeypatch.setenv("FPL26_ILS_ENDHIGH_DENSITY_GATE", "1")
     nan, inf = float("nan"), float("inf")
@@ -2832,12 +2751,9 @@ def test_endhigh_density_fails_open_on_every_unknown(monkeypatch):
                 _cfg_with(0.0, 7866),       # zero spread (would divide by zero)
                 _cfg_with(-3.0, 7866),      # nonsense spread
                 _cfg_with("x", 7866),       # unparseable
-                # NaN/inf regression guard (gpt-5.6-sol, panel_endhigh_jul31.md):
-                # EVERY comparison against NaN is False, so `spread <= 0` does
-                # not catch it and it falls through to `dens >= thr` -> False ->
-                # BLOCKED. An infinite spread gives density exactly 0.0, which
-                # compares cleanly and also blocks. Both would block an
-                # optical-like design while claiming to fail open.
+                # Non-finite spread or endpoint inputs must fail open. Explicit
+                # checks are required because NaN comparisons otherwise fall
+                # through.
                 _cfg_with(nan, 7866),
                 _cfg_with(15.2, nan),
                 _cfg_with(inf, 7866),
@@ -2848,25 +2764,26 @@ def test_endhigh_density_fails_open_on_every_unknown(monkeypatch):
 
 def test_endhigh_density_threshold_override_rejects_garbage(monkeypatch):
     """A broken override must fall back to the default, never silently disable
-    the gate (jul30: a probe that returns nothing is not a pass)."""
+    the gate (: a probe that returns nothing is not a pass)."""
     from optimizer.ils_polish import (endhigh_density_min, endhigh_density_blocked,
                                       ENDHIGH_DENSITY_MIN_DEFAULT)
     monkeypatch.setenv("FPL26_ILS_ENDHIGH_DENSITY_GATE", "1")
     for bad in ("not-a-number", "", "0", "-5"):
         monkeypatch.setenv("FPL26_ILS_ENDHIGH_DENSITY_MIN", bad)
         assert endhigh_density_min() == ENDHIGH_DENSITY_MIN_DEFAULT
-        # and digit is still blocked rather than let through by the bad value
+        # A malformed override fails closed for a high-density, ~23k-cell design.
         assert endhigh_density_blocked(_cfg_with(131.4, 22946), 900.0, 1000.0)[0] is True
     monkeypatch.setenv("FPL26_ILS_ENDHIGH_DENSITY_MIN", "100")
     assert endhigh_density_min() == 100.0
-    # at 100, digit (175) now ARMS -- proving the threshold is really consulted
+    # Lowering the threshold admits the high-density path for this ~23k-cell fixture.
     assert endhigh_density_blocked(_cfg_with(131.4, 22946), 900.0, 1000.0)[0] is False
 
 
 def test_endhigh_density_blocks_the_rotation_path_not_just_the_ladder(monkeypatch):
-    """ExtraNetDelay_high lives in the BASE rotation (ILS_COMBOS), so gating only
-    the place-retry ladder would leave the path it actually reached digit by wide
-    open. With the gate armed on a low-density design it must never be placed."""
+    """Verify the density gate removes the high-delay directive from the base rotation.
+
+    The gate applies to every scheduling path, not only the place-retry ladder.
+    """
     placed, logs = _run_loop(
         monkeypatch,
         {"FPL26_ILS_PLACE_RETRY_LADDER": "0",     # ladder OFF: rotation path only
@@ -2904,12 +2821,11 @@ def test_skip_unaffordable_advances_to_the_next_rung_in_the_same_cycle(monkeypat
 
 
 def test_skip_unaffordable_disarmed_surrenders_the_cycle(monkeypatch):
-    """The control. Same window, same anchor, flag off: rung 1 still refuses, but
-    nothing advances — which is what let an 845s rotation draw end digit's run.
+    """Verify that a disarmed, unaffordable probe leaves the cycle unused.
 
-    This is the within-build control the mechanism claim rests on: without it,
-    'AltSpreadLogic_medium ran' proves nothing, since arming the ladder appends
-    it to the rotation anyway (see test_ladder_reserve_stops_the_ladder...)."""
+    Rejecting the first rung must not advance the rotation when the mechanism
+    is disabled.
+    """
     _, logs = _run_loop(
         monkeypatch,
         {"FPL26_ILS_PLACE_RETRY_LADDER": "1",
@@ -2927,7 +2843,7 @@ def test_skip_unaffordable_cannot_bypass_the_ladder_reserve(monkeypatch):
     it to be wrong is to walk past a rung the reserve would have stopped.
 
     With reserve armed at anchor 250s / window 400s, rung 2 costs 262s and cannot
-    also reserve 250s. Skip-unaffordable brought us to rung 2; the reserve must
+    also reserve 250s. Skip-unaffordable advanced to rung 2; the reserve must
     still gate it and clear the queue, so the ladder must NOT advance to rung 3.
 
     NOTE what this deliberately does NOT assert. My first version checked that
@@ -2997,12 +2913,10 @@ def test_incr_route_skipped_when_incumbent_router_is_unknown(monkeypatch):
 
 
 def test_ladder_stops_probing_once_a_rung_accepts(monkeypatch):
-    """Found live on spam: rung 2 ACCEPTED and rung 3 — a directive already measured
-    WORSE on that design — then consumed the last of the ruin window. An accept
-    answers the placement-family question, so the remaining rungs are dropped.
+    """Verify that the ladder stops probing after a rung accepts.
 
-    WNS script: cycle 1 regresses (queues the ladder), rung 1 also fails to beat
-    the incumbent, rung 2 accepts. Two readings per cycle (post-route, post-physopt).
+    An acceptance resolves the placement-family choice, so all remaining rungs
+    are dropped.
     """
     seq = ["-0.95", "-0.95",     # cycle 1 Explore: regression -> ladder queued
            "-0.95", "-0.95",     # rung 1: no accept
@@ -3033,10 +2947,8 @@ def test_stop_on_accept_is_default_off(monkeypatch):
     assert ladder_stop_on_accept_enabled() is False
 
 
-# ---- STUCK-SEED THRESHOLD OVERRIDE (jul28) ---------------------------------
-# Which NETLIST the ILS re-places from decides optical's record: its recipe_gain is
-# 0.154 against a 0.15 cut, so it takes the recipe_best seed and lands -0.971 where
-# the raw-seeded sweep lands -0.846. These pin the override, not the constant.
+# These cases pin seed selection around the recipe-gain cutoff:
+# gains below 0.15 use the raw seed; gains above it use recipe_best.
 STUCK_CORPUS = [("spam", 0.021, "raw"), ("corescore", 0.141, "raw"),
                 ("optical", 0.154, "recipe_best"), ("vtr", 0.211, "recipe_best"),
                 ("vexriscv", 1.035, "recipe_best")]
@@ -3059,7 +2971,7 @@ def test_override_moves_optical_to_the_raw_seed(monkeypatch):
     cfg = ILSPolishConfig(enabled=True)
     monkeypatch.setenv("FPL26_ILS_STUCK_GAIN_NS", "0.20")
     assert choose_ils_seed(initial_wns=-1.0, recipe_wns=-0.846, cfg=cfg)[0] == "raw"
-    # vexriscv (1.035) must STAY on recipe-best even at the raised threshold
+    # A 1.035 ns recipe gain remains on the recipe-best seed at the raised threshold.
     assert choose_ils_seed(initial_wns=-1.0, recipe_wns=0.035, cfg=cfg)[0] == "recipe_best"
 
 
@@ -3073,17 +2985,10 @@ def test_stuck_threshold_override_default_and_garbage_are_inert(monkeypatch):
 
 
 def test_any_forced_probe_is_futility_exempt_not_just_ladder_rungs(monkeypatch):
-    """REGRESSION TEST for a measured -8.02 MHz loss.
+    """Verify that every forced probe is exempt from futility strikes.
 
-    optical arm=mb (single-rung place-retry): the forced ExtraNetDelay_high probe
-    returned -0.971, took the SECOND futility strike, and the loop stopped at
-    cycles=2 accepted=0 -> +17.11, against +25.13 with the probe disarmed. In the
-    control the second cycle was ROUTE_ONLY and it ACCEPTED. The exemption had been
-    gated behind the ladder flag, so the single-rung path never got it.
-
-    Replays that shape with the REAL K=2 futility rule and every cycle regressing:
-    without the exemption the run ends at cycles=2 (cycle 1 = strike 1, the forced
-    probe = strike 2); with it, the probe does not count and a third cycle runs.
+    The exemption applies to single-rung probes as well as ladder rungs,
+    preserving eligibility for later cycles.
     """
     import time as _t
     monkeypatch.setenv("FPL26_ILS_PLACE_RETRY", "1")
@@ -3110,10 +3015,12 @@ def test_any_forced_probe_is_futility_exempt_not_just_ladder_rungs(monkeypatch):
 
 
 def test_incr_route_priority_takes_the_cycle_before_the_route_sentinels(monkeypatch):
-    """spam jul28 arm=stopaccept reached +20.85 and then logged the escalation as
-    skipped TWICE — ROUTE_REROLL/ROUTE_ONLY had already re-routed the incumbent
-    with AggressiveExplore, destroying the precondition S3 needs. Armed, the
-    escalation must take its cycle while it is still eligible."""
+    """Verify that incremental-route escalation runs before route fallback
+    sentinels.
+
+    Fallback reroutes can invalidate escalation eligibility, so an eligible
+    escalation must claim the cycle first.
+    """
     from optimizer.ils_polish import INCR_ROUTE_PD
     seq = ["-0.80", "-0.80"] + ["-0.85"] * 20   # cycle 1 accepts -> _last_rd=Explore
     _, _, _ = _capture_cmds(
@@ -3161,9 +3068,11 @@ def _run_incr_route_priority(monkeypatch, route_anchor_s, window_s):
 
 
 def test_incr_route_priority_fires_when_a_full_route_is_priced_out(monkeypatch):
-    """spam jul28: remaining 292s vs full-route need 367s. Nothing else could have
-    used that cycle, so the escalation takes it and carries the record step
-    (-0.598 -> -0.543, +29.19)."""
+    """Verify that incremental-route escalation runs when the remaining budget
+    cannot cover a full route.
+
+    The escalation claims an otherwise unusable cycle.
+    """
     logs = _run_incr_route_priority(monkeypatch, route_anchor_s=400.0,
                                     window_s=300.0)
     assert any("incr-route PRIORITY:" in m for m in logs), logs
@@ -3171,10 +3080,11 @@ def test_incr_route_priority_fires_when_a_full_route_is_priced_out(monkeypatch):
 
 
 def test_incr_route_priority_yields_when_a_full_route_still_fits(monkeypatch):
-    """3d jul28 night16: remaining 441s vs full-route need 376s. The jump displaced
-    ROUTE_ONLY (+0.079ns) for a 0.005ns micro-accept and cost the design 5.96 MHz.
-    With the guard the jump must YIELD, leaving the cycle to the from-scratch
-    route."""
+    """Verify that incremental-route escalation yields when the remaining budget
+    can cover a full route.
+
+    A from-scratch route takes priority while it remains affordable.
+    """
     logs = _run_incr_route_priority(monkeypatch, route_anchor_s=290.0,
                                     window_s=4000.0)
     assert any("incr-route PRIORITY yielded" in m for m in logs), logs
@@ -3183,16 +3093,19 @@ def test_incr_route_priority_yields_when_a_full_route_still_fits(monkeypatch):
 
 def test_incr_route_priority_yields_when_the_route_anchor_is_unknown(monkeypatch):
     """No anchor = cannot PROVE a full route is priced out. Fail safe to the
-    pre-jul28 shipped order rather than jump on an unmeasured guess."""
+    earlier shipped order rather than jump on an unmeasured guess."""
     logs = _run_incr_route_priority(monkeypatch, route_anchor_s=0.0,
                                     window_s=4000.0)
     assert not any("incr-route PRIORITY:" in m for m in logs), logs
 
 
 def test_incr_route_priority_default_on_and_disarms_on_zero(monkeypatch):
-    """jul29: this flag flipped to DEFAULT ON because the eval path never armed it —
-    spam ships +17.51 instead of +29.19 without it. Both directions are pinned here,
-    since the ON default is now a SHIP property and not merely a convenience."""
+    """Verify that incremental-route priority is enabled by default and disabled
+    by a zero-valued setting.
+
+    Both the default and the explicit opt-out are part of the configuration
+    contract.
+    """
     from optimizer.ils_polish import incr_route_first_enabled
     monkeypatch.delenv("FPL26_ILS_INCR_ROUTE_FIRST", raising=False)
     assert incr_route_first_enabled() is True, "eval runs set no flags; this must be on"
@@ -3201,38 +3114,31 @@ def test_incr_route_priority_default_on_and_disarms_on_zero(monkeypatch):
 
 
 def test_ladder_order_by_wns_is_default_on_with_kill_switch(monkeypatch):
-    """aug01: PROMOTED to default-ON, so this pins the NEW contract.
+    """Verify that WNS-based ladder ordering is enabled by default and retains an
+    opt-out.
 
-    It used to assert default-OFF, with the rationale "the shipped evidence order
-    stands until an A/B moves it". `ladder_ab_jul31` is that A/B: 6 designs x
-    (treatment, control), one build, ship surface a828b63f on both boxes. The
-    reorder FIRED on three — spam 29.19 vs ctrl 10.78, fir 21.30 vs 13.38,
-    logicnets 105.61 vs 105.61 — with ZERO firing designs below their mode, and
-    was a provable no-op on the other three (|ILS baseline| >= 0.7). The
-    pre-registered rule (spam >= 26.16 AND no firing design below mode) is met.
-
-    Kept as an inversion rather than deleted: a promoted flag still needs its
-    default AND its escape hatch pinned, or a later refactor silently un-ships it.
+    Both the default behavior and the kill switch are part of the configuration
+    contract.
     """
     from optimizer.ils_polish import ladder_rungs, PLACE_RETRY_LADDER
     monkeypatch.delenv("FPL26_ILS_LADDER_ORDER", raising=False)
     monkeypatch.delenv("FPL26_ILS_LADDER_ORDER_BY_WNS", raising=False)
     # default-ON: a near-met baseline now reorders with nothing set.
     assert ladder_rungs(-0.665, 0.7)[0] == "AltSpreadLogic_medium"
-    # ...and a DEEP baseline is still untouched, flag or no flag. This is the
-    # property that made optical (-0.959, measured) safe without ever being run.
+    # Deep negative slack preserves the default ladder order regardless of the flag.
     assert ladder_rungs(-0.959, 0.7) == list(PLACE_RETRY_LADDER)
-    # kill switch restores the pre-aug01 order exactly.
+    # kill switch restores the earlier order exactly.
     monkeypatch.setenv("FPL26_ILS_LADDER_ORDER_BY_WNS", "0")
     assert ladder_rungs(-0.665, 0.7) == list(PLACE_RETRY_LADDER)
 
 
 def test_ladder_order_by_wns_promotes_medium_only_for_near_met(monkeypatch):
-    """The three designs with rung data, at their measured ILS baselines.
+    """Verify that WNS-based ladder ordering promotes medium effort only for
+    near-met timing.
 
-    spam (-0.665) is near-met and its record needs AltSpreadLogic_medium from the
-    untouched seed. optical (-0.924) and 3d (-2.153) are deep, and medium measures
-    -1.086 / -2.408 on them — on 3d that is worse than its own baseline."""
+    Deep negative slack retains the normal rung order because medium effort is
+    not appropriate there.
+    """
     from optimizer.ils_polish import ladder_rungs, PLACE_RETRY_LADDER
     monkeypatch.delenv("FPL26_ILS_LADDER_ORDER", raising=False)
     monkeypatch.setenv("FPL26_ILS_LADDER_ORDER_BY_WNS", "1")
@@ -3245,7 +3151,9 @@ def test_ladder_order_by_wns_promotes_medium_only_for_near_met(monkeypatch):
 
 
 def test_ladder_order_by_wns_needs_both_inputs(monkeypatch):
-    """No baseline (or no near-met magnitude) = no evidence to key on = shipped order."""
+    """No baseline (or no near-met magnitude) = no evidence to key on = shipped
+    order.
+    """
     from optimizer.ils_polish import ladder_rungs, PLACE_RETRY_LADDER
     monkeypatch.delenv("FPL26_ILS_LADDER_ORDER", raising=False)
     monkeypatch.setenv("FPL26_ILS_LADDER_ORDER_BY_WNS", "1")
@@ -3265,9 +3173,12 @@ def test_explicit_ladder_order_beats_the_wns_rule(monkeypatch):
 
 
 def test_ladder_order_knob_default_and_override(monkeypatch):
-    """The FIRST rung runs from the UNMODIFIED seed; later rungs run from whatever
-    has accepted. spam's record places AltSpreadLogic_medium from the RAW
-    benchmark, so reproducing it needs that rung first."""
+    """Verify that the ladder-order setting controls which rung receives the
+    unmodified seed.
+
+    The first rung starts from raw input; later rungs may inherit the latest
+    accepted checkpoint.
+    """
     from optimizer.ils_polish import ladder_rungs, PLACE_RETRY_LADDER
     monkeypatch.delenv("FPL26_ILS_LADDER_ORDER", raising=False)
     assert ladder_rungs() == list(PLACE_RETRY_LADDER)
@@ -3286,10 +3197,8 @@ def test_ladder_order_knob_changes_the_probe_sequence(monkeypatch):
     assert placed[1] == "AltSpreadLogic_medium", placed
 
 
-# ---- RE-DRAW RESERVE (jul31, fir) ------------------------------------------
-# fir handed back 2923s, the ILS ate ~2000s for +0.006ns, and the wrapper then
-# refused attempt 2 at "remaining 763s < floor 1200s". The re-draw was worth
-# ~0.5 x 12.23 = +6 MHz in expectation. An unproven stage must not spend it.
+# Redraw reserve is opt-in and prevents an exploratory ILS stage from
+# consuming time reserved for another wrapper attempt.
 
 def test_redraw_reserve_is_default_off(monkeypatch):
     from optimizer.ils_polish import redraw_reserve_enabled
@@ -3311,10 +3220,8 @@ def test_redraw_reserve_s_rejects_garbage(monkeypatch):
 def test_redraw_reserve_stops_an_unproductive_ils(monkeypatch):
     """fir's case: cycles run, nothing meaningful accepted, so the ILS must stop
     while the attempt floor is still intact instead of spending it."""
-    # window 600s, anchor 100 -> next cycle priced 115s, so remaining-next = 485.
-    # A 550s reserve makes 485 < 550 true and the guard must fire.
-    # wrapper_window 600s, next cycle priced 115s -> 485 < 550 reserve, and the
-    # loop runs past REDRAW_MIN_CYCLES_DEFAULT, so the guard must fire.
+    # A 600 s window minus the 115 s next-cycle estimate leaves 485 s,
+    # below the 550 s reserve; after the minimum cycle count, the guard fires.
     _, logs = _run_loop(
         monkeypatch,
         {"FPL26_ILS_REDRAW_RESERVE": "1", "FPL26_ILS_REDRAW_RESERVE_S": "550"},
@@ -3345,13 +3252,11 @@ def test_redraw_reserve_never_fires_before_the_first_cycle(monkeypatch):
 
 
 def test_redraw_reserve_v1_arithmetic_would_have_killed_digit(monkeypatch):
-    """⛔ Pins WHY v1 was wrong, so the fenced-deadline bug cannot come back.
+    """Verify redraw reserve uses the wrapper's unfenced remaining budget.
 
-    v1 compared the reserve against the ILS's fenced remaining:
-        1246s (fenced) - 527s = 719s  <  1200s  -> STOP at digit's cycle-4 head
-    v2 compares against the WRAPPER's remaining:
-        1746s (unfenced) - 527s = 1219s > 1200s -> CONTINUE
-    Cycle 4 is ExtraNetDelay_low -> -0.614 -> alpha 72.59, the whole +38 MHz.
+    The reserve may stop only when wrapper time minus predicted cycle cost
+    falls below the threshold, preventing the internal ILS fence from being
+    counted twice.
     """
     from optimizer.ils_polish import redraw_reserve_s, MEASURED_BASIS_MARGIN
     monkeypatch.delenv("FPL26_ILS_REDRAW_RESERVE_S", raising=False)
@@ -3364,9 +3269,11 @@ def test_redraw_reserve_v1_arithmetic_would_have_killed_digit(monkeypatch):
 
 
 def test_redraw_reserve_min_cycles_covers_digits_19_second_margin():
-    """The wrapper-budget fix clears digit by only 19s. A 19s margin deciding
-    38 MHz is the knife-edge that already cost 17.7 points elsewhere, so the
-    reserve must also refuse to fire before digit's winning cycle (its 4th)."""
+    """Verify redraw reserve honors the four-cycle minimum.
+
+    The floor ensures a shallow failing set reaches its fourth candidate before
+    time-based reserve logic can stop exploration.
+    """
     from optimizer.ils_polish import REDRAW_MIN_CYCLES_DEFAULT
     DIGIT_WINNING_CYCLE = 4
     assert REDRAW_MIN_CYCLES_DEFAULT > DIGIT_WINNING_CYCLE, (

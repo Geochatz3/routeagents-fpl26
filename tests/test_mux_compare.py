@@ -1,4 +1,4 @@
-"""INSURED-COMPARE final-candidate MUX tests (jul23 panel #2, drill #1).
+"""INSURED-COMPARE final-candidate MUX tests.
 
 Mechanism under test (dcp_optimizer.py):
 
@@ -91,9 +91,7 @@ def _candidate_dcp(tmp_path: Path, name: str = "presweep.dcp") -> Path:
     return p
 
 
-# ---------------------------------------------------------------------------
 # The MUX: argmax + never-worse + byte-identical no-op
-# ---------------------------------------------------------------------------
 
 class MuxShipTests(unittest.TestCase):
 
@@ -298,9 +296,7 @@ class MuxShipTests(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), b"PIPELINE-OUTPUT")
 
 
-# ---------------------------------------------------------------------------
 # register_final_candidate: the SAME gates as the bank path
-# ---------------------------------------------------------------------------
 
 class RegisterGateTests(unittest.TestCase):
 
@@ -424,10 +420,8 @@ class RegisterGateTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
-# ---------------------------------------------------------------------------
-# FLAGSHIP (replace_gamble) -> MUX wiring (jul23 muxwire): the best VERIFIED
+# FLAGSHIP (replace_gamble) -> MUX wiring: the best VERIFIED
 # gamble draw is enrolled REGARDLESS of the +0.15 adopt gate.
-# ---------------------------------------------------------------------------
 
 class FlagshipMuxWiringTests(unittest.TestCase):
 
@@ -547,10 +541,8 @@ class FlagshipMuxWiringTests(unittest.TestCase):
         self.assertEqual(opt._final_candidates, [])
 
 
-# ---------------------------------------------------------------------------
-# RESERVE/controller -> MUX wiring (jul23 muxwire): the tail enrolls its
+# RESERVE/controller -> MUX wiring: the tail enrolls its
 # harvested best_valid; equal-to-pipeline is a byte-identical no-op.
-# ---------------------------------------------------------------------------
 
 class TailMuxWiringTests(unittest.TestCase):
 

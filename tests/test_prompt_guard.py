@@ -1,4 +1,4 @@
-"""Unit tests for the prompt-size guard (eval-key 402 doom loop, jul03).
+"""Unit tests for the prompt-size guard (the 402 doom loop).
 
 Preview attempt-3 forensics: the contest's provisioned OpenRouter key enforces
 a per-request prompt-token limit (observed 57,489). Once the conversation

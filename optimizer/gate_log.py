@@ -1,39 +1,13 @@
-"""Typed gate/decision ledger — the jul26 panel's unanimous #1 missing signal.
+"""Provides a typed, append-only ledger for optimizer gate decisions.
 
-WHY THIS EXISTS
-  jul26 recovered ~+55 score points from ONE defect family: *a prediction was allowed to
-  REFUSE work*. All five instances were found BY ACCIDENT, hours each. A 3-seat panel
-  (gpt-5.6-sol, kimi-k3, deepseek-v4-pro) independently converged on the same fix: the
-  run already logs every decision, but as free text, so decisions cannot be AGGREGATED.
-  sol's framing — "it supplies denominators": with typed rows you can separate
-  "mechanism never applicable" from "applicable but vetoed" from "executed but invalid"
-  from "valid improvement not promoted". The existing 255-row decisions.jsonl cannot.
-
-  It also produces the predicted-vs-observed pairs needed to replace blind constants
-  (like the 600 s one that refused a 21 s route_design) with a 2-4 parameter cost model
-  under leave-one-design-out. That is FITTING A COST MODEL, which the project's
-  methodology invariant permits — as opposed to fitting a decision boundary, which it
-  forbids.
-
-DESIGN CONSTRAINTS, because the module being instrumented IS the contest submission
-  1. **Default OFF.** With `FPL26_GATE_LOG` unset this module does nothing at all, so
-     behaviour is byte-identical to before. The sweep sets it; the eval does not.
-  2. **Cannot raise, ever.** `emit()` swallows every exception internally. A logger that
-     can break a gate is worse than no logger — so call sites need no try/except and
-     there is no code path where a logging failure changes an optimization decision.
-  3. **Append-only, flushed per row.** The operator's session can die mid-sweep (this
-     box kills jobs when the browser tab closes), so a row must survive the instant it
-     is written. Never buffered for assembly at the end.
-  4. **No new work.** Every value is copied from state the optimizer already computed.
-     No extra Vivado calls, no extra LLM calls, no re-evaluated predicates, no hashing.
-
-TYPED VOCABULARY — the point is that these are enums, not prose.
-  verdict:      ALLOW | REFUSE | OBSERVE
-  provenance:   HISTORY (measured on this design, this run) | MODEL (size model) |
-                CONSTANT (blind) | MEASURED_ANCHOR (published measurement) | UNKNOWN
-  A refusal whose provenance is CONSTANT or MODEL is the defect family. A refusal whose
-  provenance is HISTORY or MEASURED_ANCHOR is legitimate — it is bounded by something
-  real. That single field is what makes the ledger mechanically minable.
+The ledger distinguishes inapplicable, refused, executed-invalid, and
+valid-unpromoted work so decisions can be aggregated mechanically. It is
+disabled by default and becomes a no-op when unconfigured. Emission never
+raises, flushes each row, and performs no additional tool calls, predicate
+evaluation, or hashing. Verdicts are ``ALLOW``, ``REFUSE``, or ``OBSERVE``.
+Provenance is ``HISTORY``, ``MODEL``, ``CONSTANT``, ``MEASURED_ANCHOR``, or
+``UNKNOWN``. Refusals from modeled or constant estimates remain distinguishable
+from refusals bounded by direct measurements.
 """
 import json
 import os

@@ -1,20 +1,9 @@
-"""ILS futility override: the SCORING FUNCTION decides, not a counter (jul26).
+"""Test that ILS futility continuation uses a time-weighted scoring hurdle instead
+of a fixed cycle count.
 
-MEASURED MOTIVATION (mini-ISP chain29, eval parity):
-    ILS-polish loop-exit trigger; using remaining 2984s.
-    ILS cycle 1 place=Explore:      wns=-0.943 dt=111s (best -0.904)
-    ILS cycle 2 place=__LASTMILE__: wns=-0.904 dt=122s (best -0.904)
-    ILS: no improvement in 2 real cycles — stopping (yield budget)
-ILS held 2984 s, spent 233 s, then stopped on the K=2 constant. The jul07 record
-reached 413.22 on its cycle-2 __LASTMILE__ (-0.882 -> -0.850, +5.4 MHz) after
-FOUR cycles.
-
-  hurdle = alpha * 0.1 * (dt/3600) / P
-one ~120 s cycle at alpha 97.08 => ~0.34 MHz. The record's winning cycle yielded
-5.4 MHz — 16x the hurdle. K=2 stops an order of magnitude before the economics.
-
-No fitted constant: the hurdle is the contest's own formula plus a MEASURED
-cycle cost. DEFAULT OFF (hurdle_continue_alpha_mhz=0.0).
+The threshold is alpha × 0.1 × (dt / 3600) / P and uses the observed cycle
+duration rather than a fitted constant. A zero hurdle disables the override by
+default.
 """
 from __future__ import annotations
 import sys, unittest
@@ -40,7 +29,7 @@ class DefaultOffTests(unittest.TestCase):
         cfg = ILSPolishConfig()
         self.assertEqual(cfg.hurdle_continue_alpha_mhz, 0.0)
         self.assertFalse(would_continue(cfg, 120.0, 2984.0),
-                         "default must preserve pre-jul26 K-counter behaviour")
+                         "default must preserve earlier K-counter behaviour")
 
 
 class HurdleArithmeticTests(unittest.TestCase):

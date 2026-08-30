@@ -1,19 +1,11 @@
-"""Integration tests for session 2 observability wiring.
+"""Verify that observability components are invoked from production call sites.
 
-These tests verify that DecisionTracer, ToolError, and PathGuard are
-actually invoked from production call sites — not just that the modules
-exist.  Failure modes covered:
+Coverage includes budget skips, timeouts, tool exceptions, successful tool
+calls, finalization failures, and out-of-root path checks. Audit-mode path
+violations are recorded without raising.
 
-  - call_tool budget skip   → BUDGET_SKIP code + decision record
-  - call_tool timeout       → TIMEOUT_BUDGET code + decision record
-  - call_tool exception     → UNKNOWN_TOOL_ERROR code + decision record
-  - call_tool success       → tool_call_success record, no error code
-  - finalize Phase 1 failure→ PathGuard records a path_guard_check event
-                              AND _finalize/run_start emit records too
-  - PathGuard out-of-root   → audit-mode violation recorded, no raise
-
-We mock the MCP call layer and the analysis step; no Vivado / RapidWright
-processes are spawned.
+The MCP call layer and analysis step are mocked, so no implementation tools or
+checkpoint-processing services are started.
 """
 from __future__ import annotations
 
@@ -232,12 +224,11 @@ class PathGuardWiringTests(unittest.TestCase):
         self.assertIn("optimize_begin", labels)
 
     def test_audit_mode_records_out_of_root_violation_no_raise(self):
-        """Calling _path_guard_check on a path outside roots in audit
-        mode must not raise and must record the violation.
+        """Verify that audit mode records an out-of-root path without raising.
 
-        Default mode flipped to enforce in session 4; this test
-        explicitly opts back into audit by setting
-        `_path_guard_mode = "audit"` before lazy init."""
+        The test explicitly sets `_path_guard_mode` to `"audit"` before lazy
+        initialization because the default mode enforces path restrictions.
+        """
         # Force audit mode for this test (session-4 default is enforce).
         self.opt._path_guard_mode = "audit"
         self.opt._ensure_path_guard(output_dcp=self.output_dcp)

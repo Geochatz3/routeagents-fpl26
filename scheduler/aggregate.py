@@ -1,8 +1,7 @@
-"""
-Aggregate replay results — sum ΔFmax over a design set under different
-scheduler configurations.  Lets us compare candidate orderings on the
-metric that actually matters for the contest (sum of selected ΔFmax),
-not just per-design match counts.
+"""Aggregate replay outcomes across inputs and scheduler configurations.
+
+Reports the sum of selected Fmax changes in MHz, allowing candidate orderings
+to be compared by total optimization gain rather than per-input match counts.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from .replay import replay_from_jsonl, _row_to_result
 from .runner import SchedulerConfig, select_best
 
 
-# Reference baselines (same as portfolio_select_best.py)
+# Reference baselines (published per-design ΔFmax figures)
 PUBLISHED_BL = {
     "vexriscv_re-place": 105.1, "amd_mini-isp": 68.3,
     "rosetta_spam-filter": 56.6, "rosetta_3d-rendering": 8.3,

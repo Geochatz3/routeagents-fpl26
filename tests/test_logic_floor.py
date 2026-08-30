@@ -1,10 +1,9 @@
-"""Tests for the v5.5 logic-floor attestation (optimizer/logic_floor.py).
+"""Tests the pure logic-floor admission policy.
 
-The decision core is pure; these tests pin the thresholds to the measured
-anchors: mini-ISP at the B3 floor MUST fire (bound 7.83 MHz — k3's number,
-recomputed here from the raw path), and every census must-not-fire class
-(net-heavy corescore-like, retimeable LUT-chain, disagreeing solves, wide
-near-critical populations, unrouted states, parse failures) must refuse.
+Admission requires a routed, parseable, sparse, net-light, macro-dominated
+critical-path signature with consistent solves. Net-heavy paths, retimeable
+logic chains, disagreeing solves, broad near-critical populations, unrouted
+states, and parse failures must refuse.
 """
 import os
 import sys
@@ -20,9 +19,12 @@ from optimizer.logic_floor import (  # noqa: E402
 
 
 def _miniisp_paths():
-    """32 paths shaped like mini-ISP's B3-floor state: worst path is the DSP
-    chain (dp 2.271 = logic 1.911 + route 0.360, 7 hops, macro-dominated);
-    the rest sit >= 0.25ns away, net-light."""
+    """Return synthetic paths representing a sparse, net-light floor state.
+
+    The worst path is macro-dominated with 2.271 ns total delay, 1.911 ns logic
+    delay, 0.360 ns route delay, and seven hops; the other 31 paths are at
+    least 0.25 ns away.
+    """
     paths = [LFPath(slack=-0.850, dp=2.271, lg=1.911, rt=0.360, hops=7,
                     lut=0.111, macro=1.800)]
     for i in range(LOGIC_FLOOR_NPATHS - 1):
@@ -42,7 +44,7 @@ class FireCaseTests(unittest.TestCase):
     def test_miniisp_floor_fires_with_k3_bound(self):
         v = _eval(_miniisp_paths())
         self.assertTrue(v.fire, v.reason)
-        # k3's arithmetic: bound_slack = -0.850 + (0.360 - 0.045*7) = -0.805
+        # The arithmetic: bound_slack = -0.850 + (0.360 - 0.045*7) = -0.805
         # bound_alpha = 1000/(1.570+0.805) - 1000/(1.570+0.850) = 7.83 MHz
         self.assertAlmostEqual(v.bound_alpha_mhz, 7.83, delta=0.05)
         self.assertGreaterEqual(v.logic_frac, 0.80)
@@ -74,9 +76,8 @@ class RefuseCaseTests(unittest.TestCase):
         self.assertIn("two-solve", v.reason)
 
     def test_dense_window_of_floor_paths_still_fires(self):
-        # v5.5.2 (live box6 measurement): mini-ISP's real top-32 are ALL
-        # within 16 mils of WNS — a dense window of uniformly floor-bound
-        # paths must FIRE; unseen paths can only reduce harvest further.
+        # The top 32 paths span only 15.5 ps and are uniformly logic-floor-bound,
+        # so the detector must fire even if unseen paths reduce the harvest.
         paths = [LFPath(slack=-0.850 + i * 0.0005, dp=2.271, lg=1.911,
                         rt=0.360, hops=7, lut=0.037, macro=1.874)
                  for i in range(LOGIC_FLOOR_NPATHS)]
@@ -84,7 +85,7 @@ class RefuseCaseTests(unittest.TestCase):
         self.assertTrue(v.fire, v.reason)
 
     def test_live_box6_measurement_fires(self):
-        # Pinned to the aug09 lf_drill.log numbers (the real Tcl against the
+        # Pinned to the lf_drill.log numbers (the real Tcl against the
         # real -0.847 artifact): 4x -0.847, 8x -0.844, 4x -0.842, 8x -0.841,
         # 8x -0.831; lg 1.909-1.911, rt 0.342-0.357, hops 7, macro 1.874.
         raw = ([(-0.847, 2.268, 1.911, 0.357)] * 4
@@ -157,10 +158,8 @@ class TransportContractTests(unittest.TestCase):
         self.assertNotIn("\r", LOGIC_FLOOR_TCL)
 
     def test_tcl_classifies_by_resource_type_token(self):
-        # v5.5 review-1 BLOCKER 2: real 2025.1 grammar puts the RESOURCE TYPE
-        # before the arc name (`LUT3 (Prop_A6LUT_SLICEL_I2_O)`), and bracketed
-        # bus arcs (`DSP_ALU (Prop_DSP_ALU_DSP48E2_V_DATA[43]_...)`) must be
-        # matched. Pin the load-bearing pattern pieces.
+        # Timing arcs place the resource type before the arc name and may
+        # contain bracketed bus indices. The parser must accept both forms.
         from optimizer.logic_floor import LOGIC_FLOOR_TCL
         self.assertIn(r"{([A-Za-z0-9_]+)\s+\(Prop_[^)]*\)\s+([0-9.]+)}",
                       LOGIC_FLOOR_TCL)
@@ -177,9 +176,11 @@ class ConsistencyGuardTests(unittest.TestCase):
 
 
 class B1AdmissionTests(unittest.TestCase):
-    """v5.5.3 physics admission (replaces the 85s wall-clock anchor cap after
-    the AWS eval-parity inversion: mini-ISP 145s vs vexriscv 130s on the
-    contest box). fire == ADMIT; every failure REFUSES (= old decline)."""
+    """Tests physics-based admission for logic-floor decisions.
+
+    A passing decision admits the floor; failure of any admission predicate
+    must refuse it.
+    """
 
     def _adm(self, paths, wns_banked=-0.904, **over):
         from optimizer.logic_floor import evaluate_b1_admission
@@ -188,9 +189,8 @@ class B1AdmissionTests(unittest.TestCase):
         return evaluate_b1_admission(**kw)
 
     def _b1_paths(self):
-        # mini-ISP's B1 state (-0.904, observed identically on dev AND the
-        # AWS eval box): same DSP-internal family as the B3 floor, path
-        # slacks shifted by the 54ps B3 later recovers.
+        # The paths model a DSP-internal family whose slacks are shifted 54 ps
+        # from a recoverable logic-floor state.
         paths = [LFPath(slack=-0.904, dp=2.271, lg=1.911, rt=0.360, hops=7,
                         lut=0.111, macro=1.800)]
         for i in range(31):
@@ -205,10 +205,8 @@ class B1AdmissionTests(unittest.TestCase):
         self.assertGreaterEqual(v.macro_frac, 0.90)
 
     def test_aws_measured_b1_state_admits_at_18_not_12(self):
-        # Regression pin of the aug10 AWS gate abort: real B1 window bounds
-        # at -0.819 (bound_alpha 14.38 MHz from wns -0.904) with logic 0.828
-        # macro 0.974 — floor-class, MUST admit. The old 12.0 threshold
-        # refused this exact state.
+        # A macro-dominated path near the admission boundary is classified as
+        # floor-limited and must be admitted.
         paths = [LFPath(slack=-0.904, dp=2.271, lg=1.880, rt=0.400, hops=7,
                         lut=0.049, macro=1.831)]
         for i in range(31):
@@ -223,10 +221,8 @@ class B1AdmissionTests(unittest.TestCase):
         self.assertLessEqual(v.bound_alpha_mhz, 15.0)
 
     def test_vexriscv_replace_fabric_refuses_on_macro(self):
-        # vex1's B1 (-0.785): LUT re-place fabric — retimeable, must refuse
-        # regardless of how fast or slow the box measured it. Net delay is
-        # pinned near the per-hop floor so the refusal is macro's, isolating
-        # the load-bearing check.
+        # A LUT-dominated, retimeable fabric path must be refused.
+        # Net delay stays near the per-hop floor to isolate the macro check.
         paths = [LFPath(slack=-0.785, dp=2.1, lg=1.55, rt=0.42, hops=9,
                         lut=1.40, macro=0.05)]
         for i in range(31):

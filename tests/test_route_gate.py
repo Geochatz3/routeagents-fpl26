@@ -1,23 +1,10 @@
-"""Tests for optimizer.route_gate — pure route-time predictor (R-D1-2).
+"""Test the pure route-time predictor with direct fixtures and no optimizer or
+mocks.
 
-Pure-function style (mirrors tests/test_recipe_router.py): no DCPOptimizer,
-no mocks — direct calls with literal fixtures.
-
-Anchor fixtures come from the eval-box calibration ADDENDUM
-(01-RESEARCH.md, mined 2026-07-19 from the 2026-07-14 official beta
-harness logs):
-
-  - boom-class:  379,380 primitive cells; completed phys_opt
-    AlternateFlowWithRetiming 1387.79s; full re-route (AggressiveExplore
-    after -unroute) KILLED at 1632.9s with 1650s remaining → the D1
-    failure the gate must refuse, mid-run AND at cold-start.
-  - fir-class:   12,367 cells — small design, must never be over-refused.
-  - mini-isp:     8,414 cells — smallest calibration point.
-  - optical-class: 84,422 cells; observed full route after place 94.95s,
-    largest phys_opt 47.6s (K=2.0's validation point).
-
-Any change that lets the boom fixtures pass as feasible is a REGRESSION
-of the exact eval failure this module exists to prevent.
+Fixtures span small designs, route and physical-optimization timings, and a
+very large design whose full reroute exceeds the remaining budget. The gate
+must reject that infeasible reroute at cold start and mid-run without
+over-refusing small designs.
 """
 from __future__ import annotations
 
@@ -34,9 +21,7 @@ from optimizer.route_gate import (
 )
 
 
-# ---------------------------------------------------------------------------
 # Fixture helpers
-# ---------------------------------------------------------------------------
 
 BOOM_CELLS = 379_380
 BOOM_PHYS_OPT_S = 1387.79
@@ -51,9 +36,7 @@ def _boom_history():
     ]
 
 
-# ---------------------------------------------------------------------------
 # predict_reroute_seconds
-# ---------------------------------------------------------------------------
 
 class TestPredictRerouteSeconds(unittest.TestCase):
 
@@ -82,9 +65,7 @@ class TestPredictRerouteSeconds(unittest.TestCase):
         self.assertGreaterEqual(pred, BOOM_CELLS * CELLS_SCALED_RATE_S)
 
 
-# ---------------------------------------------------------------------------
 # assess_destructive_reroute — the boom calibration cases
-# ---------------------------------------------------------------------------
 
 class TestBoomScenario(unittest.TestCase):
 
@@ -153,10 +134,8 @@ class TestNoOverRefusal(unittest.TestCase):
             r.predicted_reroute_s, 84_422 * CELLS_SCALED_RATE_S, places=2)
 
 
-# ---------------------------------------------------------------------------
 # Boundary correctness — thresholds derived from the module constants so
 # the pair stays valid if a constant is ever re-calibrated.
-# ---------------------------------------------------------------------------
 
 class TestBoundary(unittest.TestCase):
 
@@ -183,10 +162,8 @@ class TestBoundary(unittest.TestCase):
         self.assertTrue(r.feasible)
 
 
-# ---------------------------------------------------------------------------
 # Robustness — malformed history must be skipped, never raise; inputs
 # must not be mutated (purity contract).
-# ---------------------------------------------------------------------------
 
 class TestMalformedHistory(unittest.TestCase):
 
@@ -226,10 +203,8 @@ class TestMalformedHistory(unittest.TestCase):
         self.assertEqual(SAFETY_MARGIN_S, 120.0)
 
 
-
-
 class DoubleBlindColdStartTests(unittest.TestCase):
-    """jul20 external review S2: cell-count None + empty history must
+    """external review S2: cell-count None + empty history must
     REFUSE (predict inf), never return 0/'feasible' with zero data."""
 
     def test_no_cells_no_history_predicts_inf(self):

@@ -30,15 +30,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-# ---------------------------------------------------------------------------
-# Pathology labels
-# ---------------------------------------------------------------------------
-# Each label is a stable string identifier used by:
-#   - the system prompt (telling the LLM which pathology was detected)
-#   - the recipe selector (mapping pathology → recipe candidates)
-#   - the RAG winning_tools field (so future runs learn which recipe
-#     fixed which pathology on which design).
-# ---------------------------------------------------------------------------
+# Pathology labels are stable identifiers shared by the LLM prompt, recipe
+# selection, and retrieval metadata. Renaming one requires updating all three.
 
 PLACEMENT_DETOUR = "PLACEMENT_DETOUR"
 ROUTE_DETOUR = "ROUTE_DETOUR"
@@ -60,12 +53,8 @@ ALL_LABELS = frozenset({
 })
 
 
-# ---------------------------------------------------------------------------
-# Detection thresholds — picked from observed contest-design behaviour
-# (boom_soc 4h-uncapped run, ispd16 capped run, finn_radioml +51 MHz run).
-# Numbers err on the side of catching MORE pathologies; a recipe that
-# can't help is cheaper than a missed opportunity.
-# ---------------------------------------------------------------------------
+# Detection thresholds favor sensitivity because an inapplicable recipe is
+# cheaper than missing an actionable pathology.
 
 # Detour ratio = routed_path_length / manhattan_distance.  > 2.0 means
 # the router took a path more than 2x longer than the geometric minimum.
@@ -86,11 +75,9 @@ VERY_HIGH_FANOUT_THRESHOLD = 500
 ROUTE_DELAY_FRACTION_HIGH = 0.65
 ROUTE_DELAY_FRACTION_VERY_HIGH = 0.80
 
-# Critical-path cell spread (avg Manhattan distance between adjacent
-# cells on the path), in RapidWright tile units.  Higher = cells spread
-# far apart on fabric.  Aligned with Phase 1's PBLOCK recommendation
-# threshold (avg > 70 → "use PBLOCK") so CELL_SPREAD fires when the
-# design summary already flags spread as the dominant concern.
+# Cell spread is the average Manhattan distance between adjacent critical-path
+# cells, in RapidWright tile units. The high threshold matches the design
+# summary's placement-region recommendation.
 CELL_SPREAD_HIGH = 70.0
 CELL_SPREAD_VERY_HIGH = 150.0  # boom_soc: 302 tiles → very-high pathology
 
@@ -100,10 +87,8 @@ RETIMING_FF_MIN = 3
 RETIMING_SLACK_PER_FF_NS = 0.5
 
 
-# ---------------------------------------------------------------------------
-# Data shapes — callers pass dicts so we don't impose a dataclass on
-# every caller, but the documented fields below are the recognized ones.
-# ---------------------------------------------------------------------------
+# Data shapes. Callers pass plain dicts so this module imposes no dataclass
+# on them; the fields documented below are the recognized ones.
 
 @dataclass
 class PathPathology:
@@ -136,10 +121,8 @@ class DesignPathology:
         }
 
 
-# ---------------------------------------------------------------------------
 # Mapping: pathology → recipes that have a chance of fixing it.
 # Ordered by likelihood of success.  Update as recipes are landed.
-# ---------------------------------------------------------------------------
 
 PATHOLOGY_TO_RECIPES: dict[str, tuple[str, ...]] = {
     PLACEMENT_DETOUR: (
@@ -195,9 +178,7 @@ PATHOLOGY_TO_RECIPES: dict[str, tuple[str, ...]] = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Per-path classifier
-# ---------------------------------------------------------------------------
 
 def classify_path(path: dict) -> list[PathPathology]:
     """Classify a single critical path into one or more pathologies.
@@ -366,12 +347,8 @@ def classify_design(paths: list[dict],
     """
     per_path = [classify_path(p) for p in paths]
     counts: dict[str, int] = {}
-    # Track max confidence per label.  A single high-confidence detection
-    # of CELL_SPREAD (avg_distance >> threshold) outweighs many moderate-
-    # confidence HIGH_FANOUT_DRIVER hits.  This matters for spread-bound
-    # designs like boom_soc (avg 302 tiles → CELL_SPREAD very-high
-    # confidence 0.85) where the fanouts on critical paths are merely
-    # moderate (~100-200 → HIGH_FANOUT_DRIVER moderate confidence 0.65).
+    # Retain the maximum confidence for each label so one strong detection can
+    # outweigh repeated weaker detections of another pathology.
     confidences: dict[str, float] = {}
     for path_labels in per_path:
         for p in path_labels:

@@ -2,11 +2,10 @@
 Best-of-N candidate scheduler — runs two or more dcp_optimizer.py invocations
 sequentially within a wall-budget, returns the best valid output DCP.
 
-Design (per FINAL_DEV_ROADMAP.md P0):
+Design:
   Phase A: anchor candidate    — time budget = min(20 min, total_budget/3)
   Phase B: v0_3 candidate      — time budget = remaining - 60 s safety
   Phase C (optional): repeat   — additional v0_3 seeds if budget allows
-                                 (per FINAL_DEV_ROADMAP P2)
 
 Each candidate runs as a `dcp_optimizer.py` subprocess with its own output
 DCP path.  The scheduler parses each run's `run_summary.txt` to get final
@@ -18,15 +17,14 @@ output (matches dcp_optimizer.py's existing "no DCP unless improved"
 contract).
 
 Anchor vs v0_3 mode toggle:
-  This branch's dcp_optimizer.py is the v0_3-controller version.  To
+  The bundled dcp_optimizer.py is the v0_3-controller version.  To
   emulate anchor mode without forking the codebase, the scheduler passes
   --mode-flag combinations that disable v0_3's force-continue and
   unconditional cap.  This requires a small (<30 LOC) change to
-  dcp_optimizer.py to read those flags.  See FINAL_DEV_ROADMAP P0
-  subtask 1.
+  dcp_optimizer.py to read those flags.
 
-Until that toggle lands, this module runs two v0_3 seeds (matches the
-"repeated-seed" path of D22).  The replay test at
+Until that toggle lands, this module runs two v0_3 seeds (the
+repeated-seed path).  The replay test at
 `scheduler/test_replay.py` proves the scheduler's selection logic is
 correct against the existing campaign data even before the toggle lands.
 """
@@ -49,13 +47,8 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# JAVA_HOME bootstrap (mirrors the Makefile inference)
-# ---------------------------------------------------------------------------
-# When the scheduler is invoked directly (not via `make run_optimizer`),
-# JAVA_HOME isn't auto-set.  RapidWright needs it to find libjvm.so.
-# Replicate the Makefile's fallback: PATH java first, then Vivado-bundled
-# JRE (jre11* preferred, fall back to any jre*).
+# Direct scheduler invocation may leave JAVA_HOME unset, preventing RapidWright
+# from locating libjvm.so. Infer it from PATH or a bundled JRE, preferring jre11.
 
 def _ensure_java_home() -> None:
     if os.environ.get("JAVA_HOME"):
@@ -93,9 +86,7 @@ def _ensure_java_home() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 # Per-run data captured from the optimizer
-# ---------------------------------------------------------------------------
 
 @dataclass
 class CandidateResult:
@@ -123,9 +114,7 @@ class CandidateResult:
         )
 
 
-# ---------------------------------------------------------------------------
-# Output-summary parsers (same patterns as portfolio_runner.sh emit_row)
-# ---------------------------------------------------------------------------
+# Output-summary parsers (same patterns as the campaign portfolio runner)
 
 _PATTERNS = {
     "initial_fmax_mhz": re.compile(r"Initial Fmax:\s+([\d\.]+)\s*MHz"),
@@ -155,18 +144,15 @@ def parse_run_log(log_path: Path) -> dict:
     return out
 
 
-# ---------------------------------------------------------------------------
 # Candidate launcher
-# ---------------------------------------------------------------------------
 
 def parse_recipe_log(log_path: Path) -> dict:
-    """Parse the JSON blob recipes/cell_replacement.py prints to stdout
-    on completion.  Recipe stdout ends with a pretty-printed JSON object.
-    We grab the last balanced { ... } block in the log and read that.
+    """Parse the trailing JSON object emitted by a recipe process.
 
-    Returns the same shape as parse_run_log so the two parsers are
-    interchangeable for CandidateResult population.  Recipe doesn't
-    track LLM cost (always $0); iterations is always 1.
+    The parser reads the final balanced brace block from stdout, allowing
+    earlier log text to contain arbitrary output. Returns fields compatible
+    with ``parse_run_log``; recipe results set LLM cost to $0 and iterations to
+    1.
     """
     out = {k: None for k in _PATTERNS}
     if not log_path.exists():
@@ -257,24 +243,17 @@ def run_candidate(
     )
 
 
-# ---------------------------------------------------------------------------
 # Scheduler
-# ---------------------------------------------------------------------------
 
 @dataclass
 class SchedulerConfig:
-    """Knobs for the scheduler.  All defaults derive from D22 evidence.
+    """Configure scheduler candidate selection and optional recipe execution.
 
-    `candidates` is the candidate ordering.  When None (the default),
-    the runner consults `scheduler.dispatch.candidates_for(design_name)`
-    (or `candidates_with_recipe` when `include_recipe=True`) to pick a
-    per-design ordering — see dispatch.py for the table.  Pass an
-    explicit list to override (e.g. for ablation experiments).
-
-    `include_recipe` opts in to the recipe slot.  Off by default until
-    we have empirical ΔFmax data per design — the recipe's value vs
-    LLM candidates is currently only known on vexriscv (recipe loses
-    to anchor +125 vs +76).  Use `--include-recipe` to A/B.
+    When ``candidates`` is None, the runner obtains a per-design ordering from
+    ``scheduler.dispatch`` and includes its recipe ordering only when
+    ``include_recipe`` is enabled. An explicit candidate sequence overrides
+    automatic dispatch. Recipe execution is opt-in and disabled by default
+    because recipe applicability depends on the input design.
     """
     total_budget_s: int = 3600  # 60 min hard cap (contest's gamma_capped at 1h)
     min_first_candidate_s: int = 600   # at least 10 min for first run
@@ -284,7 +263,7 @@ class SchedulerConfig:
     candidates: Optional[List[str]] = None
     include_recipe: bool = False
     recipe_max_wall_s: int = 600       # 10-min cap on the recipe slot
-    # Repeated-seed feature (P2 in FINAL_DEV_ROADMAP).  After the configured
+    # Repeated-seed feature.  After the configured
     # candidates finish, fill remaining minutes with additional v0_3
     # invocations.  Each relies on LLM stochasticity for variance.
     repeated_seeds: int = 0            # 0 = off; N = up to N extra seeds
@@ -324,7 +303,7 @@ def run_scheduled(
     work_dir = work_dir or Path(f"./scheduler_run-{int(time.time())}")
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Make sure JAVA_HOME is set before we spawn child optimizer processes —
+    # Make sure JAVA_HOME is set before spawning child optimizer processes —
     # otherwise RapidWright will fail to load libjvm.so in each child.
     _ensure_java_home()
 
@@ -361,9 +340,9 @@ def run_scheduled(
             break
 
         if cand == "recipe":
-            # Recipe is fast and deterministic — give it a tight cap so a
-            # hang (we've seen 40-min runs on digit-recog) can't eat the
-            # LLM-candidate budget.  10 min is 2× the typical 5-min wall.
+            # Cap recipe execution so a hung tool call cannot consume the LLM-
+            # candidate budget. The default 10-minute cap is about twice normal
+            # runtime.
             cand_budget = min(config.recipe_max_wall_s, int(remaining))
             if cand_budget < 60:
                 logger.info(f"scheduler: skipping recipe slot (budget {cand_budget}s too tight)")
@@ -396,8 +375,8 @@ def run_scheduled(
             f"final_fmax={result.final_fmax_mhz} valid={result.is_valid}"
         )
 
-    # Repeated-seed loop: fill remaining budget with extra v0_3 invocations
-    # (P2 from FINAL_DEV_ROADMAP).  Each relies on LLM stochasticity.
+    # Repeated-seed loop: fill remaining budget with extra v0_3 invocations.
+    # Each relies on LLM stochasticity.
     if config.repeated_seeds > 0:
         for seed_idx in range(config.repeated_seeds):
             remaining = config.total_budget_s - (time.time() - start)
@@ -490,9 +469,7 @@ def _serialise(r: CandidateResult) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
@@ -510,8 +487,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--repeated-seeds", type=int, default=0,
                         help="After the configured candidates finish, fill remaining "
                              "budget with up to N extra v0_3 seeds (each relies on LLM "
-                             "stochasticity for variance). 0 = off. P2 from "
-                             "FINAL_DEV_ROADMAP — recovers finn/3d-rendering wins.")
+                             "stochasticity for variance). 0 = off. Recovers "
+                             "finn/3d-rendering wins.")
     parser.add_argument("--work-dir", type=Path, default=None,
                         help="Working directory for per-candidate runs (default scheduler_run-<ts>).")
     parser.add_argument("-v", "--verbose", action="store_true")

@@ -1,41 +1,17 @@
-"""Adaptive banked tail controller — pure policy (jul22, PLAN item 1).
+"""Define the pure policy for an adaptive banked tail controller.
 
-Upgrades the fixed bare-reroute tail loop to a measured-Δns/s PORTFOLIO
-policy over the PROVEN move menu, with per-class harvest-to-wall on
-deep-WNS designs.  This module is pure (no IO, no Vivado, no optimizer
-state) so the policy is exhaustively unit-testable; execution lives in
-DCPOptimizer._run_tail_controller.
+The controller selects among bare rerouting, retiming-enabled physical
+optimization, high-fanout replication, and a polish ladder using
+gain-per-second priors. Accepting a move re-enables the other moves because
+state changes can make previously exhausted moves productive again.
 
-Evidence base (plateau probe jul21 + chain cell, boom −11.177,
-final_round/plateau_probe_jul21.md):
+The policy arms only for deeply negative slack and continues until the
+wall-time floor, a full plateau, or a runaway cap. Internal errors fail closed
+to the plain reroute loop while preserving the banked best result.
 
-  move            Δns     wall s   prior rate ns/s
-  m1_route       +0.404   2082     1.94e-4  (live: +0.215 banked eval,
-                                             DEBUG-WALL loop iterated
-                                             −11.309→−10.557 jul21/22)
-  m4_ladder      +0.431   1668     2.58e-4  (monotone per-pass)
-  m3_fanout      +0.369   1772     2.08e-4
-  m2_physopt_ae  +0.595   4012     1.48e-4
-  CHAIN M2→M1→M3 = +0.726 cumulative (hold +0.010): moves RE-BITE after
-  another move changes the state — hence accept ⇒ un-retire the others.
-
-Near-met designs: every move decays to no-op/marginal (fir/logicnets/
-optical rows) → the controller only ARMS on deep-WNS states
-(best_wns ≤ deep_wns_threshold; round-2 loosened gate −1.0).  There the
-wall policy is HARVEST-TO-WALL: γ-thrift is anti-P(top-5) when the
-gradient is ~0.1 ns per 15 min and γ costs ≤3% of α (fable-maxthink
-jul22) — the loop stops only on wall floor, plateau (all moves retired
-with nothing un-retiring them), or the runaway caps.
-
-Fail-closed: any controller-internal error makes the caller fall back to
-the plain shipped M1 bare-reroute loop (banked best intact either way).
-
-Hold discipline: M1 rides the auto-bank hook unchanged (bare route_design
-was hold-neutral in every probe cell and live run).  phys_opt moves are
-banked ONLY through the stage's own gate: WNS improved AND fully routed
-AND hold_accept() below (h0-relative floor, plateau-probe discipline) —
-the auto-bank hook is SUPPRESSED around them because it does not check
-hold, and banking a hold-dirty state would fail the validator (α=0).
+Bare reroutes retain automatic banking because they are hold-neutral.
+Physical-optimization moves suppress automatic banking and are accepted only
+when WNS improves, routing is complete, and hold timing passes.
 """
 from __future__ import annotations
 
@@ -47,7 +23,7 @@ from typing import Dict, Optional, Tuple
 # global max_moves cap normally stop the loop first.
 TAIL_CTRL_MAX_EXECS_PER_MOVE = 4
 
-# h0-relative hold epsilon (plateau probe jul21 discipline:
+# h0-relative hold epsilon (plateau-probe discipline:
 # whs1 ≥ min(whs0, 0) − 0.001 — never make hold meaningfully worse, and
 # never gate on pre-existing positive margin a move did not create).
 TAIL_CTRL_HOLD_EPS_NS = 0.001
@@ -59,7 +35,7 @@ class TailMove:
 
     cost_factor_vs_route: fallback cost predictor as a multiple of the
     PRESERVING bare-route prediction when the move has not yet been
-    observed this run (probe ratios on boom: ladder 1668/2082≈0.80,
+    observed this run (probe ratios on the evidence design: ladder 1668/2082≈0.80,
     fanout 1772/2082≈0.85, phys_opt AE 4012/2082≈1.93 — rounded UP,
     prefer-refusing).
     """

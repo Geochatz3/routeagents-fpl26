@@ -1,38 +1,22 @@
-"""
-Per-design dispatch — pick a candidate ordering tuned to each known
-design.  For designs we have campaign data on, the table reflects the
-empirical winner; for unknown designs (e.g. the contest's hidden
-benchmark), we fall back to a generic ordering tuned by design
-fingerprint (LUT count, spread).
+"""Per-design dispatch — pick a candidate ordering suited to each design.
 
-The table is a *hint*, not a hard constraint.  The scheduler still runs
-all candidates in the suggested order within the wall budget.  The
-purpose is to put the *most likely winner* first so that if budget
-forces a one-candidate run, we get the right one.
+Where campaign data exists, the table reflects the empirical winner; for an
+unseen design it falls back to a generic ordering chosen by fingerprint (LUT
+count and critical-path spread).
 
-Empirical evidence (all 10 portfolio designs, AWS-validated, per
-SELECTION.md in seeds_20260510_102618/merged_portfolio/):
+The table is a HINT, not a hard constraint.  The scheduler still runs every
+candidate in the suggested order within the wall budget.  The point is to put
+the most likely winner first, so that a budget which forces a single-candidate
+run gets the right one.
 
-  design                    winner      ΔFmax   loss-vs-other-cand
-  ---                       ---         ---     ---
-  amd_mini-isp              anchor      +87.35  v0_3 was +68.25 (anchor wins by +19.10)
-  rosetta_optical-flow      anchor      +44.80  v0_3 was +21.85 (anchor wins by +22.95)
-  vexriscv_re-place         tie         +125.37 anchor == v0_3 (deterministic strategy)
-  rosetta_spam-filter       v0_3        +82.58  anchor was +2.70 (v0_3 wins by +79.88)
-  logicnets_jscl            v0_3 (fc=1) +69.04  anchor was +9.50 (v0_3 wins by +59.54)
-  rosetta_digit-recognition v0_3 (fc=1) +29.07  anchor was +0.00 (v0_3 wins by +29.07)
-  vtr_mcml                  v0_3        +13.89  anchor was +13.22 (v0_3 wins by +0.67)
-  rosetta_3d-rendering      v0_3_seed3  +7.08   anchor was +3.80, v0_3 +5.93 (seed3 wins narrowly)
-  finn_radioml              v0_3_seed2  +39.04  anchor was +34.08, v0_3 +30.96 (seed2 wins, fc=3)
-  corescore_500_mod         v0_3 (fc=3) +53.38  anchor was +46.39 (v0_3 wins by +6.99)
+The observed pattern is that the anchor controller wins on small, low-spread
+designs, and the full controller wins everywhere else — often by a wide margin
+where its force-continue behaviour fires.  Designs on the boundary tend to lock
+both controllers onto the same deterministic strategy, so the ordering there
+does not matter.
 
-Pattern: anchor wins on small + low-spread designs (LUT < 5k AND spread < 30
-empirically).  Everything else: v0_3 wins, often by a wide margin when
-force-continue fires.  vexriscv_re-place is the boundary case — both
-candidates lock onto the same deterministic strategy.
-
-We deliberately keep the table SHALLOW (per CLAUDE.md P2: simplicity first).
-Six rows is enough to reflect what we know without overfitting to the campaign.
+The table is kept deliberately shallow: enough rows to reflect what is known,
+few enough not to overfit the campaign it came from.
 """
 from __future__ import annotations
 
@@ -70,17 +54,12 @@ class DesignFingerprint:
 
 
 def fingerprint_for_unknown(fp: DesignFingerprint) -> List[str]:
-    """Heuristic ordering for designs not in KNOWN_DESIGNS.
+    """Order candidates heuristically when no known-input dispatch entry exists.
 
-    Empirical anchor-favouring rule (from the 10-design table above):
-        LUT < 5k AND spread < 30  →  ['anchor', 'v0_3']
-    Otherwise:
-        ['v0_3', 'anchor']
-
-    The cluster boundary (5k, 30) is approximate; vexriscv_re-place
-    (2k LUT, spread 63) ties either way.  When we have no fingerprint
-    data at all, default to v0_3-first (matches the global best
-    ordering at the aggregate level — see scheduler/aggregate.py).
+    Inputs with fewer than 5,000 LUTs and spread below 30 try ``anchor`` before
+    ``v0_3``; all others reverse that order. The thresholds define the
+    dispatcher's compact, low-spread region. If fingerprint data is
+    unavailable, ``v0_3`` runs first.
     """
     if fp.lut_count is not None and fp.critical_path_spread is not None:
         if fp.lut_count < 5000 and fp.critical_path_spread < 30:
@@ -127,9 +106,9 @@ def candidates_with_recipe(
     return base
 
 
-# Recipe applicability per the 9-design AWS sweep on 2026-05-10 (RECIPE_SWEEP_2026-05-10.md).
+# Recipe applicability per a 9-design AWS sweep.
 # `applicable`  : recipe ran clean, par_routed=true, ΔFmax > 0 (or known small ΔFmax) — safe to run
-# `harmful`     : recipe moved cells but route_design left routing errors — would zero our score
+# `harmful`     : recipe moved cells but route_design left routing errors — would zero the score
 # `no_op`       : detour analysis returned no candidates above threshold — recipe runs no work
 # `error`       : recipe hung or crashed (digit-recog: 40-min wall + crash) — skip until rerun
 # `unknown`     : not yet swept — treat as conservative no-skip (recipe will short-circuit safely)
@@ -167,8 +146,11 @@ def recipe_safe_for(design_name: Optional[str]) -> bool:
 
 
 def design_name_from_dcp(dcp_path) -> Optional[str]:
-    """Best-effort: derive a design name from a DCP filename like
-    `amd_mini-isp_2025.1.dcp` → `amd_mini-isp`.  Returns None if we can't.
+    """Derive a logical design name from a checkpoint filename when possible.
+
+    Removes a recognized version suffix and the ``.dcp`` extension while
+    preserving the remaining filename stem. Returns None when the filename does
+    not match the expected form.
     """
     import re
     from pathlib import Path

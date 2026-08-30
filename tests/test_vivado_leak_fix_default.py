@@ -1,28 +1,13 @@
-"""The engine-leak fix is DEFAULT ON (jul29) — and its two halves must never disagree.
+"""Test the coupled Vivado process-group cleanup contract.
 
-THE LEAK: `_vivado_pid` is the bin/vivado WRAPPER SHELL. SIGKILLing it kills a shell that
-cannot forward the signal, so bin/loader and the real engine reparent to init and idle at
-0 CPU holding 4-6 GB each, never seeing EOF because our stdin pipe stays open. Measured
-jul28: eleven engines / ~19 GB dead RSS on ONE box, and the orphans survive their MCP's
-exit. On the eval box (31 GB, swapless, ~1 h per design) an OOM is a 0.000 for that
-benchmark — the exact mode that cost boom_soc_v2 in beta.
+The fix is ON by default, and both call sites must read `FPL26_VIVADO_LEAK_FIX`
+using the same default literal. Spawning creates a new session; cleanup closes
+stdin before signaling that session's process group.
 
-THE FIX has two halves that are only safe TOGETHER:
-  * spawn with `start_new_session=True`, giving this Vivado subtree its own process group;
-  * on cleanup, close stdin and then `killpg` that group.
-
-WHY THIS FILE EXISTS. If the spawn half were OFF while the cleanup half were ON, the
-Vivado subtree would share OUR process group and `killpg` would kill the driver and every
-concurrent run on the box. That is not a degraded mode, it is the jul28 mistake the
-handoff warns about ("never kill by pgid"), escalated. The two halves are kept in sync by
-reading the SAME environment variable with the SAME default in both places — an invariant
-that a future edit to one site can silently break, because both sites still parse fine on
-their own. Nothing else in the suite pins it, so it is pinned here at the source level.
-
-These tests pin the CONTRACT:
-  * default (variable unset) is ON, so the fix protects a run nobody configured;
-  * `FPL26_VIVADO_LEAK_FIX=0` still disables it (the documented kill switch);
-  * both call sites use an identical default literal.
+These operations must remain coupled because group cleanup without session
+isolation can terminate the driver and concurrent runs, while wrapper-only
+termination can orphan engine processes and their open pipes. Setting the
+variable to `0` remains the supported kill switch.
 """
 from __future__ import annotations
 
@@ -65,7 +50,9 @@ def _leak_fix_defaults():
 
 class TestLeakFixDefault(unittest.TestCase):
     def test_both_halves_are_present(self):
-        """Spawn and cleanup each read the flag; losing one half is the dangerous case."""
+        """Spawn and cleanup each read the flag; losing one half is the dangerous
+        case.
+        """
         defaults = _leak_fix_defaults()
         self.assertEqual(
             len(defaults), 2,
@@ -82,7 +69,7 @@ class TestLeakFixDefault(unittest.TestCase):
             "killpg kills the driver and every concurrent run on the box" % (FLAG, defaults))
 
     def test_default_is_on(self):
-        """Validated on hardware jul29 (ORPHANS=0); an unconfigured run must be protected."""
+        """Validated on hardware (ORPHANS=0); an unconfigured run must be protected."""
         defaults = _leak_fix_defaults()
         for d in defaults:
             self.assertIn(
@@ -91,7 +78,9 @@ class TestLeakFixDefault(unittest.TestCase):
                 "OOMs, and an OOM is a 0.000 for that benchmark" % FLAG)
 
     def test_kill_switch_value_still_disables(self):
-        """`=0` must remain a real off switch: it restores the previous spawn byte-for-byte."""
+        """`=0` must remain a real off switch: it restores the previous spawn
+        byte-for-byte.
+        """
         truthy = ("1", "true", "on", "yes")
         self.assertNotIn("0", truthy)
         self.assertNotIn("", truthy)

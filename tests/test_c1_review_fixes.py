@@ -1,4 +1,4 @@
-"""jul20 C1-phase adversarial-review fixes — verified diagnoses, pinned.
+"""C1-phase adversarial-review fixes — verified diagnoses, pinned.
 
 Covers (see the review's exact fix list):
   FIX 1a (C1/S7 BLOCKER) — incremental crash-safe cost_ledger.json written
@@ -17,7 +17,7 @@ Covers (see the review's exact fix list):
       base dir (FPL26_RUN_DIR_BASE honored); no new dir -> None, never
       reuse a pre-existing dir.
   FIX 5 (S3, observability only) — distinct
-      loop_exit_reason="polish_reserve_fence" when the C1-T3 fence-capped
+      loop_exit_reason="polish_reserve_fence" when the fence-capped
       timeout (not genuine budget exhaustion) caused the budget kill.
 
 Stub-driven per tests/test_budget_enforcement.py — no network, no Vivado.
@@ -60,9 +60,7 @@ def _ledger(run_dir: Path) -> dict:
     return json.loads((run_dir / "cost_ledger.json").read_text())
 
 
-# ---------------------------------------------------------------------------
 # FIX 1a — incremental cost ledger (agent side)
-# ---------------------------------------------------------------------------
 
 class CostLedgerTests(unittest.TestCase):
     def setUp(self):
@@ -128,9 +126,7 @@ class CostLedgerTests(unittest.TestCase):
         opt._write_cost_ledger()       # must not raise
 
 
-# ---------------------------------------------------------------------------
 # FIX 1b — wrapper-side metric read: token_usage -> cost_ledger fallback
-# ---------------------------------------------------------------------------
 
 class ReadRunMetricsFallbackTests(unittest.TestCase):
     def setUp(self):
@@ -178,9 +174,7 @@ class ReadRunMetricsFallbackTests(unittest.TestCase):
         self.assertIsNone(mro._read_run_metrics(self.rd)["cost"])
 
 
-# ---------------------------------------------------------------------------
 # FIX 3 — snapshot-diff run-dir attribution
-# ---------------------------------------------------------------------------
 
 class RunDirAttributionTests(unittest.TestCase):
     def setUp(self):
@@ -245,9 +239,7 @@ class RunDirAttributionTests(unittest.TestCase):
             self.assertEqual(mro._wrapper_run_dir_base(repo), repo)
 
 
-# ---------------------------------------------------------------------------
 # FIX 2 — wrapper-internal budgeted fallback
-# ---------------------------------------------------------------------------
 
 class InternalFallbackTests(unittest.TestCase):
     def setUp(self):
@@ -378,9 +370,7 @@ class MainRoutesIntoInternalFallbackTests(unittest.TestCase):
                 self.assertEqual(mro.main([str(inp)]), 0)
 
 
-# ---------------------------------------------------------------------------
 # FIX 5 — polish-reserve fence exit-reason label (observability only)
-# ---------------------------------------------------------------------------
 
 class FenceCapFlagTests(unittest.TestCase):
     """_deadline_aware_timeout must remember whether it fence-capped the

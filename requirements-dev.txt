@@ -1,0 +1,12 @@
+# Dependencies for the OFFLINE test suite (`make test`). Not needed for a
+# scored run, and deliberately NOT `-r requirements.txt`.
+#
+# Measured, not assumed: in a clean venv the suite collects and passes with
+# exactly these three. It does NOT need `rapidwright` (a JVM package) or
+# `pexpect` — both are runtime-only, and installing them to run tests costs
+# minutes and can fail on a machine with no JDK.
+#
+# The two shared pins below must match requirements.txt; a test asserts it.
+pytest>=8.0.0,<10.0.0
+mcp==1.28.1
+openai>=1.0.0,<3.0.0

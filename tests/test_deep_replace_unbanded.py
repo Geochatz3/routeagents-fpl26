@@ -1,30 +1,10 @@
-"""UNBANDED deep-replace: a prediction may schedule work, never refuse it (jul26).
+"""Verify that unbanded deep replacement treats benefit predictions as scheduling
+hints rather than vetoes.
 
-THE DEFECT. `deep_replace_should_run` refused the stage unless
-`failing >= 100k AND |WNS| >= 10ns`. That band is a PREDICTION OF BENEFIT used
-as a VETO, and jul26 measured it mis-scoped by three orders of magnitude:
-
-    design      fmax_ratio  failing  |WNS|   operate   regen-from-pristine
-    logicnets   0.605        1,529   0.978   +6.45     +100.23   <- +93.77 gap
-    digit       0.624            -   1.025   +0.00     +15.44
-    optical     0.650            -   1.074   +0.42     +12.64
-    FIR         0.889          252   0.313   +13.65    LOSES
-
-logicnets is nowhere near the band and regeneration is worth +93.77 over
-operating. chain28 then measured production LOSING to a 271 s bare regen
-(489.48 vs 503.78) precisely because deep-replace[first] refused:
-
-    deep-replace[first]: skipped (failing_endpoints=1,529 < 100,000)
-
-THE FIX IS NOT A WIDER BAND. Choosing a boundary from six designs on a
-44-CLEAN-row corpus with a 3.5 MHz noise floor is the threshold-fitting the
-methodology invariant forbids. Instead the benefit-prediction stops being able
-to REFUSE; affordability (a hard bound) and the insured-compare MUX (a
-measurement) decide.
-
-These tests pin: default behaviour is byte-identical; unbanded drops ONLY the
-physics veto; every hard bound still refuses; and FIR-like designs are still
-protected by measurement rather than by the band.
+Unbanded mode removes only the physics-band rejection. Affordability and other
+hard bounds still refuse unsafe work, while checkpoint comparison protects
+against adopting an unhelpful result. Default banded behavior remains
+unchanged.
 """
 from __future__ import annotations
 
@@ -123,22 +103,14 @@ if __name__ == "__main__":
 
 
 class FirstStageAffordabilityTests(unittest.TestCase):
-    """jul28 night16d: the band-FIRST gate re-introduced a VETO for logicnets.
+    """Verify that affordable first-stage work is not deferred solely by the
+    benefit band.
 
-    The jul27 gate defers any out-of-band design's FIRST stage, on the stated
-    assumption that "nothing is refused: it still gets deep-replace at the tail if
-    budget remains". night16d measured that assumption FALSE — both deferred designs
-    DID run the stage at the tail and still lost, because FIRST and TAIL are not the
-    same work (FIRST reseeds the pipeline, the tail is a closing polish):
-
-        design      cost basis  failing   tail ran it   alpha vs control
-        mini-ISP        37s      4,887    yes  (75s)        -3.39
-        logicnets      161s      1,529    yes (184s)       -10.64
-        corescore     1099s     39,008    n/a (deferred)    +4.96
-
-    The separator is COST, not the band. These tests pin the arithmetic of the
-    affordability override that keeps a CHEAP first stage where it belongs, using the
-    wave-2-proven tail reserve already in the tree rather than a fitted constant.
+    First-stage replacement reseeds the pipeline, whereas tail replacement is
+    only a closing optimization and is not equivalent. The affordability
+    override compares measured cost with wall time after the existing tail
+    reserve, allowing inexpensive first-stage work while deferring work that
+    cannot fit safely.
     """
 
     # mirrors dcp_optimizer: budget = wall x (1 - TAIL_RESERVE_WALL_CLAMP_FRAC)
@@ -186,27 +158,23 @@ class FirstStageAffordabilityTests(unittest.TestCase):
         self.assertFalse(1.0 * self.MARGIN <= self.budget(0.0))
 
     def test_ispd16_stays_deferred_even_though_it_is_in_band(self):
-        """ispd16's 2315s stage is unaffordable by a wide margin; the override must
-        not rescue it. Its -4.14 came from a DIFFERENT defect (a first-stage skip
-        leaves no measured anchor, so the tail then fails closed)."""
+        """Keep an unaffordable deep-replacement stage deferred even when it is
+        otherwise in band.
+
+        A separate missing-anchor path fails closed and must not be mistaken
+        for affordability behavior.
+        """
         self.assertFalse(self.keeps_first(2315.0))
 
 
 class TailAnchorFallbackTests(unittest.TestCase):
-    """jul28 night16c: a FIRST-stage skip silently guaranteed a TAIL-stage skip.
+    """Verify that tail affordability can use a size-model fallback when no
+    measured anchor exists.
 
-    A measured anchor only exists once a heavy step has RUN. So when FIRST is skipped
-    (band or reserve), nothing publishes one, replace_gamble_cost_basis returns 0, and
-    the tail refuses with "no measured cost anchor (fail closed)" — the stage then runs
-    at NEITHER point. Observed on ispd16:
-
-        deep-replace[first]: skipped (insufficient terminal reserve ...)
-        deep-replace[tail]:  skipped (no measured cost anchor (fail closed))
-
-    The asymmetry was unjustified: the FIRST stage already trusts the size model at t=0
-    for precisely this reason. These tests pin that a zero basis still fails closed at
-    the predicate level (the predicate is not what changed), and that affordability —
-    not a missing measurement — is what refuses an unaffordable design.
+    Skipping the first heavy stage leaves no measured cost anchor. The
+    low-level predicate still fails closed for a zero basis, but the caller
+    supplies the modeled fallback before evaluating affordability so that
+    budget, rather than missing telemetry, determines refusal.
     """
 
     def test_zero_basis_still_fails_closed_at_the_predicate(self):
@@ -224,9 +192,12 @@ class TailAnchorFallbackTests(unittest.TestCase):
         self.assertIn("armed", why)
 
     def test_an_estimated_basis_is_REFUSED_when_unaffordable(self):
-        """ispd16's shape: 2315s estimate against a ~960s tail window. The fallback must
-        not rescue it — it should be refused for COST, with a number, rather than for a
-        missing measurement."""
+        """Refuse an estimated-basis fallback when its projected cost exceeds the
+        remaining tail window.
+
+        The refusal must report a numeric cost reason rather than a missing
+        measurement.
+        """
         run, why = call(LOGICNETS, banded=False, cost_basis_s=2315.0,
                         remaining_s=960.0)
         self.assertFalse(run)

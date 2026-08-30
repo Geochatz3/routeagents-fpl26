@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import dcp_optimizer as dcp_mod
 from dcp_optimizer import DCPOptimizer
+from tests.source_corpus import dcp_source_lines, dcp_source_text
 
 
 def _async(coro):
@@ -128,11 +129,8 @@ class DefaultOffTests(unittest.TestCase):
         self.assertFalse(self.opt._wall_handback_break_due())
 
     def test_default_off_never_acts_on_real_signal_site(self):
-        # 04-01 Task 3 parity: an agent constructed WITHOUT --wall-handback
-        # keeps _wall_handback_enabled False, and even a REAL sanctioned
-        # signal firing (budget-kill through call_tool's skip path, banked
-        # accept present so the guard passes) never trips the loop-break
-        # predicate — behavior byte-identical to today.
+        # When wall handback is disabled, a sanctioned budget-expiry signal does
+        # not break the loop, even when a banked checkpoint satisfies its guard.
         self.assertFalse(self.opt._wall_handback_enabled)
         self.opt._best_valid_dcp = Path(self.tmp.name) / "b.dcp"
         self.opt.max_wall_seconds = 100.0
@@ -280,7 +278,7 @@ class LoopGateWiringTests(unittest.TestCase):
     expose --wall-handback and wire it to _wall_handback_enabled. Source
     scan (the loop itself needs a live LLM session to execute)."""
 
-    SRC = Path(dcp_mod.__file__).read_text()
+    SRC = dcp_source_text()
 
     def test_loop_breaks_via_predicate(self):
         self.assertIn("_wall_handback_break_due()", self.SRC)
@@ -290,7 +288,7 @@ class LoopGateWiringTests(unittest.TestCase):
         self.assertIn('"--wall-handback"', self.SRC)
         self.assertIn("_wall_handback_enabled = bool(", self.SRC)
 
-    def test_polish_stages_never_write_the_reason(self):
+    def test_polish_ladder_never_write_the_reason(self):
         # No polish stage may clear/reset _exit_early_reason: the ONLY
         # assignments allowed are the __init__ default (annotated) and the
         # arm helper.  Comparisons (==, !=, `is`) don't count.

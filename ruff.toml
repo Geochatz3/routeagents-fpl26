@@ -1,0 +1,51 @@
+# Lint gate for `make lint` / CI. Deliberately NARROW.
+#
+# Two decisions worth stating, because both are easy to get wrong here.
+#
+# 1. NO FORMATTER. docs/PROVENANCE.md's value rests on a readable diff between
+#    tag `fpl26-final-submission` and `main` -- "what differs" is a claim a
+#    reader is invited to check. A whole-repo reformat would make that diff
+#    unreadable and buy nothing.
+#
+# 2. Only rules the repository ALREADY passes are selected, so the gate is
+#    green from the day it lands and can only be made stricter. A gate that
+#    fails on arrival is one people learn to skip -- the same failure mode as
+#    scripts/ship_path_audit.py returning 1 on every clean tree.
+#
+# The known backlog is recorded below rather than silently ignored. Counts are
+# from ruff 0.16.4 at the commit that added this file; they are a snapshot, not
+# an assertion, and no test pins them.
+#
+#   F401  unused-import                  106  -- mostly the deliberate re-export
+#                                               surface in dcp_optimizer.py and
+#                                               JVM class loads in RapidWrightMCP
+#   F541  f-string-missing-placeholders    92  -- log lines written as f-strings
+#   F841  unused-variable                  24  -- a real cleanup; some are calls
+#                                               whose result is ignored
+#   B007  unused-loop-control-variable      7
+#   B017  assert-raises-exception           8  -- tests asserting bare Exception
+#   B904  raise-without-from-inside-except  3
+#
+# Clearing any of those means moving its code into `select` below, not editing
+# this comment.
+
+target-version = "py310"
+extend-exclude = ["dcp_optimizer_run-*", "fpl26_contest_benchmarks"]
+
+[lint]
+select = [
+    "E9",    # syntax / IO errors ruff can detect
+    "F821",  # undefined name -- the only F rule that is a runtime bug
+    "F811",  # redefinition of an unused name (shadowed import or def)
+    "F632",  # `is` against a literal
+    "F702",  # `continue` outside a loop
+    "F706",  # `return` outside a function
+    "F707",  # `except:` before a more specific handler
+    "B002",  # `++n`, which is not an increment
+    "B006",  # mutable default argument
+    "B012",  # break/return inside `finally` swallows the exception
+    "S102",  # exec
+    "S307",  # eval
+    "T100",  # a forgotten breakpoint()
+    "PLE",   # pylint's error class
+]

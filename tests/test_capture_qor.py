@@ -1,18 +1,15 @@
-"""Tests for the Session-14 ``--capture-qor`` post-finalize hook.
+"""Tests the optional post-finalization QoR capture hook.
 
-The hook must:
-- be OFF by default,
-- when ON and the DCP exists, build a JSON path inside ``run_dir`` and
-  call the subprocess runner exactly once,
-- emit a single ``action_label="qor_capture"`` decision record per
-  finalize, with ``report_only=True`` and ``used_for_decision=False``,
-- treat timeout / failure / missing DCP as NON-FATAL,
-- refuse a JSON target inside ``submission/``,
-- NOT change lifecycle status,
-- NOT introduce design-name conditionals.
+Capture is disabled by default. When enabled with an existing DCP, it
+constructs a JSON target inside `run_dir` and invokes the subprocess runner
+exactly once.
 
-All tests monkey-patch ``_run_qor_capture_subprocess`` — no Vivado is
-spawned.
+Each finalization emits one `action_label="qor_capture"` decision record with
+`report_only=True` and `used_for_decision=False`. Timeouts, failures, and
+missing DCPs are nonfatal; targets inside `submission/` are rejected. Capture
+must not change lifecycle status or introduce design-specific conditionals.
+
+The subprocess runner is patched, so these tests do not invoke Vivado.
 """
 from __future__ import annotations
 
@@ -279,10 +276,8 @@ class CaptureQorOptimizerHookTests(unittest.TestCase):
             self.opt._design_name_for_memory = "rosetta_spam-filter"
             _async(self.opt._maybe_capture_qor_post_finalize(self.out_dcp))
         r = _qor_records(self.opt)[0]
-        # The record can carry a `design` autofill (existing convention)
-        # but the qor_capture STATUS / json_path / error_summary must not
-        # branch on it — check it isn't substring-matched into the action
-        # path or status string.
+        # The optional `design` autofill is metadata only; it must not affect
+        # capture status, paths, error summaries, or action labels.
         for k in ("status", "error_summary", "action_label"):
             v = r.get(k)
             if isinstance(v, str):

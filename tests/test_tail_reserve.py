@@ -1,44 +1,20 @@
-"""DEEP-WNS TAIL RESERVE tests (jul22 PLAN item 5 + jul23 V2 predicate).
+"""Tests the optional exit-tail reserve for designs with deeply negative slack.
 
-Mechanism under test (dcp_optimizer.py): when --deep-wns-tail-reserve /
-FPL26_DEEP_WNS_TAIL_RESERVE > 0 AND the design is STILL deep-WNS at the
-boundary (CURRENT best_wns <= _tail_ctrl_deep_wns_ns, default -1.0), the
-main LLM loop breaks once remaining wall <= reserve with
-loop_exit_reason=tail_reserve, exiting through the SHARED
-_exit_with_ils_polish tail like every other loop exit.
+The reserve defaults to zero, and the CLI overrides the environment variable.
+Invalid or negative values disable it; values between zero and one represent a
+fraction of the wall budget.
 
-Evidence being encoded (jul22 farm wave, leg_boom at eval speed): the
-LLM/recipe loop ran the ENTIRE wall to budget_exhausted (-35 s remaining
-at exit) so the deterministic exit tail got ZERO seconds (wall-fit gate
-refused 886 s vs -95 s effective); the only eval tail fire ever (+0.215
-banked, jul21) came from an accidental early loop exit.
+At a loop boundary, the reserve arms only when current best WNS remains below
+the configured threshold, the cell count exceeds the live ILS limit, and the
+stagnation condition holds. Unknown cell counts leave it disarmed, and a zero
+stagnation interval disables that guard.
 
-V2 (jul23 panel Q1b, 3-2 V2_BOOM_ONLY; farm waves 2+3 evidence):
-  - WALL CLAMP: effective reserve = min(requested,
-    TAIL_RESERVE_WALL_CLAMP_FRAC x wall) when the wall is known
-    (0.686 = 2400/3500, the wave-2 proven arm; wave-3: reserve >= wall
-    truncated ispd16/boom recipes to baseline), loud WARNING on clamp;
-  - STAGNATION GUARD: break only when no best_wns improvement in the
-    last FPL26_TAIL_RESERVE_STAGNANT_S seconds (default 240; 0 = off)
-    — wave-3 failed by exiting MID-recipe-improvement;
-  - SIZE-GATED-ONLY ARMING: _input_cell_count must exceed the LIVE ILS
-    max_cells gate (wave-2 L3-vs-L5: ILS-path control beat the reserve
-    on vtr); unknown cell count -> NOT armed (fail-safe).
+The default -1.0 ns boundary is pinned by `_tail_ctrl_deep_wns_ns`. Known wall
+budgets clamp the reserve by `TAIL_RESERVE_WALL_CLAMP_FRAC`.
 
-Load-bearing invariants:
-  - DEFAULT OFF (0/unset): zero behavior change on every existing path;
-  - resolver follows the house convention (CLI wins over env;
-    unparseable/negative keeps the default = OFF);
-  - deep-WNS check uses the CURRENT best_wns at the boundary, not entry
-    WNS (recipe-fixed near-met designs must NOT early-exit);
-  - the early exit goes through the SHARED exit tail
-    (_exit_with_ils_polish) with a distinct "[tail-reserve]" reason line;
-  - a value in (0, 1) is a fraction of --max-wall-seconds.
-
-Harness style mirrors tests/test_tail_controller.py +
-tests/test_bare_reroute_polish.py (+ the _run_optimize loop driver from
-tests/test_api_resilience_loop.py): stubbed sessions / scripted
-get_completion, NO Vivado, NO RapidWright, NO network, NO real sleeps.
+An armed exit sets `loop_exit_reason` to `tail_reserve` and passes through the
+shared ILS-polish tail. Tests use stubbed sessions without external tools,
+network access, or real sleeps.
 """
 from __future__ import annotations
 
@@ -109,9 +85,7 @@ def _make_optimizer(tmp_path: Path) -> DCPOptimizer:
     return opt
 
 
-# ---------------------------------------------------------------------------
 # Resolver convention (house style: CLI wins over env; invalid keeps default)
-# ---------------------------------------------------------------------------
 
 class ResolverTests(unittest.TestCase):
 
@@ -169,9 +143,7 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(resolve_deep_wns_tail_reserve_s(None), 0.0)
 
 
-# ---------------------------------------------------------------------------
 # V2 resolver: stagnation-guard window (env-only knob, house convention)
-# ---------------------------------------------------------------------------
 
 class StagnantResolverTests(unittest.TestCase):
 
@@ -210,9 +182,7 @@ class StagnantResolverTests(unittest.TestCase):
             self.assertEqual(opt._tail_reserve_stagnant_s, 90.0)
 
 
-# ---------------------------------------------------------------------------
 # Predicate: _tail_reserve_break_due / _deep_wns_tail_reserve_effective_s
-# ---------------------------------------------------------------------------
 
 class PredicateTests(unittest.TestCase):
 
@@ -348,10 +318,8 @@ class PredicateTests(unittest.TestCase):
             self.opt._deep_wns_tail_reserve_effective_s()
 
     def test_clamped_reserve_still_breaks_inside_clamped_window(self):
-        # Requested 5000s (>= wall would have broken IMMEDIATELY after
-        # the first bank — the wave-3 recipe-truncation failure); with
-        # the clamp the boundary is 2400s: remaining 3000 must NOT
-        # break, remaining 2000 must.
+        # A 5000 s request is clamped to 2400 s for this wall budget.
+        # The boundary does not trigger at 3000 s remaining, but does at 2000 s.
         self._arm(5000.0, remaining=3000.0, max_wall=3500.0)
         self.assertFalse(self.opt._tail_reserve_break_due())
         self._arm(5000.0, remaining=2000.0, max_wall=3500.0)
@@ -429,10 +397,8 @@ class PredicateTests(unittest.TestCase):
         self.assertTrue(self.opt._tail_reserve_break_due())
 
 
-# ---------------------------------------------------------------------------
 # Loop integration: the break exits through the SHARED exit tail
 # (_run_optimize driver mirrored from tests/test_api_resilience_loop.py)
-# ---------------------------------------------------------------------------
 
 class LoopIntegrationTests(unittest.TestCase):
 
@@ -500,11 +466,9 @@ class LoopIntegrationTests(unittest.TestCase):
         return opt, get_completion, exit_tail, "\n".join(logs.output)
 
     def test_on_deep_at_boundary_exits_through_shared_tail(self):
-        # Wall 900s: deadline = start + (900 - 300 finalize reserve) ->
-        # remaining ~600s <= CLAMPED reserve (0.686 x 900 = 617s; the
-        # raw 5000s request exceeds the wall) at iteration 1 -> the
-        # loop breaks BEFORE any LLM call and exits via the SHARED
-        # tail, with the loud clamp warning in the logs.
+        # With a 900 s wall, the finalization allowance leaves about 600 s.
+        # The reserve clamps to 617 s, so the loop exits before any LLM call
+        # through the shared tail path. The clamp is also reported in logs.
         opt, get_completion, exit_tail, logs = self._run_optimize(
             reserve=5000.0, max_wall=900.0, best_wns=-2.0)
         get_completion.assert_not_awaited()
@@ -522,10 +486,9 @@ class LoopIntegrationTests(unittest.TestCase):
         self.assertNotIn("[tail-reserve]", logs)
 
     def test_on_shallow_no_early_exit(self):
-        # Boundary hit but the design is near-met (-0.5 > -1.0): owned
-        # by the LLM/ILS — no reserve exit (CURRENT-WNS requirement).
-        # (The clamp warning may still log — it is a config observation,
-        # not a break.)
+        # Reserve exit applies only when current WNS indicates deep negative slack.
+        # A near-met design at -0.5 ns continues through LLM/ILS at the boundary.
+        # A clamp warning reports configuration and does not imply an exit.
         opt, get_completion, exit_tail, logs = self._run_optimize(
             reserve=5000.0, max_wall=900.0, best_wns=-0.5)
         get_completion.assert_awaited()
@@ -558,10 +521,8 @@ class LoopIntegrationTests(unittest.TestCase):
         self.assertNotIn("[tail-reserve] deep-WNS reserve reached", logs)
 
     def test_recent_improvement_no_early_exit(self):
-        # V2 STAGNATION GUARD at loop level: optimize() seeds
-        # last_improvement_time = start_time = now, so with the default
-        # 240s window the loop is NOT stagnant at iteration 1 -> no
-        # break even though every other condition holds.
+        # The loop initializes last improvement to its start time.
+        # The first iteration is therefore not stagnant within the 240 s window.
         opt, get_completion, exit_tail, logs = self._run_optimize(
             reserve=5000.0, max_wall=900.0, best_wns=-2.0,
             stagnant_s=TAIL_RESERVE_STAGNANT_S_DEFAULT)

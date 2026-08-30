@@ -1,29 +1,15 @@
-"""Advisory policy card v1 — feature-first historical hints for the
-iter-1 LLM prompt.
+"""Builds an advisory policy card from feature-similar prior episodes.
 
-ADVISORY ONLY.  This module never returns a command, never picks a
-strategy, never selects a tool.  It returns a compact text block
-(≈200–500 tokens) describing what feature-similar past runs did
-and what failed there.
-
-Hard rules enforced here:
-
-1. Feature-first retrieval ONLY.  No design-name retrieval, no
-   exact-name matching, no benchmark-name conditionals.
-2. Validator-backed weighting.  Episodes without
-   `validation_status == "ok"` and a real `validated_delta_fmax`
-   are excluded from positive-pattern aggregation; they may
-   still appear in negative-memory warnings if they carry a
-   neg-mem record.
-3. Contest-mode filtering.  When the consumer is running under
-   `--contest-mode`, only contest-mode episodes are used.
-4. Confidence labelling.  Single-episode wins are LOW confidence.
-   ≥3 similar episodes with positive validated delta is MEDIUM;
-   ≥3 with positive delta on validator-confirmed beat-ship
-   targets is HIGH.
-
-Default flow is unchanged: the optimizer wires this in only when
-`--policy-card` is explicitly passed.
+The result is an approximately 200–500-token text block describing relevant
+actions and failures; it never selects commands, strategies, or tools.
+Retrieval uses features only and must not match or branch on design names.
+Positive patterns require `validation_status == "ok"` and a real
+`validated_delta_fmax`; excluded episodes may still contribute eligible
+negative-memory warnings. Contest-mode consumers use only contest-mode
+episodes. One matching positive episode is low confidence; at least three
+similar positive validated outcomes are medium confidence; at least three
+validator-confirmed target-beating outcomes are high confidence. The policy
+card is enabled only when `--policy-card` is passed.
 """
 from __future__ import annotations
 
@@ -41,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Feature distance — Euclidean over normalised (lut_count, spread).
 # Constants tuned to the v0 store: LUT range 1.9k–295k spans ≈ 150×;
-# spread range 8–660 spans ≈ 80×.  We z-normalise crudely by dividing
+# spread range 8–660 spans ≈ 80×.  Z-normalised crudely by dividing
 # by typical scales so neither feature dominates.
 _LUT_SCALE = 50_000.0
 _SPREAD_SCALE = 100.0
@@ -157,9 +143,12 @@ def select_relevant_negative_memories(
     neg_store_path: Optional[Any] = None,
     config: Optional[PolicyCardConfig] = None,
 ) -> List[Tuple[float, Dict[str, Any]]]:
-    """Negative memories don't have feature fields directly; they
-    carry `profile_features` (snapshot of start_features).  Use that
-    when available; otherwise admit the record at a fallback distance."""
+    """Selects relevant negative memories using stored profile features.
+
+    Negative-memory records use `profile_features`, a snapshot of starting
+    features, for distance calculations. Records without profile features
+    remain eligible at the configured fallback distance.
+    """
     cfg = config or PolicyCardConfig()
     mems = load_negative_memories(neg_store_path) if neg_store_path else load_negative_memories(
         __import__("optimizer.negative_memory",
@@ -202,7 +191,7 @@ def _variant_advisory_text(
     critical_path_spread: Optional[float],
 ) -> Optional[str]:
     """Return cluster-derived variant advisory text, or None if no advisory
-    applies.  NEVER references benchmark / design names; emits feature
+    applies.  Never references benchmark / design names; emits feature
     cluster reasoning only.  Returns a label-style advisory family from
     the same allow-list used by HFCv0 — never a Vivado / Tcl command.
     """
@@ -231,7 +220,7 @@ def _variant_advisory_text(
 
     if variant == "route_bound_v1":
         # Target: route_bound_likely candidates (high congestion signal).
-        # Without QoR features in the card-rendering scope we can't gate
+        # Without QoR features in the card-rendering scope there is no way to gate
         # on route_bound_score directly; gate by small-lut + low_spread
         # proxy for now and emit a WARNING ONLY (no advisory_family).
         if (lut is not None and lut < 10_000
@@ -271,8 +260,8 @@ def render_policy_card(
       - card_token_estimate:     int (chars/4 heuristic)
       - confidence:              "high" | "medium" | "low" | "none"
 
-    The text block follows the POLICY_MEMORY_CARD format documented
-    in the brief.  When no similar validated episode exists, the
+    The text block follows the POLICY_MEMORY_CARD format.
+    When no similar validated episode exists, the
     card returns empty text but still records what was attempted.
     """
     cfg = config or PolicyCardConfig()
@@ -371,10 +360,10 @@ def render_policy_card(
                           "no mandatory command.  Design name is not "
                           "a key here.")
 
-    # Session-20 variant advisory.  Default = unchanged behaviour.
+    # Variant advisory.  Default = unchanged behaviour.
     # When variant != "default", append a cluster-derived advisory
     # block at the END of the card so any historical card content
-    # is preserved verbatim above it.  NEVER references design names.
+    # is preserved verbatim above it.  Never references design names.
     variant_text: Optional[str] = None
     if variant and variant != "default":
         if variant not in VALID_VARIANTS:

@@ -1,23 +1,8 @@
-"""Decision tracer — minimal per-iteration / per-event JSONL telemetry.
+"""Records optimizer decisions and events as best-effort JSONL telemetry.
 
-Goal: emit a structured record for every optimizer decision (tool call,
-finalize event, validator hit) into `runs/<run_id>/decisions.jsonl`.
-Future infra (policy memory, ablation harness, structured error
-recovery) consumes this stream.
-
-This first implementation is INTENTIONALLY MINIMAL.  No policy card,
-no retrieval, no ML.  Just:
-  - one append-atomic JSONL writer
-  - a stable, documented schema (SCHEMA_VERSION)
-  - tolerance for missing fields (everything optional)
-  - silent failure on write errors (never blocks optimization)
-
-Design contract:
-  DecisionTracer.emit(record_dict) → bool
-  DecisionTracer.path_for_run(run_id) → Path
-  load_decisions(path) → list[dict]
-
-Schema documented in DECISION_RECORD_FIELDS below.
+Records are appended to `runs/<run_id>/decisions.jsonl` using the schema
+identified by `SCHEMA_VERSION`. Fields are optional, and write failures never
+block optimization. `DECISION_RECORD_FIELDS` documents the record schema.
 """
 from __future__ import annotations
 
@@ -31,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional
 logger = logging.getLogger(__name__)
 
 # Schema version bumps:
-# v1 (2026-05-20 P1): initial fields below.
+# v1: initial fields below.
 SCHEMA_VERSION = 1
 
 # Documented set of fields the schema RECOGNIZES.  Unknown fields are
@@ -51,7 +36,7 @@ DECISION_RECORD_FIELDS = {
     "validity_state", "best_valid_checkpoint_path",
     "best_valid_token", "lineage_token", "ship_lineage_source",
     "output_dcp_path",
-    # feature-first retrieval (initial_analysis only, Session 6 P1)
+    # feature-first retrieval (initial_analysis only)
     "lut_count", "critical_path_spread",
     # error + cost
     "tool_error_code", "runtime_s",
@@ -71,16 +56,11 @@ DECISION_SOURCES = {
 
 
 class DecisionTracer:
-    """Append-only JSONL writer for decision records.
+    """Provides an append-only JSONL writer for decision records.
 
-    Public API:
-      - emit(record): best-effort append of one record.  Returns True
-        on success, False if write failed (and logs a warning).
-      - path_for_run(run_id): the canonical path under a run dir.
-      - close(): noop today; reserved for future buffered modes.
-
-    Threading: not thread-safe.  Single-writer per run (the optimizer
-    runs one iteration at a time).
+    `emit` returns whether a best-effort append succeeded, `path_for_run`
+    returns the canonical path beneath the run directory, and `close` is a
+    no-op. Instances are not thread-safe and require a single writer per run.
     """
 
     def __init__(self, run_dir: Path | str, run_id: Optional[str] = None):
@@ -106,12 +86,12 @@ class DecisionTracer:
         return self._path
 
     def emit(self, record: Dict[str, Any]) -> bool:
-        """Best-effort append of one record.  Stamps schema_version,
-        run_id, and timestamp if missing.  Never raises.
+        """Append one decision record without interrupting optimization on
+        failure.
 
-        Returns True on successful write, False otherwise.  Failures
-        are logged at WARNING level once per emit so the optimizer
-        keeps running.
+        Missing `schema_version`, `run_id`, and `timestamp` fields are added
+        before writing. The method returns `True` on success and `False` on
+        failure, logs each failed append at WARNING level, and never raises.
         """
         if not isinstance(record, dict):
             logger.warning("decision_tracer.emit: record is not a dict; skipped")

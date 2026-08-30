@@ -1,13 +1,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Portions of this file consist of AI-generated content.
-# SPDX-License-Identifier: Apache 2.0
+# SPDX-License-Identifier: Apache-2.0
 
 """
 RapidWright Tools - Wrapper functions for RapidWright operations
 Uses the pip-installed rapidwright package which handles JPype integration
-and bundles its own standalone jar.  ENV-COMPAT PATCH applied (see
-ENV_COMPAT_PATCHES.md): no longer overrides RAPIDWRIGHT_PATH/CLASSPATH so
-the worktree does not need a built RapidWright git submodule.
+and bundles its own standalone jar.  RAPIDWRIGHT_PATH/CLASSPATH are
+deliberately NOT overridden, so a working tree needs no built RapidWright
+git submodule.
 """
 import logging
 from typing import Dict, Any, Optional
@@ -59,11 +59,8 @@ def initialize_rapidwright(jvm_max_memory: str = "4G") -> Dict[str, Any]:
         return result
     
     try:
-        # ENV-COMPAT PATCH (beta-mimic-anchor, see ENV_COMPAT_PATCHES.md):
-        # Original code required a built RapidWright submodule under
-        # RapidWright/jars/ (created by `make build-rapidwright`).  We instead
-        # rely on the pip-installed `rapidwright` package which bundles its own
-        # standalone jar and self-configures CLASSPATH.  Algorithm-equivalent.
+        # Use the pip-installed RapidWright package, which provides its standalone
+        # jar and configures the Java class path.
         import rapidwright
         import os
         from com.xilinx.rapidwright.device import Device
@@ -72,7 +69,7 @@ def initialize_rapidwright(jvm_max_memory: str = "4G") -> Dict[str, Any]:
         
         logger.info("RapidWright initialized successfully")
         
-        # Test that we can access basic functionality
+        # Check that basic functionality is reachable
         device_count = len(Device.getAvailableDevices())
         
         # Get version and install path
@@ -105,10 +102,11 @@ def initialize_rapidwright(jvm_max_memory: str = "4G") -> Dict[str, Any]:
 
 def get_supported_devices() -> Dict[str, Any]:
     """
-    Get list of all FPGA devices supported by RapidWright, including families and part numbers.
-    
-    Returns:
-        Dictionary with devices organized as a tree: Series -> FamilyType -> Devices
+    Get list of all FPGA devices supported by RapidWright, including families
+    and part numbers.
+
+    Returns: Dictionary with devices organized as a tree: Series -> FamilyType
+    -> Devices
     """
     if not _initialized:
         return {"error": "RapidWright not initialized. Call initialize_rapidwright first."}
@@ -546,18 +544,18 @@ def search_sites(site_type: Optional[str] = None,
 
 def optimize_lut_input_cone(hierarchical_input_pins: list[str]) -> Dict[str, Any]:
     """
-    Optimize LUT input cones by combining chained small LUTs into a single larger LUT.
-    
-    This optimization reduces logic depth by replacing series of small LUTs with a single
-    larger LUT (up to 6 inputs). This is particularly useful for critical paths where
-    the delay through multiple LUT levels can be reduced to a single LUT.
-    
-    Args:
-        hierarchical_input_pins: List of hierarchical input pin names to optimize
-                                (e.g., ["module/submodule/inst/pin"])
-        
-    Returns:
-        Dictionary with optimization results
+    Optimize LUT input cones by combining chained small LUTs into a single
+    larger LUT.
+
+    This optimization reduces logic depth by replacing series of small LUTs
+    with a single larger LUT (up to 6 inputs). This is particularly useful for
+    critical paths where the delay through multiple LUT levels can be reduced
+    to a single LUT.
+
+    Args: hierarchical_input_pins: List of hierarchical input pin names to
+    optimize (e.g., ["module/submodule/inst/pin"])
+
+    Returns: Dictionary with optimization results
     """
     if not _initialized:
         return {"error": "RapidWright not initialized. Call initialize_rapidwright first."}
@@ -943,17 +941,11 @@ def analyze_fabric_for_pblock(
                 center_of_mass_row = sum(placed_rows) // len(placed_rows)
                 logger.info(f"Center of mass: col={center_of_mass_col}, row={center_of_mass_row}")
         
-        # Find a contiguous range around center of mass that:
-        # 1. Has enough resources for target (with margin)
-        # 2. Avoids bad columns
-        # 3. Is reasonably sized (not the entire device)
+        # Select a bounded, contiguous region around the placement center of mass.
+        # The region provides resource margin while excluding unsuitable columns.
         
-        # SIMPLIFIED APPROACH: Use fixed reasonable size based on empirical data
-        # For logicnets_jscl design (30K LUTs), optimal was 12 SLICE cols × 50 rows
-        # This achieved timing closure. Scale based on target LUTs:
-        # - Small designs (<20K LUTs): 15-20 columns
-        # - Medium designs (20-50K LUTs): 20-30 columns
-        # - Large designs (>50K LUTs): 30-40 columns
+        # Use coarse LUT-count tiers to limit placement-region width.
+        # The fixed widths balance resource margin against excessive placement spread.
         
         target_luts = required_slices * 4  # Convert back to LUTs
         
@@ -1379,7 +1371,7 @@ def _compute_routed_path_length(net, sink_pin):
     if pips is None or pips.size() == 0:
         return -1
     
-    # Build a Node map to use as a lookup as we traverse nodes backwards from the
+    # Build a Node map to use as a lookup while traversing nodes backwards from the
     # sink pin to the source pin.
     node_map = {}
     for pip in pips:
@@ -1398,7 +1390,8 @@ def _compute_routed_path_length(net, sink_pin):
     if source_node is None or sink_node is None:
         return -1    
 
-    # Traverse backwards (sink to source), accumulate Manhattan node (tile-to-tile) distances along the way
+    # Traverse backwards (sink to source), accumulate Manhattan node (tile-to-
+    # tile) distances along the way
     length = 0
     node = sink_node
     while node is not None and node != source_node:
@@ -1411,11 +1404,11 @@ def _compute_routed_path_length(net, sink_pin):
     return length if node == source_node else -1
 
 def _detour_ratio(net, sink_pin):
-    """Return the detour ratio for the provided sink back to the source of the provided net.
+    """Return the detour ratio for the provided sink back to the source of the
+    provided net.
 
-        Args:
-        net: RapidWright Net object (must be routed, i.e. have PIPs)
-        sink_pin: RapidWright SitePinInst object for the sink site pin
+    Args: net: RapidWright Net object (must be routed, i.e. have PIPs)
+    sink_pin: RapidWright SitePinInst object for the sink site pin
     """
     src_pin = net.getSource()
     if src_pin is None or src_pin.getSite() is None:
@@ -1547,8 +1540,6 @@ def analyze_net_detour(
         traceback.print_exc()
         return {"error": str(e)}                
 
-#
-
 
 def optimize_cell_placement(
     cell_names: list,
@@ -1662,9 +1653,9 @@ def optimize_cell_placement(
             for net in connected_nets:
                 affected_net_names.append(str(net.getName()))
                 try:
-                    # Note: this removes all routing on the entire net.
-                    #       For incoming nets of a re-placed cell, this will also unroute
-                    #       any routing going to other unrelated cells.
+                    # Note: this removes all routing on the entire net. For
+                    # incoming nets of a re-placed cell, this will also unroute
+                    # any routing going to other unrelated cells.
                     net.unroute()
                 except Exception:
                     pass
@@ -1799,7 +1790,7 @@ def convert_fabric_region_to_pblock_ranges(
             col = tile.getColumn()
             row = tile.getRow()
             
-            # Check if tile is within our region
+            # Check whether the tile is inside the target region
             if not (col_min <= col <= col_max and row_min <= row <= row_max):
                 continue
             

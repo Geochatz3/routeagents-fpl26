@@ -1,25 +1,9 @@
-"""The deep-replace affordability gate double-counts the finalize reserve.
+"""Verify that deep-replacement affordability reserves finalization exactly once.
 
-`remaining_s` reaches `deep_replace_should_run` already reduced by
-`_finalize_reserve_seconds`:
-
-    dcp_optimizer.py:10380 (tail)  -> self._budget_deadline
-    dcp_optimizer.py:9145  (first) -> time.time() + self._budget_remaining()
-    _budget_deadline = start + max_wall - _finalize_reserve_seconds   (300.0)
-
-The gate then computes `need = anchor * 1.3 + finalize_reserve_s` with the SAME
-300s, so it withholds **600s for a finalize that needs 300s**.
-
-This is the jul26 pattern that earned boom_soc +6.5 MHz ("prediction was solving a
-problem the staging had already removed"), left unapplied to this gate.
-
-The numeric cases below are REAL decline lines mined jul30 from 59 `agent.log`
-files on the Dev Cloud boxes, not invented figures — so if the constants or the
-formula move, these tests say so in the corpus's own terms.
-
-Safety property that makes the correction testable at all: it is DISCRIMINATING.
-Of 30 distinct declines, 22 arm once corrected and all 8 genuinely-infeasible ones
-stay declined.
+The supplied remaining time already excludes the finalization reserve, so
+adding that reserve to the estimated need would count it twice. Corrected
+calculations must admit feasible work while continuing to reject work that
+cannot finish within the available budget.
 """
 from __future__ import annotations
 
@@ -29,6 +13,7 @@ from optimizer.deep_replace_sibling import (
     DEEP_REPLACE_COST_MARGIN,
     deep_replace_should_run,
 )
+from tests.source_corpus import dcp_source_text, optimizer_class_source
 
 RESERVE = 300.0
 
@@ -193,13 +178,12 @@ class HardGatesStillApplyTests(unittest.TestCase):
 
 class WiringTests(unittest.TestCase):
     """Pin that the flag is read with an OFF default and reaches the gate — a
-    correction nobody can turn on is the jul29 drift in miniature."""
+    correction nobody can turn on is the drift in miniature."""
 
     @classmethod
     def setUpClass(cls):
         from pathlib import Path
-        src = Path(__file__).resolve().parent.parent / "dcp_optimizer.py"
-        cls.text = src.read_text(encoding="utf-8", errors="replace")
+        cls.text = dcp_source_text()
 
     def test_flag_default_off(self):
         self.assertIn(
@@ -207,13 +191,8 @@ class WiringTests(unittest.TestCase):
             self.text)
 
     def test_flag_is_passed_to_the_gate(self):
-        # aug06: the argument became `(_no_double_reserve or _sg_first)` when
-        # FPL26_DEEP_FIRST_SIZEGATED landed — the size-gated class waives the
-        # double-subtracted reserve too (see tests/test_deep_first_sizegated.py).
-        # This test's SUBJECT is unchanged: _no_double_reserve must still reach
-        # the gate, and must still be the only thing that can turn it on
-        # globally. Asserted on the expression rather than an exact string so a
-        # future additional disjunct does not read as a regression.
+        # `_no_double_reserve` must reach the gate as the global opt-in.
+        # Check expression membership because other valid conditions may share the gate.
         import re
         m = re.search(r"reserve_already_in_deadline=\(?([^)\n]*)", self.text)
         self.assertIsNotNone(m, "argument no longer passed to the gate")

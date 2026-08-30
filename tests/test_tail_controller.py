@@ -1,4 +1,4 @@
-"""Adaptive banked tail controller tests (jul22, PLAN item 1).
+"""Adaptive banked tail controller tests.
 
 Policy layer (optimizer/tail_controller.py) is pure — tested directly.
 Execution layer (DCPOptimizer._run_tail_controller + the dispatch inside
@@ -180,9 +180,7 @@ class PolicyTests(unittest.TestCase):
             self.assertFalse(move_by_key(k).rides_autobank)
 
 
-# ---------------------------------------------------------------------------
 # Resolvers
-# ---------------------------------------------------------------------------
 
 class ResolverTests(unittest.TestCase):
 
@@ -390,7 +388,7 @@ class ControllerExecutionTests(_ControllerHarness):
 
 
 class M1EchoTests(_ControllerHarness):
-    """POST-ACCEPT M1 ECHO (jul23 panel fantasy #2, terra; DEFAULT OFF).
+    """POST-ACCEPT M1 ECHO (panel fantasy #2, terra; DEFAULT OFF).
 
     Load-bearing invariants:
       - flag OFF (constructor default) => zero diff: no route_design
@@ -431,10 +429,9 @@ class M1EchoTests(_ControllerHarness):
         self.assertEqual(self.mirror_calls, [True])  # m4 still adopts
 
     def test_on_adopted_physopt_exactly_one_echo_counted(self):
-        # max_moves=2: adopted m4 (move 1) + its echo (move 2) fill the
-        # cap — the run must be exactly 4 ladder phys_opt calls + 1 bare
-        # route_design, nothing after (proves the echo is COUNTED; an
-        # uncounted echo would leave room for a second picked move).
+        # With max_moves=2, the adopted m4 and its m1 echo consume both move
+        # slots. Expect four ladder phys_opt calls and one bare route_design;
+        # no later move may run.
         self.opt._tail_ctrl_m1_echo = True
         self.opt._tail_ctrl_max_moves = 2
         self._run()
@@ -454,10 +451,9 @@ class M1EchoTests(_ControllerHarness):
         self.assertEqual(echo_flags, [False])
 
     def test_echo_result_recorded_into_m1_state(self):
-        # No-gain echo (stubbed call_tool leaves best_wns untouched):
-        # recorded as ("m1_route", 0.0) right after the parent m4 — the
-        # below-min observation retires m1 exactly like a picked M1
-        # would (intentional: the echo IS an M1 execution).
+        # The call_tool stub leaves best_wns unchanged, making the echo a zero-gain
+        # m1_route result immediately after its parent m4.
+        # The below-minimum result retires m1 because an echo counts as an M1 execution.
         self.opt._tail_ctrl_m1_echo = True
         self.opt._tail_ctrl_max_moves = 2
         patcher, calls = self._record_result_spy()
@@ -489,10 +485,8 @@ class M1EchoTests(_ControllerHarness):
         self.assertEqual(opt.best_wns, -1.2)
 
     def test_unaffordable_echo_skips_with_log(self):
-        # Remaining wall chosen BETWEEN the m4 need (0.9x route pred)
-        # and the m1 need (1.0x): the parent m4 move is affordable and
-        # adopts, but its echo is not — skipped with a log line, no
-        # route_design ever runs.
+        # Remaining wall lies between the parent move and echo estimates.
+        # The parent is adopted, but the echo is skipped without routing.
         from optimizer.route_gate import assess_preserving_reroute
         import dcp_optimizer as dcp_mod
         self.opt._tail_ctrl_m1_echo = True
@@ -606,10 +600,8 @@ class DispatchTests(unittest.TestCase):
 
         self.opt._run_tail_controller = crashing_controller
         _async(self.opt._run_bare_reroute_polish())   # must not raise
-        # Fail-closed re-open + the plain loop's route_design ran; jul23
-        # INSURED-COMPARE adds a THIRD open — the completed plain-loop tail
-        # re-opens the banked best to enroll it into the finalize MUX
-        # (belt-and-suspenders, no-op-vs-pipeline).
+        # Fail-closed recovery and the plain routing loop account for two opens.
+        # Insured comparison opens the banked best again for final selection.
         opens = [a for (n, a) in self.call_log
                  if n == "vivado_open_checkpoint"]
         self.assertEqual(len(opens), 3)
@@ -662,7 +654,7 @@ class AutoBankSuppressionTests(unittest.TestCase):
         self.assertEqual(self.opt.best_wns, -1.0)
 
     def test_hook_hold_guard_rejects_dirty_bank(self):
-        # jul22 OOD stress finding 1: an improvement event with measurable
+        # OOD stress finding 1: an improvement event with measurable
         # whs < 0 must NOT bank (validator gates hold_passed -> alpha=0).
         from unittest import mock as _mock
 
@@ -690,18 +682,15 @@ class AutoBankSuppressionTests(unittest.TestCase):
         self.assertEqual(self.opt.best_wns, -1.0)
 
     def test_hook_hold_probe_reaches_session_with_correct_tool_name(self):
-        # jul23 wave-4 Q4 forensics: the jul22 guard passed
-        # _call_vivado_tool (which PREFIXES names) -> the probe dispatched
-        # as "vivado_vivado_run_tcl" and silently failed open EVERY time.
-        # Without patching _measure_hold, drive the real path and assert
-        # the hold Tcl reaches the session under the correct tool name.
+        # Exercise the real dispatch path because it prefixes tool names.
+        # The assertion verifies that hold-analysis Tcl reaches the session.
         _async(self.opt.call_tool(self.HEAVY_TOOL, {}))
         hold_calls = [
             (n, a) for (n, a) in self.opt.vivado_session.calls
             if "-hold" in str(a.get("command", ""))]
         assert hold_calls, "hold probe never reached the session"
         # call_tool strips the "vivado_" prefix at dispatch: correct
-        # session-level name is "run_tcl"; the jul22 bug arrived as
+        # session-level name is "run_tcl"; the bug arrived as
         # "vivado_run_tcl" (only the first prefix stripped).
         for n, _a in hold_calls:
             self.assertEqual(n, "run_tcl")
@@ -710,7 +699,7 @@ class AutoBankSuppressionTests(unittest.TestCase):
         self.assertEqual(bogus, [])
 
     def test_hook_cell_count_guard_rejects_gutted_design(self):
-        # jul23 panel Q2: logic deletion (remove_cell) is tracker-
+        # panel Q2: logic deletion (remove_cell) is tracker-
         # invisible and can improve WNS while failing equivalence.
         # A session reporting a cell count below 0.5x entry must not bank.
         self.opt._input_cell_count = 100_000

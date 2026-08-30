@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Portions of this file consist of AI-generated content.
-# SPDX-License-Identifier: Apache 2.0
+# SPDX-License-Identifier: Apache-2.0
 
 """
-RapidWright MCP Server
-Provides AI assistant access to RapidWright FPGA design tools via the Model Context Protocol
+RapidWright MCP Server Provides AI assistant access to RapidWright FPGA design
+tools via the Model Context Protocol
 """
 import argparse
 import asyncio

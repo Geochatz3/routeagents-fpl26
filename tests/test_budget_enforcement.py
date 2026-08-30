@@ -1,14 +1,8 @@
-"""Budget-enforcement tests for the deadline-aware tool dispatcher,
-piggyback best_valid mirror, and finalize fast path.
+"""Tests deadline-aware dispatch, best-result mirroring, and budget-safe
+finalization.
 
-The boom_soc 2026-05-13 capped run completed VALID_OPTIMIZED +35.47 MHz
-but consumed 13817s of a nominal 3300s budget — the iteration-boundary
-budget check could not interrupt in-flight Vivado tool calls.  This
-suite pins down the new dispatcher's behaviour so we never regress to
-silent budget overruns again.
-
-We don't spawn Vivado/RapidWright/MCP — we mock the call surface and
-inspect the dispatcher's gating, timeout, mirror, and finalize logic.
+The suite verifies dispatch gating, per-call timeouts, mirror handling, and
+finalize behavior without starting external tool sessions.
 """
 from __future__ import annotations
 
@@ -29,6 +23,7 @@ from dcp_optimizer import (
     MIN_USEFUL_TOOL_SECONDS,
     RISKY_VIVADO_TOOLS,
 )
+import optimizer.tool_dispatch as _tool_dispatch
 
 
 def _async(coro):
@@ -70,11 +65,10 @@ class _FakeSession:
 
 
 def _make_optimizer(tmp_path: Path) -> DCPOptimizer:
-    """Build an Optimizer with mocked sessions and minimal state.
+    """Creates an optimizer with mocked sessions and minimal state.
 
-    The test suite needs a real DCPOptimizer instance — the dispatcher
-    logic is method-bound — but we never start servers.  Sessions are
-    replaced after construction.
+    A real optimizer instance is required because dispatcher behavior is
+    method-bound, but its sessions are replaced before any server starts.
     """
     opt = DCPOptimizer(api_key="test", run_dir=tmp_path)
     opt.vivado_session = _FakeSession()
@@ -107,10 +101,9 @@ class BudgetSkipPolicyTests(unittest.TestCase):
         self.assertEqual(reason, "deadline_passed")
 
     def test_risky_tool_skipped_when_estimate_exceeds_remaining(self):
-        # _budget_deadline is already set to (start + max_wall - reserve)
-        # in optimize(), so _budget_remaining() IS the reserve-protected
-        # window.  Here we set remaining = 100s directly; risky default
-        # 600s > 100s → skip.
+        # The budget deadline already excludes the final reserve, so remaining
+        # time is the reserve-protected window. A 100 s window cannot admit
+        # a tool with a 600 s default estimate.
         self.opt._budget_deadline = time.time() + 100.0
         skip, reason = self.opt._should_skip_for_budget("vivado_phys_opt_design")
         self.assertTrue(skip)
@@ -152,11 +145,10 @@ class BudgetSkipPolicyTests(unittest.TestCase):
             "recipe_register_retiming",
         ):
             self.assertIn(tool, RISKY_VIVADO_TOOLS, f"{tool} must be risky")
-        # These are INTENTIONALLY NOT unconditionally risky:
-        # - vivado_run_tcl: most uses are cheap property queries, gated
-        #   via the tcl-payload heuristic when payload is heavy.
-        # - rapidwright_optimize_cell_placement: per-call cost <10s; the
-        #   heavy orchestration lives in recipe_cell_replacement.
+        # Tcl dispatch is classified from its payload because property queries
+        # are cheap while implementation commands may be expensive.
+        # Cell-placement calls are cheap individually; their orchestration
+        # carries the budget risk.
         self.assertNotIn("vivado_run_tcl", RISKY_VIVADO_TOOLS)
         self.assertNotIn("rapidwright_optimize_cell_placement",
                          RISKY_VIVADO_TOOLS)
@@ -237,11 +229,18 @@ class CallToolTimeoutTests(unittest.TestCase):
         # test so we can use sub-second budgets without hitting the
         # pre-flight skip path.
         import dcp_optimizer as _mod
-        self._patch_min = mock.patch.object(_mod, "MIN_USEFUL_TOOL_SECONDS", 0.05)
+        # ToolDispatchMixin resolves this constant in its defining module.
+        # Patching only the optimizer module's re-export does not affect dispatch.
+        self._patch_min = mock.patch.object(
+            _tool_dispatch, "MIN_USEFUL_TOOL_SECONDS", 0.05)
+        self._patch_min_reexport = mock.patch.object(
+            _mod, "MIN_USEFUL_TOOL_SECONDS", 0.05)
         self._patch_min.start()
+        self._patch_min_reexport.start()
 
     def tearDown(self):
         self._patch_min.stop()
+        self._patch_min_reexport.stop()
         self.tmp.cleanup()
 
     def test_slow_call_is_cancelled_by_deadline(self):
@@ -316,10 +315,9 @@ class PiggybackMirrorTests(unittest.TestCase):
         self.assertIsNone(self.opt._best_valid_dcp)
 
     def test_mirror_skipped_when_src_missing(self):
-        # LLM's write_checkpoint "succeeded" per session, but the file
-        # didn't actually appear (Vivado/MCP misbehaviour).  Mirror must
-        # silently skip and leave the pending flag set so a later attempt
-        # can succeed.
+        # A successful tool response does not guarantee that the checkpoint file
+        # exists. A missing file skips mirroring and leaves the pending flag set
+        # so a later attempt can retry.
         self.opt._pending_best_mirror = True
         ghost = self.tmp_path / "ghost.dcp"  # never created
         _async(self.opt.call_tool("vivado_write_checkpoint",
@@ -347,23 +345,21 @@ class PiggybackMirrorTests(unittest.TestCase):
 
 
 class FinalizeFastPathTests(unittest.TestCase):
-    """When best_valid.dcp + .edf exist on disk, _finalize_output_dcp must
-    shutil-copy them to the output path instead of re-entering Vivado.
+    """Verifies that finalization copies complete mirror artifacts without
+    invoking the tool session.
 
-    This is the critical safety property: the finalize path works even
-    when Vivado is dead, because we never call session.call_tool here.
+    When both checkpoint and EDIF artifacts exist, finalization must copy them
+    directly to the output paths. This path remains available when the external
+    tool is unavailable.
     """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp.name)
         self.opt = _make_optimizer(self.tmp_path)
-        # Pre-stage best_valid mirror files AND tag the freshness WNS
-        # — the post-bug-fix fast path gates on both file existence AND
-        # _best_valid_dcp_wns matching self.best_wns within epsilon, so
-        # tests of the fast path must pre-stage the WNS marker too.
-        # Tests that simulate a STALE mirror leave _best_valid_dcp_wns
-        # unset to trigger the new stale-mirror branch deliberately.
+        # A fresh mirror requires both files and a WNS marker matching best_wns
+        # within tolerance. Fast-path fixtures must stage both.
+        # Stale-mirror fixtures omit the marker to select the fallback path.
         self.best_dcp = self.tmp_path / "best_valid.dcp"
         self.best_edf = self.tmp_path / "best_valid.edf"
         self.best_dcp.write_bytes(b"BEST_VALID_DCP_CONTENT_FOR_TEST")
@@ -445,17 +441,14 @@ class FinalizeFastPathTests(unittest.TestCase):
         self.assertNotIn("fast_path_best_valid_copy", events)
 
     def test_no_improvement_uses_best_valid_edif_when_present(self):
-        # ispd16_example2 2026-05-13 case: no improvement, dispatcher
-        # deadline_passed → vivado_open_checkpoint + write_edif both
-        # skipped → output shipped without EDIF.  The fix: if
-        # best_valid.edf is on disk (mirrored at iter 1), copy it to
-        # output.edf BEFORE attempting any Vivado call.
+        # Finalization copies an existing mirrored EDIF before invoking tools,
+        # because deadline enforcement may skip checkpoint opening or EDIF writing.
         self.opt.initial_wns = -5.0
         self.opt.best_wns = -5.0  # no improvement
         out = self.tmp_path / "optimized.dcp"
 
-        # Reset state to mimic ispd16's setup: best_valid mirror exists,
-        # _best_valid_dcp is the baseline-equivalent state.
+        # Model a state where the valid-checkpoint mirror exists and
+        # _best_valid_dcp refers to a baseline-equivalent checkpoint.
         baseline = self.tmp_path / "baseline.dcp"
         baseline.write_bytes(b"BASELINE_DCP")
         self.opt.input_dcp_path = baseline
@@ -476,10 +469,9 @@ class FinalizeFastPathTests(unittest.TestCase):
         self.assertEqual(self.opt.final_status, "VALID_FALLBACK_BASELINE")
 
     def test_no_improvement_falls_back_to_vivado_when_no_best_valid_edif(self):
-        # When no best_valid.edf is on disk, the slow path runs (Vivado
-        # open_checkpoint + write_edif).  If THAT also fails (e.g.,
-        # deadline_passed budget skip), final_status carries the NO_EDIF
-        # variant so the submission packager knows.
+        # Without a mirrored EDIF, finalization attempts checkpoint opening and
+        # EDIF generation. If that path also fails, final status reports the
+        # missing EDIF so the packager can handle it.
         self.best_edf.unlink()
         self.opt._best_valid_edif = None
         self.opt.initial_wns = -5.0
@@ -505,13 +497,10 @@ class FinalizeFastPathTests(unittest.TestCase):
 
 
 class StaleMirrorDetectionTests(unittest.TestCase):
-    """Post-2026-05-16 fix: the fast path must NOT ship best_valid.dcp when
-    the mirror is stale relative to self.best_wns.
+    """Verifies that finalization rejects a stale best-result mirror.
 
-    Forensic trigger: ispd16 2026-05-16 grok-4.3 +19.44 — vivado_write_checkpoint
-    timed out during the mirror, leaving the baseline best_valid.dcp on disk.
-    The old fast path shipped that file and claimed VALID_OPTIMIZED at
-    best_wns=-6.331, but the DCP was actually the baseline at -7.752.
+    A checkpoint whose recorded slack does not match the optimizer's best slack
+    must not be emitted as the optimized result.
     """
 
     def setUp(self):
@@ -533,12 +522,9 @@ class StaleMirrorDetectionTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_unset_mirror_wns_falls_through_to_baseline_no_inmemory_write(self):
-        # POST-2026-05-19 FIX: when mirror_wns is None (mirror never landed),
-        # the stale-mirror branch must NOT call vivado_write_checkpoint
-        # (which would dump Vivado's possibly-degraded in-memory state —
-        # root cause of the optical-flow/spam-filter/vexriscv_v2 regressions).
-        # The mirror file content is unknown-quality, so we fall through to
-        # baseline fallback.
+        # An absent mirror WNS means the mirror's quality is unknown.
+        # Finalization must not replace it from potentially degraded in-memory
+        # state; it fails closed to the baseline checkpoint.
         self.opt._best_valid_dcp_wns = None
         self.opt._best_valid_edif_wns = None
         out = self.tmp_path / "optimized.dcp"
@@ -556,10 +542,8 @@ class StaleMirrorDetectionTests(unittest.TestCase):
         events = [e["event"] for e in self.opt.lifecycle_log]
         self.assertIn("stale_mirror_detected", events,
                       "must still detect stale mirror via _best_valid_dcp_wns")
-        # Critical regression check: must NOT have ROUTED through the
-        # in-memory fresh-write path that caused the 2026-05-19
-        # regressions. The decision must say either
-        # "ship_stale_mirror_file" or "fall_through_to_baseline".
+        # A stale mirror must never trigger a fresh write from potentially
+        # regressed in-memory state.
         self.assertNotIn(
             "stale_mirror_recovered_via_fresh_write",
             events,
@@ -574,12 +558,9 @@ class StaleMirrorDetectionTests(unittest.TestCase):
             "with mirror_wns=None the only safe decision is baseline fallback")
 
     def test_stale_mirror_with_improvement_wns_ships_disk_file_not_inmemory(self):
-        # POST-2026-05-19 FIX: mirror was written at -3.0 (improvement over
-        # initial -10.0) but a later improvement bumped best_wns to -1.0
-        # without updating the mirror. The mirror file represents a REAL
-        # improvement state (still better than baseline) — ship the disk
-        # file. Do NOT trust Vivado's in-memory state (which may have
-        # regressed past the best after subsequent operations).
+        # This mirror is stale relative to the latest best WNS but still improves
+        # on the baseline. Finalization ships the known disk state rather than
+        # potentially regressed in-memory state.
         self.opt._best_valid_dcp_wns = -3.0
         self.opt._best_valid_edif_wns = -3.0
         # Replace mirror bytes so we can identify what was shipped.
@@ -612,16 +593,14 @@ class StaleMirrorDetectionTests(unittest.TestCase):
             "stale-mirror branch must NOT invoke write_checkpoint — that "
             "would dump in-memory state, which is the regression bug"
         )
-        # Lifecycle status reflects that we shipped a valid (albeit
+        # Lifecycle status reflects shipping a valid (albeit
         # stale) optimized artifact.
         self.assertIn(self.opt.final_status,
                       ("VALID_OPTIMIZED", "VALID_OPTIMIZED_NO_EDIF"))
 
     def test_ensure_output_refuses_inmemory_write_when_mirror_stale(self):
-        # POST-2026-05-19 SECOND FIX: _ensure_output_dcp_written must
-        # NOT call vivado_write_checkpoint when there's no fresh
-        # best_valid mirror. The in-memory state may have regressed
-        # past best — same root cause as the stale-mirror branch fix.
+        # Without a fresh best-valid mirror, output creation must not write the
+        # potentially regressed in-memory checkpoint.
         self.opt._best_valid_dcp_wns = None  # mirror stale
         out = self.tmp_path / "optimized_via_ensure.dcp"
 
@@ -675,10 +654,9 @@ class StaleMirrorDetectionTests(unittest.TestCase):
             "must copy disk mirror bytes, not in-memory state")
 
     def test_stale_mirror_fresh_write_fail_falls_through(self):
-        # Mirror is stale AND fresh write also fails (Vivado dead).
-        # Must fall through to the existing slow path (which ends in
-        # baseline fallback) — the optimizer must NEVER claim
-        # VALID_OPTIMIZED when no valid optimized artifact landed.
+        # If both the cached checkpoint and a fresh write are unavailable,
+        # finalization must use the baseline fallback and must not report
+        # VALID_OPTIMIZED without a valid optimized artifact.
         self.opt._best_valid_dcp_wns = None
         out = self.tmp_path / "optimized.dcp"
 
@@ -724,10 +702,9 @@ class StaleMirrorDetectionTests(unittest.TestCase):
         self.assertEqual(self.opt.final_status, "VALID_OPTIMIZED")
 
     def test_fresh_dcp_stale_edif_refreshes_via_vivado(self):
-        # DCP mirror is fresh but EDIF wasn't refreshed (e.g. retiming
-        # added pipeline registers but write_edif failed during mirror).
-        # The fast path must SHIP the fresh DCP and regenerate the EDIF
-        # from Vivado's in-memory state — never ship the stale baseline EDIF.
+        # A fresh checkpoint may outlive a failed EDIF refresh after retiming.
+        # Ship the checkpoint, but regenerate EDIF from the tool's in-memory
+        # state rather than pairing it with a stale baseline EDIF.
         self.opt._best_valid_dcp_wns = -1.0
         self.opt._best_valid_edif_wns = None  # explicitly stale
         self.best_dcp.write_bytes(b"FRESH_OPTIMIZED_DCP_RETIMED")
@@ -892,15 +869,10 @@ class DeadlineAwareTimeoutTests(unittest.TestCase):
 
 
 class FinalizeBudgetBypassTests(unittest.TestCase):
-    """Verify call_tool bypasses the budget gate when _in_finalize=True.
+    """Verifies that finalization bypasses the normal budget gate.
 
-    Background: digit-recognition 2026-05-18 found +22.89 MHz in the iter
-    loop, but _finalize_output_dcp's write_checkpoint was refused by the
-    dispatcher (tool_skipped_budget reason=deadline_passed) and the gain
-    was lost — VALID_FALLBACK_BASELINE shipped instead. The fix flips
-    self._in_finalize=True for the duration of the finalize path so
-    these critical writes always run, with a fixed 120s per-call timeout
-    catching a hung Vivado as a safety net.
+    Critical finalize calls may run after the soft deadline, but each remains
+    bounded by a 120-second timeout to contain a hung tool session.
     """
 
     def setUp(self):
@@ -958,10 +930,8 @@ class FinalizeBudgetBypassTests(unittest.TestCase):
         self.assertGreaterEqual(FINALIZE_PER_CALL_TIMEOUT_S, 60.0,
             "finalize timeout must be generous enough to allow a slow "
             "write_checkpoint on a large design")
-        # Deadline passed → if the code path used _deadline_aware_timeout
-        # the wait_for would be 0 and the call would TimeoutError immediately.
-        # The fake session is instant so we just check the result returns
-        # cleanly (no timeout error envelope).
+        # Finalization bypasses the expired budget timeout so required tool
+        # operations can complete; the instant fake isolates this behavior.
         self.opt._budget_deadline = time.time() - 5.0
         self.opt.vivado_session = _FakeSession(response_text='{"ok":true}')
         self.opt._in_finalize = True
@@ -993,38 +963,18 @@ class FinalizeBudgetBypassTests(unittest.TestCase):
 
 
 class FinalizeBypassIntegrationTests(unittest.TestCase):
-    """Integration test for the EXACT failure mode that lost +22.89 MHz
-    on rosetta_digit-recognition (2026-05-18).
+    """Exercises expired-deadline finalization through the full dispatch path.
 
-    Scenario simulated:
-      1. Iter loop has improved the design (best_wns > initial_wns).
-      2. Soft deadline expires AT the moment finalize starts —
-         _budget_remaining returns 0.
-      3. _finalize_output_dcp runs.
-      4. WITHOUT the bypass, write_checkpoint would be refused with
-         tool_skipped_budget(deadline_passed), the optimizer would
-         fall back to a baseline-copy, and the gain would be lost.
-      5. WITH the bypass, write_checkpoint completes, the optimized
-         DCP lands at the output path, and the gain is preserved.
-
-    The test asserts that:
-      A. With the new code (bypass active), the optimized DCP is
-         delivered.
-      B. Disabling the bypass (simulating the pre-fix behaviour) makes
-         the same path emit the budget-skip error envelope.
-
-    This is closer to the real failure mode than the per-method unit
-    tests because it exercises the full call_tool→dispatcher→session
-    path with the deadline already expired.
+    The test confirms that the finalize bypass writes the optimized checkpoint
+    after the soft deadline. Disabling the bypass must instead produce the
+    dispatcher’s budget-skip envelope.
     """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.opt = _make_optimizer(Path(self.tmp.name))
-        # Place a synthetic "improved" DCP that finalize would copy.
-        # The fake session's response_text doesn't write a file — we
-        # simulate the side effect of write_checkpoint by having the
-        # session write to the path argument when invoked.
+        # Seed the optimized checkpoint that finalization copies. The fake
+        # session writes requested paths to emulate write_checkpoint's side effect.
         improved = Path(self.tmp.name) / "best_valid.dcp"
         improved.write_bytes(b"improved DCP marker for integration test")
         self.improved_dcp = improved
@@ -1063,10 +1013,8 @@ class FinalizeBypassIntegrationTests(unittest.TestCase):
             "force": True,
         }))
 
-        # Asserts the full real-failure-mode contract:
-        #   - call_tool did NOT return a tool_skipped_budget envelope
-        #   - the underlying session WAS invoked (call recorded)
-        #   - the output file actually landed on disk with content
+        # Finalization must bypass the budget gate, invoke the session, and
+        # leave a nonempty checkpoint on disk.
         self.assertNotIn("tool_skipped_budget", result,
             "FINALIZE BYPASS REGRESSION: write_checkpoint was refused "
             "by the dispatcher despite _in_finalize=True. This is the "
@@ -1081,11 +1029,8 @@ class FinalizeBypassIntegrationTests(unittest.TestCase):
             "output DCP must be non-empty")
 
     def test_bypass_disabled_replicates_the_original_bug(self):
-        # This is the "would fail on old behaviour, passes on new" half
-        # of the brief: confirms that without _in_finalize the same
-        # path emits the budget-skip envelope and DOES NOT write the
-        # output. If this test stops being a "skip envelope" outcome,
-        # the bypass logic has stopped being a real gate.
+        # Outside finalization, an expired deadline must return the budget-skip
+        # envelope without invoking the session or writing an output artifact.
         self.opt._budget_deadline = time.time() - 10.0
         self.opt.vivado_session = self._make_writing_session()
         self.opt._in_finalize = False  # simulate pre-44b3193 behaviour
@@ -1139,10 +1084,9 @@ class LineageTrackingTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_eager_mirror_bumps_lineage_token(self):
-        # Manually stage two successful eager mirror events.  The real
-        # _mirror_best_valid_now path is async + Vivado-driven; we use
-        # the _bump_lineage helper directly because it's the contract
-        # surface lineage tracking depends on.
+        # Stage eager mirrors through the lineage helper; the real mirror is
+        # asynchronous and tool-driven, while lineage depends on this helper's
+        # event and token contract.
         self.assertEqual(self.opt._best_valid_token, 0)
         e1 = self.opt._bump_lineage(
             "eager_mirror", wns=-1.0,
@@ -1276,22 +1220,13 @@ class LineageTrackingTests(unittest.TestCase):
 
 
 class OptimizeReturnValueTests(unittest.TestCase):
-    """Pin the contract: optimize() returns True iff the final shipped
-    artifact represents a valid optimized OR a valid baseline-fallback
-    ship.  Anything else (HARD_FAIL_*, NO_IMPROVEMENT, missing status)
-    is a failure.
+    """Verifies the optimizer's success-return contract.
 
-    Bug regression test (post-2026-05-20 P4): spam-filter +4.84 MHz
-    run reached VALID_OPTIMIZED via the fast-path but then exited the
-    iter loop via budget_killed.  Old code: unconditional `return False`
-    after the loop → rc=1 → downstream tooling misread as failure.
-    New code: derive the return value from final_status.
-
-    The contract under test:
-        return final_status.startswith((
-            "VALID_OPTIMIZED",
-            "VALID_FALLBACK_BASELINE",
-        ))
+    Success requires a final status of `VALID_OPTIMIZED` or
+    `VALID_FALLBACK_BASELINE`, indicating a valid artifact is ready to ship.
+    Hard failures, no improvement, and missing statuses return false. The
+    return value is derived from the final status, including after
+    budget-driven loop termination.
     """
 
     def _success(self, status: str) -> bool:
@@ -1323,10 +1258,8 @@ class OptimizeReturnValueTests(unittest.TestCase):
         self.assertFalse(self._success("HARD_FAIL_NO_VALID_BASELINE"))
 
     def test_no_improvement_returns_false(self):
-        # NO_IMPROVEMENT is documented as "no DCP written → score 0",
-        # so optimize() should report failure.  The finalize wrapper
-        # actually converts no-improvement into VALID_FALLBACK_BASELINE
-        # (baseline copy), so this branch is rare in practice.
+        # NO_IMPROVEMENT means no checkpoint was written and is unsuccessful.
+        # Finalization normally converts this outcome to a baseline fallback.
         self.assertFalse(self._success("NO_IMPROVEMENT"))
 
     def test_missing_status_returns_false(self):
@@ -1336,20 +1269,11 @@ class OptimizeReturnValueTests(unittest.TestCase):
 
 
 class FinalizeStressTests(unittest.TestCase):
-    """End-to-end stress: eager mirror captures an improvement, deadline
-    expires, finalize must still ship the disk-truth best-valid DCP
-    without any further Vivado work.
+    """Verifies deadline-safe finalization of an eagerly mirrored improvement.
 
-    This pins down the post-2026-05-19/20 contract:
-      eager mirror at improvement → mirror is fresh on disk →
-      deadline expires before finalize → finalize fast-path
-      shutil-copies mirror to output_dcp, never enters Vivado.
-
-    The vexriscv_re-place_v2 2026-05-19 incident is the failure mode
-    this chain is designed to prevent: the optimizer recorded a real
-    improvement in-memory but lost it because the disk mirror never
-    captured the improved state.  The eager-mirror fix + the
-    finalize fast path together close that loop.
+    The improved state must be mirrored before the deadline expires.
+    Finalization then copies the freshest best-valid DCP from disk to the
+    output without invoking Vivado or relying on mutable in-memory state.
     """
 
     def setUp(self):
@@ -1397,17 +1321,14 @@ class FinalizeStressTests(unittest.TestCase):
 
         self.assertTrue(output_dcp.exists(),
                           "output_dcp must land on disk via the fast path")
-        # Byte-equal to the eager-mirror DCP — proves we shipped the
+        # Byte-equal to the eager-mirror DCP — proves the run shipped the
         # disk-truth best-valid, not Vivado in-memory state.
         self.assertEqual(output_dcp.read_bytes(),
                           self.improved_dcp.read_bytes(),
                           "shipped DCP must equal the eager-mirror DCP "
                           "byte-for-byte")
-        # The fast path explicitly avoids re-entering Vivado.  In a
-        # deadline-expired scenario, the dispatcher would refuse Vivado
-        # calls anyway, but we additionally require that NO call was
-        # even attempted on the DCP write — that's the load-bearing
-        # property of the fast path.
+        # The fast path must not invoke the tool to rewrite a checkpoint,
+        # including after the deadline has expired.
         dcp_writes = [c for c in tracking.calls
                        if c[0] in ("vivado_write_checkpoint",
                                     "write_checkpoint")]
@@ -1462,12 +1383,9 @@ class FinalizeStressTests(unittest.TestCase):
         _async(self.opt._finalize_output_dcp(output_dcp))
 
         self.assertTrue(output_dcp.exists())
-        # CONTRACT: stale-mirror branch ships the mirror FILE if it's
-        # an improvement over baseline (mirror_wns -0.5 > initial -1.5
-        # → True).  We do NOT ship baseline in this branch — the disk
-        # mirror represents a known-good improvement, just not the
-        # absolute latest.  This matches the stale_mirror_recovered_
-        # via_disk_copy lifecycle path in _finalize_output_dcp_impl.
+        # A stale mirror that still improves on the baseline remains a
+        # known-good disk artifact and must be shipped instead of the baseline
+        # or unmirrored in-memory state.
         self.assertEqual(output_dcp.read_bytes(),
                           self.improved_dcp.read_bytes(),
                           "stale-but-still-improvement mirror must ship as "
@@ -1480,23 +1398,13 @@ class FinalizeStressTests(unittest.TestCase):
 
 
 class RouterStepAwareContinuationTests(unittest.TestCase):
-    """Tests for the BETA-CTRL-V0.4 router-step-aware continuation rule.
+    """Verifies router-aware continuation when a recommended heavy step remains
+    unattempted.
 
-    Bug observed 2026-05-18 on rosetta_digit-recognition: R4 fired with
-    a 5-step plan including place_design directive=Auto_1 as step 3.
-    The LLM made 0 place_design calls and 12 phys_opt_design calls,
-    stopped at 16 min with 34 min budget remaining → only +3.12 MHz
-    vs ~+6 target.
-
-    Fix: when the active router plan recommends a vivado_place_design
-    step and no place_design has been called this run, AND budget
-    remains ≥ 5 min, AND current slope is positive (gain > 0), the
-    force-continue branch injects a specific prompt naming the
-    unattempted heavy step.
-
-    These tests pin the helper (_router_unattempted_heavy_step) in
-    isolation; the full force-continue branch integration is exercised
-    by the end-to-end rerun campaign.
+    `_router_unattempted_heavy_step` identifies a recommended placement step
+    when none has run, at least five minutes remain, and measured gain is
+    positive. The continuation prompt must name the unattempted step
+    explicitly.
     """
 
     def setUp(self):
@@ -1541,8 +1449,7 @@ class RouterStepAwareContinuationTests(unittest.TestCase):
 
     def test_returns_place_design_when_unattempted(self):
         self.opt.recipe_router_plan = self._r4_plan()
-        # Simulate the digit-recognition pattern: lots of phys_opt, no
-        # place_design.
+        # Simulate repeated physical optimization with no placement call.
         self.opt._tool_calls_seen = [
             ("vivado_phys_opt_design", "AlternateFlowWithRetiming"),
             ("vivado_route_design", "Default"),
@@ -1554,8 +1461,7 @@ class RouterStepAwareContinuationTests(unittest.TestCase):
         self.assertIn("Auto_1", result)
 
     def test_returns_none_after_place_design_called(self):
-        # Simulate vexriscv_v2 / spam-filter pattern — place_design was
-        # called at least once. No nudge needed.
+        # A prior placement call suppresses the placement nudge.
         self.opt.recipe_router_plan = self._r4_plan()
         self.opt._tool_calls_seen = [
             ("vivado_phys_opt_design", "AlternateFlowWithRetiming"),
@@ -1584,7 +1490,7 @@ class RouterStepAwareContinuationTests(unittest.TestCase):
         # (tool_name, directive) to _tool_calls_seen.
         self.opt.vivado_session = _FakeSession(response_text='{"ok":true}')
         self.opt._budget_deadline = time.time() + 1000.0  # plenty of budget
-        # S2 fix (jul20): give the unroute gate cell data so the routed-
+        # S2 fix: give the unroute gate cell data so the routed-
         # state-destroying place_design stays feasible for this test.
         self.opt._input_cell_count = 10_000
         _async(self.opt.call_tool("vivado_place_design",
@@ -1594,11 +1500,11 @@ class RouterStepAwareContinuationTests(unittest.TestCase):
 
 
 class V05GateTests(unittest.TestCase):
-    """Tests for BETA-CTRL-V0.5 — the relaxation of V0.4's `> 0` slope
-    gate to `>= 0`. Bug observed 2026-05-19 on spam-filter V0.4 rerun:
-    iter-1 gain was exactly 0 MHz at the LLM stop point, V0.4 stayed
-    silent, V0 generic fired instead. V0.5 catches the exact
-    "no improvement yet but heavy step unattempted" case.
+    """Verifies router-aware continuation at zero measured gain.
+
+    A recommended heavy step remains eligible when it has not been attempted,
+    sufficient budget remains, and gain is nonnegative. Exact zero therefore
+    triggers the specific continuation path rather than the generic fallback.
     """
 
     def setUp(self):
@@ -1738,32 +1644,20 @@ class V05GateTests(unittest.TestCase):
 
 
 class EagerMirrorInlineTests(unittest.TestCase):
-    """The 2026-05-19 mirror fix requires _mirror_best_valid_now to fire
-    INLINE at the moment of WNS improvement detection — before any
-    subsequent LLM tool call can degrade Vivado's in-memory state.
+    """Verifies that WNS improvements are mirrored immediately.
 
-    vexriscv_v2 (2026-05-19): LLM measured best WNS -0.926 (+3.18 MHz over
-    baseline -0.946) but mirror stayed at -0.946 because the mirror
-    only ran at iteration-loop top.  In the gap between WNS-improvement
-    measurement and iter top, intra-iteration tool calls degraded the
-    Vivado state, so by the time the mirror ran the on-disk artifact was
-    stale.  Finalize correctly refused the stale state and shipped
-    baseline — safe, but lost recoverable MHz.
-
-    These tests pin down the fix: every WNS-improvement detection site
-    in call_tool must call self._mirror_best_valid_now(eager=True) BEFORE
-    returning, so the disk capture is tied to the exact in-memory state
-    we just measured.
+    Every improvement-detection path in `call_tool` must invoke
+    `_mirror_best_valid_now(eager=True)` before returning or allowing another
+    tool call. This ordering ties the disk snapshot to the measured in-memory
+    state before later operations can degrade it.
     """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp.name)
         self.opt = _make_optimizer(self.tmp_path)
-        # Spy on _mirror_best_valid_now so we can assert call order and
-        # the snapshot of best_wns at the moment it was invoked.  The
-        # real mirror would write Vivado state to disk — we replace it
-        # with a recorder so the test stays Vivado-free.
+        # Replace the tool-driven mirror with a recorder to verify call order
+        # and the best-WNS snapshot without requiring the FPGA tool.
         self.mirror_calls: list[tuple[bool, float, str]] = []
 
         async def spy(eager: bool = False):
@@ -1782,7 +1676,7 @@ class EagerMirrorInlineTests(unittest.TestCase):
         self.opt.target_clock = None  # use parse_timing_summary_static path
         self.opt.vivado_session = _FakeSession(response_text="WNS -1.0")
 
-        with mock.patch("dcp_optimizer.parse_timing_summary_static",
+        with mock.patch("optimizer.tool_dispatch.parse_timing_summary_static",
                           return_value={"wns": -1.0, "tns": 0.0}):
             _async(self.opt.call_tool("vivado_report_timing_summary", {}))
 
@@ -1843,7 +1737,7 @@ class EagerMirrorInlineTests(unittest.TestCase):
         self.opt.target_clock = None
         self.opt.vivado_session = _FakeSession(response_text="WNS -2.0")
 
-        with mock.patch("dcp_optimizer.parse_timing_summary_static",
+        with mock.patch("optimizer.tool_dispatch.parse_timing_summary_static",
                           return_value={"wns": -2.0, "tns": 0.0}):
             _async(self.opt.call_tool("vivado_report_timing_summary", {}))
 
@@ -1858,24 +1752,25 @@ class EagerMirrorInlineTests(unittest.TestCase):
         self.opt.target_clock = None
         self.opt.vivado_session = _FakeSession(response_text="WNS -1.0")
 
-        with mock.patch("dcp_optimizer.parse_timing_summary_static",
+        with mock.patch("optimizer.tool_dispatch.parse_timing_summary_static",
                           return_value={"wns": -1.0, "tns": 0.0}):
             _async(self.opt.call_tool("vivado_report_timing_summary", {}))
 
         self.assertEqual(len(self.mirror_calls), 0)
 
     def test_mirror_capture_precedes_subsequent_tool_call(self):
-        """vexriscv_v2 incident replay: improvement, then a degrading
-        subsequent call.  The eager mirror snapshot must equal the
-        improved WNS — proving the capture happened BEFORE the second
-        call could have degraded best_wns (if a degradation path
-        existed; here we simulate by issuing a second worse call)."""
+        """Verifies that eager mirroring precedes a subsequent degrading tool
+        call.
+
+        The mirrored snapshot must retain the improved WNS even when the next
+        simulated call reports a worse result.
+        """
         self.opt.best_wns = -2.0
         self.opt.target_clock = None
         self.opt.vivado_session = _FakeSession(response_text="WNS -1.0")
 
         # Round 1: improvement to -1.0 → eager mirror should fire NOW
-        with mock.patch("dcp_optimizer.parse_timing_summary_static",
+        with mock.patch("optimizer.tool_dispatch.parse_timing_summary_static",
                           return_value={"wns": -1.0, "tns": 0.0}):
             _async(self.opt.call_tool("vivado_report_timing_summary", {}))
 
@@ -1887,7 +1782,7 @@ class EagerMirrorInlineTests(unittest.TestCase):
         # Round 2: a 'degrading' measurement at -3.0 — best_wns must
         # stay at the high-water mark, and no new mirror call fires
         # (no improvement → no eager mirror).
-        with mock.patch("dcp_optimizer.parse_timing_summary_static",
+        with mock.patch("optimizer.tool_dispatch.parse_timing_summary_static",
                           return_value={"wns": -3.0, "tns": 0.0}):
             _async(self.opt.call_tool("vivado_report_timing_summary", {}))
 

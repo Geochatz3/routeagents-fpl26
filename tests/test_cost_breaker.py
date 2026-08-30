@@ -1,18 +1,8 @@
-"""C1-T1 β circuit-breaker tests — cumulative LLM-spend ceiling across
-attempts + shrinking per-attempt budget + in-attempt pre-call gate.
+"""Test cumulative LLM-spend circuit breakers without external services.
 
-Evidence this suite pins:
-  - preview #15 (jul13): grok-4.5 on vexriscv_v2 crossed the eval's
-    $1.00/benchmark cumulative LLM-spend cap -> the harness ZEROED the
-    design ("no_improvement" at the cap).  Eval boxes iterate ~12x
-    faster than local, so local cost intuition undershoots.
-  - rehearsal-1 (jul20, flags ON): fir cumulative spend hit $0.76 —
-    $0.24 from the zero-cap — because the wrapper's 0.85 cost-cap check
-    was retrospective-only and every attempt carried a fresh fixed
-    $0.75 in-attempt allowance (worst case ~$0.84 + $0.75).
-
-Pure-function/stub-driven per tests/test_budget_enforcement.py — no
-network, no Vivado, no real sleeps.
+The suite covers the cumulative ceiling, shrinking per-attempt budgets, and the
+pre-call gate within an attempt. Stubs replace network access, Vivado, and
+sleeping.
 """
 from __future__ import annotations
 
@@ -46,9 +36,7 @@ def _async(coro):
     return asyncio.run(coro)
 
 
-# ---------------------------------------------------------------------------
 # Part A — pure cost_gate (wrapper pre-launch predictive gate)
-# ---------------------------------------------------------------------------
 
 def _att(i, cost, fmax=100.0):
     return {"i": i, "fmax": fmax, "status": "VALID_OPTIMIZED",
@@ -70,7 +58,7 @@ class CostGateTests(unittest.TestCase):
         self.assertIn("#15", why)
 
     def test_retrospective_hole_closed(self):
-        # The exact pre-C1-T1 hole: $0.84 spent < 0.85 cap used to launch a
+        # The exact hole this closes: $0.84 spent < 0.85 cap used to launch a
         # fresh $0.75 allowance (worst case ~$1.59).  Ceiling refuses.
         launch, _, _ = cost_gate([_att(1, 0.44), _att(2, 0.40)], 0.84, 0.80)
         self.assertFalse(launch)
@@ -138,7 +126,7 @@ class CostGateTests(unittest.TestCase):
         self.assertTrue(launch)
         self.assertEqual(allowance, 0.80)
 
-    # ---- FIX 4 (S5, jul20 C1 review): first-attempt sub-cent clamp ----
+    # ---- FIX 4 (S5, C1 review): first-attempt sub-cent clamp ----
 
     def test_first_attempt_subcent_ceiling_clamps_up_to_one_cent(self):
         # A sub-cent ceiling must yield ONE minimal $0.01 LLM-lean attempt,
@@ -197,9 +185,7 @@ class AttemptCmdBudgetTests(unittest.TestCase):
         self.assertFalse(any(a.startswith("LLM_COST_BUDGET=") for a in cmd))
 
 
-# ---------------------------------------------------------------------------
 # Part B — run() integration (stubbed subprocess, TestIncrementalRefresh style)
-# ---------------------------------------------------------------------------
 
 class TestRunCumulativeCeiling:
     def _drive(self, tmp_path, monkeypatch, per_attempt_cost, fmaxes,
@@ -216,10 +202,9 @@ class TestRunCumulativeCeiling:
             Path(out).write_bytes(b"dcp-attempt-%d" % calls["n"])
             return 0
 
-        # FIX 3 adaptation: attribution is snapshot-diff now — each attempt
-        # gets its OWN fresh run dir (matching real agent behavior), so the
-        # never-charge-the-same-dir-twice guard doesn't collapse per-attempt
-        # costs.
+        # Give each attempt a fresh run directory, matching agent behavior.
+        # Cost attribution deduplicates directories, so reuse would collapse
+        # distinct per-attempt costs.
         def fake_attribute(base, before):
             d = tmp_path / f"dcp_optimizer_run-{calls['n']}"
             d.mkdir(exist_ok=True)
@@ -274,10 +259,12 @@ class TestRunCumulativeCeiling:
 
 
 class TestRunEstimateCharging:
-    """FIX 1b + FIX 3 (jul20 C1 review): an LLM-budgeted attempt with NO
-    readable cost record is charged the predictive estimate (max prior
-    known cost, else the $0.35 band-top prior) — never a silent $0 — and
-    the same run dir is never charged twice."""
+    """Verify conservative charging when an attempt has no readable cost record.
+
+    A budgeted attempt uses the highest known prior cost or, if none exists,
+    $0.35 as the configured prior-band ceiling. Each run directory is charged
+    at most once.
+    """
 
     def _drive(self, tmp_path, monkeypatch, costs, fmaxes, rd_present=True,
                same_dir=False, max_attempts=4, **run_kwargs):
@@ -335,13 +322,31 @@ class TestRunEstimateCharging:
         assert s["llm_cost_total"] == mro.COST_ESTIMATE_FALLBACK_USD
         assert s["attempts"][0]["run_dir"] is None
 
-    def test_breaker_off_no_estimate_charge(self, tmp_path, monkeypatch):
-        # No LLM budget was handed down -> no basis to charge an estimate
-        # (legacy behavior preserved under the kill switch).
+    def test_breaker_off_still_charges_the_estimate(self, tmp_path,
+                                                     monkeypatch):
+        # The ceiling kill switch (--cost-ceiling 0) does NOT mean the
+        # attempt spent nothing: cost_gate's "breaker_off" path hands down no
+        # budget precisely so the agent keeps its own $0.75 default exit.
+        # Charging $0 for an unreadable record therefore left cost_so_far
+        # frozen -- and cost_so_far is also the meter the INDEPENDENT
+        # $1.00/benchmark cost_cap guard reads, so disabling the ceiling used
+        # to blind both spend guards at once.
         s = self._drive(tmp_path, monkeypatch, [None, None], [100.0, 50.0],
                         max_attempts=2, cost_ceiling=0)
-        assert s["llm_cost_total"] == 0.0
-        assert s["attempts"][0]["cost_estimated"] is False
+        assert s["llm_cost_total"] == 2 * mro.COST_ESTIMATE_FALLBACK_USD
+        assert s["attempts"][0]["cost_estimated"] is True
+
+    def test_breaker_off_cost_cap_still_stops_the_loop(self, tmp_path,
+                                                       monkeypatch):
+        # With the ceiling off and no readable records, the retrospective
+        # cap must still fire: 3 x $0.35 = $1.05 >= the $0.85 cap passed by
+        # _drive, so the 4th attempt never launches.
+        s = self._drive(tmp_path, monkeypatch, [None] * 4,
+                        [100.0, 50.0, 50.0, 50.0],
+                        max_attempts=4, cost_ceiling=0)
+        assert len(s["attempts"]) == 3
+        assert s["llm_cost_total"] == round(
+            3 * mro.COST_ESTIMATE_FALLBACK_USD, 4)
 
     def test_zero_ledger_charged_zero_not_estimate(self, tmp_path,
                                                    monkeypatch):
@@ -368,10 +373,8 @@ class TestRunEstimateCharging:
         assert s["llm_cost_total"] == 0.70
 
 
-# ---------------------------------------------------------------------------
 # Part C — agent side (dcp_optimizer): effective exit + pre-call gate +
 # deterministic finalize-with-banked on breach in BOTH controller modes.
-# ---------------------------------------------------------------------------
 
 class ResolveLlmCostExitTests(unittest.TestCase):
     def test_unset_keeps_default(self):
@@ -501,7 +504,7 @@ class LoopBreachFinalizeTests(unittest.TestCase):
         self.assertEqual(opt.iteration, 1)
 
     def test_anchor_breach_finalizes_with_banked(self):
-        # C1-T1 gap closed: anchor mode previously ran to is_done or
+        # Gap closed: anchor mode previously ran to is_done or
         # max_iterations with NO cost exit.
         opt = _make_opt(self.tmp_path, mode="anchor")
 

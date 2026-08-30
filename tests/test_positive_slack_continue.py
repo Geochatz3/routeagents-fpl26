@@ -1,18 +1,8 @@
-"""FPL26_POSITIVE_SLACK_CONTINUE (aug07) — the zero-crossing is not the finish line.
+"""Verify that optimization continues after timing slack becomes nonnegative.
 
-WHY THIS FILE EXISTS. alpha is a DELTA of Fmax, and Fmax = 1000/(T - wns) is
-UNCLAMPED in the organizers' own reference implementation
-(docs/optimization_example.md). The agent nevertheless declared victory at
-wns >= 0 in two places:
-
-    entry  dcp_optimizer.py  initial_wns >= 0 -> ship the input, alpha = 0
-    loop   dcp_optimizer.py  best_wns    >= 0 -> exit the LLM loop
-
-Both are unreachable on all 16 corpus designs (every one enters deeply
-negative; fir at 0.313 ns is the shallowest), so NO existing test could have
-caught this and no A/B could measure it. These tests encode the arithmetic and
-the gate directly, because a hidden near-met benchmark is the only thing that
-would otherwise report the defect — by scoring us zero.
+The objective uses unclamped Fmax, so improvements beyond zero WNS remain
+valuable. Tests cover both initial-design and iterative-loop gates to prevent
+premature termination.
 """
 from __future__ import annotations
 
@@ -21,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.source_corpus import dcp_source_lines, dcp_source_text
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -31,14 +22,7 @@ positive_slack_entry_decision = dcp_optimizer.positive_slack_entry_decision
 plateau_armed_from_loop_start = dcp_optimizer.plateau_armed_from_loop_start
 
 
-# --------------------------------------------------------------------------
-# 0. THE DECISIONS THEMSELVES — real calls, mutation-live.
-#
-# The aug07 review (F4) mutated the armed branch to `return True` and every
-# assertion in the first version of this file still passed: they only read
-# source text. The logic now lives in two pure functions that these tests
-# actually execute.
-# --------------------------------------------------------------------------
+# Exercise the pure decision functions directly so branch mutations are observable.
 
 class TestEntryDecision:
     def test_negative_slack_is_the_normal_path_either_way(self):
@@ -87,9 +71,7 @@ class TestPlateauArming:
         assert plateau_armed_from_loop_start(True, -1.0, None, False) is False
 
 
-# --------------------------------------------------------------------------
 # 1. The premise: positive slack is worth alpha, in OUR code and in THEIRS.
-# --------------------------------------------------------------------------
 
 class _FmaxOnly:
     """calculate_fmax is a pure function of (wns, T); bind it without a run."""
@@ -127,9 +109,7 @@ def test_fmax_is_none_when_slack_swallows_the_whole_period():
     assert _fmax(2.0, 1.570) is None
 
 
-# --------------------------------------------------------------------------
 # 2. The flag: DEFAULT OFF, kill switch wins, armed on the ship path.
-# --------------------------------------------------------------------------
 
 def test_flag_is_default_off(monkeypatch):
     monkeypatch.delenv("FPL26_POSITIVE_SLACK_CONTINUE", raising=False)
@@ -162,19 +142,15 @@ def test_makefile_arms_it_on_the_ship_path():
     mk = (ROOT / "Makefile").read_text(errors="replace")
     assert "FPL26_POSITIVE_SLACK_CONTINUE=$(if $(POSITIVE_SLACK)," in mk, (
         "the flag is not injected by the run_optimizer target — it would be "
-        "DEFAULT OFF on the only run that is scored (jul29 ship-path drift)")
+        "DEFAULT OFF on the only run that is scored")
 
 
-# --------------------------------------------------------------------------
-# 3. The two gates, read straight out of the source.
-#
-# These are source assertions, not behavioural ones: both sites live inside a
-# ~1500-line async method that cannot be driven without a live Vivado session,
-# and a mocked stand-in would test the mock. What CAN be pinned exactly is that
-# neither `return` is reachable while the flag is armed.
-# --------------------------------------------------------------------------
+# These source-level checks verify wiring inside an async method that requires
+# a live Vivado session and is impractical to drive as a unit test.
+# Both guarded exits must delegate to the tested decision functions, and
+# neither return may be reachable while continuation is armed.
 
-SRC = (ROOT / "dcp_optimizer.py").read_text(errors="replace")
+SRC = dcp_source_text()
 
 
 def test_entry_exit_is_wired_to_the_tested_decision():
@@ -219,13 +195,8 @@ def test_stale_clamp_docstring_is_gone():
     assert "fmax = 1000 / (clock_period - WNS), for EVERY sign of WNS." in SRC
 
 
-# --------------------------------------------------------------------------
-# 5. NON-FINITE WNS FAILS OFF (aug07 code panel, confidence 5).
-#
-# recipe_pass_band's tail is an unconditional `return "mid"`, which made it the ONE
-# band function that failed OPEN on malformed timing data. best_wns is initialised
-# to float("-inf") in this class, so -inf is REACHABLE, not hypothetical.
-# --------------------------------------------------------------------------
+# Non-finite timing data fails closed by selecting no recipe band.
+# Negative infinity is a reachable initial value for the best WNS.
 
 def test_non_finite_wns_arms_no_band():
     band = dcp_optimizer.recipe_pass_band

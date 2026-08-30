@@ -1,11 +1,11 @@
-"""Typed gate ledger (jul26 panel #1 signal).
+"""Typed gate ledger.
 
 The invariants that matter are not "it writes JSON" — they are:
   1. with FPL26_GATE_LOG unset, behaviour is byte-identical to before (default OFF);
   2. emit() can NEVER raise, whatever it is handed, because a telemetry failure must not
      be able to change an optimization decision;
   3. a refusal records the PROVENANCE of the estimate that drove it, which is the field
-     that separates a legitimate bound (HISTORY) from the jul26 defect family (CONSTANT).
+     that separates a legitimate bound (HISTORY) from the defect family (CONSTANT).
 """
 import json
 import os
@@ -93,7 +93,7 @@ class GateLogContentTests(unittest.TestCase):
         self.assertAlmostEqual(r["margin_s"], 277.0 - 600.0)   # negative => refused
 
     def test_over_estimate_ratio_is_computed(self):
-        """The field kimi-k3's 'absurd-constant' rule sorts on."""
+        """The field the 'absurd-constant' rule sorts on."""
         gate_log.emit("tool_runtime", gate_log.VERDICT_OBSERVE,
                       predicted_s=600.0, observed_s=20.0)
         self.assertAlmostEqual(self._rows()[0]["over_estimate_ratio"], 30.0)

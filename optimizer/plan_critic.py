@@ -1,32 +1,26 @@
-"""Cheap pre-flight PLAN CRITIC — a second opinion before a heavy Vivado move.
+"""Cheap pre-flight plan critic — a second opinion before a heavy Vivado move.
 
-WHY THIS EXISTS (jul25 panel, 4 of 5 seats converged on this independently):
+Not active in the scored submission (default off).
 
-Today we run ONE model (``x-ai/grok-4.3``) in a loop with no second opinion of
-any kind — no reviewer, no verifier, no critic, no self-check.  The panel's
-measured indictment:
+The optimizer otherwise runs one model in a loop with no second opinion of any
+kind: no reviewer, no verifier, no critic, no self-check.  The designs it does
+worst on tend to be the ones where it made the FEWEST calls and spent the
+LEAST budget — it commits early to a plan and never revisits it.
 
-    design      our gap    API calls   LLM spend   % of ~$1 budget
-    boom_soc    -22.15     16          $0.357      36 %
-    ispd16       -6.78     26          $0.226      23 %
-    rend3d      -10.06     58          $0.689      69 %
+That trade is worth taking because unspent model budget is not saved money.
+The score charges a bounded fraction for spend, so budget left unused is simply
+unused deliberation, while a heavy Vivado move costs a large slice of the wall.
+Spending a cent to avoid wasting ten minutes of that wall is the trade this
+module makes.
 
-The design we lose the most on made the FEWEST calls and spent the LEAST
-budget.  Since score = ``alpha - 0.1*alpha*beta - 0.1*alpha*gamma`` and beta
-caps at 10 % of alpha, unspent LLM budget is not saved money — it is unused
-deliberation.  A heavy Vivado move costs 600-1200 s of the eval hour; a critic
-call costs ~$0.01-0.05 and a few seconds.  Spending a cent to avoid wasting ten
-minutes of wall is the trade this module makes.
+Never-worse posture — read this before changing anything here.  The critic is
+ADVISORY ONLY.  It cannot veto, cancel, or rewrite an action; its output is
+injected as a note the planner may ignore.  A vetoing critic could talk the
+planner out of a winning move, which would not be never-worse.  The stricter
+"run both and let the MUX decide" variant was rejected because it doubles heavy
+Vivado wall, which a one-hour evaluation does not have.
 
-NEVER-WORSE POSTURE — read before changing:
-The critic is **ADVISORY ONLY**.  It cannot veto, cannot cancel, and cannot
-rewrite an action.  Its output is injected as a note the planner may ignore.
-A vetoing critic could talk the planner out of a winning move and would not be
-never-worse; the panel's own rule was to prefer proposals that cannot regress.
-The stricter "run both and let the MUX decide" variant was rejected here because
-it doubles heavy Vivado wall, which the 1-hour eval does not have.
-
-FREE PARAMETERS: three (``enabled``, ``max_calls``, ``beta_headroom_frac``).
+Free parameters: three — enabled, max_calls, and the spend headroom fraction.
 No decision boundary is fitted to any design outcome.
 """
 
@@ -135,9 +129,9 @@ def should_critique(
                        f"(< {min_remaining_s:.0f}s) — spend it on Vivado")
     if budget_usd is None or budget_usd <= 0:
         return False, "LLM budget unknown — fail closed"
-    # Only review while there is genuine beta headroom. This is the panel's
-    # "unspent budget is the bug" point made operational: we critique BECAUSE
-    # the budget is underused, and we stop as soon as it is not.
+    # Only review while there is genuine beta headroom. This is the
+    # "unspent budget is the bug" made operational: the critique fires
+    # BECAUSE the budget is underused, and stops as soon as it is not.
     if spent_usd >= budget_usd * beta_headroom_frac:
         return False, (f"beta headroom exhausted (${spent_usd:.3f} >= "
                        f"{beta_headroom_frac:.0%} of ${budget_usd:.2f})")

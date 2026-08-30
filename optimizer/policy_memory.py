@@ -1,7 +1,7 @@
 """Policy-memory episode store v0 — derive trustworthy episodes from
 `runs/<run_id>/decisions.jsonl`.
 
-Design contract (per Session 5 brief):
+Design contract:
 
 - READ-ONLY over decisions.jsonl.  This module never touches the
   optimizer's live trace; it only summarises a finished run into one
@@ -26,10 +26,9 @@ Public API:
   - episode_id_for_run(run_id) -> str
 
 Schema version bumps:
-  v1 (2026-05-20 P2): initial schema below.
+  v1: initial schema below.
 
-Field documentation lives in `EPISODE_V0_FIELDS` and the Session 5
-brief.
+Field documentation lives in `EPISODE_V0_FIELDS`.
 """
 from __future__ import annotations
 
@@ -77,7 +76,6 @@ def episode_id_for_run(run_id: str) -> str:
     return hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:12]
 
 
-# ---------------------------------------------------------------------------
 # Trace parsing helpers — all tolerant of missing fields.
 
 # Best-effort regex pulls for the few values the optimizer dropped into
@@ -143,9 +141,9 @@ def _first_non_null(records: Iterable[Dict[str, Any]], key: str) -> Any:
 
 
 def _design_from_run_start(rec: Dict[str, Any]) -> Optional[str]:
-    """Run_start notes look like:
-        'input=rosetta_digit-recognition_2025.1.dcp output=... mode=v0_3'
-    Extract the design slug before `_2025.1.dcp` if present.
+    """Extracts the design slug from a run-start note's input checkpoint.
+
+    The `_2025.1.dcp` suffix is removed when present.
     """
     notes = rec.get("notes")
     if not isinstance(notes, str):
@@ -160,20 +158,14 @@ def _design_from_run_start(rec: Dict[str, Any]) -> Optional[str]:
     return fname or None
 
 
-# ---------------------------------------------------------------------------
 # Episode builder
 
 def _extract_retrieval_metadata(rag_records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Pull retrieval metadata out of `rag_retrieval` decision records.
+    """Extracts retrieval metadata from a `rag_retrieval` decision record.
 
-    The optimizer currently emits retrieval metadata inside a notes
-    string of the form:
-
-        retrieval_mode=feature_first design_notes_injected=False
-        exact_name_used=False retrieved_episode_ids=['a114d039']
-        negative_memory_count=40 memory_records_considered=122
-
-    Plus a top-level `rag_mode` field.  We parse both.
+    The function parses retrieval mode, design-note and exact-name flags,
+    retrieved episode IDs, and memory counts from the key-value notes string.
+    It also reads the top-level `rag_mode` field.
     """
     out: Dict[str, Any] = {
         "retrieved_episode_ids": [],
@@ -231,7 +223,7 @@ def _aggregate_action_trace(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             best_valid_token_max = int(bvt)
         sl = r.get("ship_lineage_source")
         if sl:
-            # last wins; we want the final finalize record's lineage.
+            # Last wins: the lineage wanted is the final finalize record's.
             ship_lineage_source = sl
     return {
         "tool_calls_by_name": dict(tool_calls_by_name),
@@ -294,7 +286,7 @@ def _extract_start_features(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         out["target_clock"] = kv.get("target_clock")
         out["pathology"] = kv.get("pathology")
         out["router_rule"] = kv.get("router_rule")
-        # Feature-first retrieval fields (Session 6 P1).  Prefer
+        # Feature-first retrieval fields.  Prefer
         # top-level dedicated fields; tolerate older traces that
         # don't carry them.
         out["lut_count"] = _maybe_int(rec.get("lut_count"))
@@ -314,9 +306,9 @@ def _trust_for(records: List[Dict[str, Any]],
     using the validator's claim-vs-validated drift.
 
     v0 rules:
-      - high       — finalize_end says VALID_OPTIMIZED and zero pathguard violations.
-      - medium     — VALID_FALLBACK_BASELINE (no improvement attempted/landed) — episode is structurally fine but uninformative.
-      - low        — finalize never fired or unrecognised final_status.
+          - high       — finalize_end says VALID_OPTIMIZED and zero pathguard violations.
+          - medium     — VALID_FALLBACK_BASELINE (no improvement attempted/landed) — episode is structurally fine but uninformative.
+          - low        — finalize never fired or unrecognised final_status.
     """
     final = outcome.get("final_status")
     pg_v = sum(1 for r in records
@@ -436,7 +428,6 @@ def build_episode(decisions_jsonl_path: Path | str,
     return episode
 
 
-# ---------------------------------------------------------------------------
 # Store I/O — append-only JSONL with episode_id-based dedupe.
 
 def load_episodes(store_path: Path | str) -> List[Dict[str, Any]]:
@@ -502,7 +493,6 @@ def ingest_decisions(decisions_jsonl_path: Path | str,
     return ep
 
 
-# ---------------------------------------------------------------------------
 # Default store path: next to the optimizer repo root by default.  Caller
 # can override via STORE env or explicit arg.
 

@@ -1,13 +1,8 @@
-"""Size-aware no-history estimate for risky tools (jul26).
+"""Tests size-aware fallback runtime estimates for risky tools without history.
 
-Pins the fix for the defect measured in chain40: `_estimate_tool_runtime` returned a
-flat 600 s for a risky tool with no history, so `_should_skip_for_budget` refused
-`vivado_phys_opt_design` on mini-ISP (8,414 cells, size-model place+route 37 s) with
-277 s left, and the run shipped the baseline at +0.00 MHz.
-
-The invariant these tests defend is NOT "the number is 48" — it is **the estimate may
-only ever get smaller than the blind constant, never larger**, so the change cannot
-make any design's gate more conservative than it was.
+The fallback may reduce the blind constant when size evidence supports it, but
+it must never exceed that constant. This keeps budget gating no more
+conservative than the history-free behavior.
 """
 import os
 import unittest
@@ -37,7 +32,7 @@ class SizeAwareToolEstimateTests(unittest.TestCase):
         self.assertAlmostEqual(est, 8414 * 0.004350 * 1.3, places=3)
 
     def test_the_exact_chain40_refusal_no_longer_happens(self):
-        """Reproduce chain40's numbers: 277s remaining must now be enough."""
+        """Reproduce that run's numbers: 277s remaining must now be enough."""
         o = _opt(8414)
         est = o._no_history_risky_estimate_s()
         self.assertGreater(277.0, est,

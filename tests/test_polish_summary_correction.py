@@ -1,14 +1,8 @@
-"""The summary must describe the artifact that SHIPPED, not the one before polish.
+"""Test that the final summary describes the artifact selected after polish.
 
-`winner_polish` replaces the scored DCP after the agent has already printed its
-summary block. On a POLISH_VERDICT=IMPROVED that block understates what shipped.
-No contest score is lost — the better DCP is what gets scored — but every A/B we
-run parses that block, so six rows of the jul28/29 corpus were read low, logicnets
-by 4.50 MHz. That is above the 3.5 MHz noise floor and it turned a win into what
-was recorded as the cohort's only loss.
-
-These tests pin the correction arithmetic and the fact that the corrected values
-are emitted with the SAME labels our drivers grep, so a `tail -1` finds them.
+When polish replaces the scored checkpoint after the initial summary, corrected
+metrics are emitted under the same labels. Appending the correction ensures
+parsers that select the last matching value observe the final artifact.
 """
 from __future__ import annotations
 
@@ -26,11 +20,9 @@ sys.modules["mr_polish_corr"] = mr
 _spec.loader.exec_module(mr)
 
 
-# (logged fmax MHz, logged polish delta ns, artifact-measured fmax MHz) — the two runs
-# whose shipped DCP was re-opened in Vivado on jul29 (`report_route_status`). Every input
-# is logged; none is back-solved from the answer. Kept identical to the corpus corrector's
-# ARTIFACT_TRUTH in final_round/tools/tests/test_polish_correct.py, so the in-run
-# correction and the after-the-fact one cannot drift apart.
+# Calibration tuples contain logged fmax in MHz, logged polish delta in ns,
+# and artifact-measured fmax in MHz. Keep this table synchronized with the
+# correction harness's ARTIFACT_TRUTH.
 ARTIFACT_TRUTH = [
     (498.01, 0.018000000000000016, 502.5125628),
     (79.18, 0.0009999999999994458, 79.18910357),

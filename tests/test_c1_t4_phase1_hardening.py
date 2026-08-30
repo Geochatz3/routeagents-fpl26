@@ -1,21 +1,14 @@
-"""C1-T4 Phase-1 hardening tests (jul20 phase-1 red-team audit).
+"""Tests Phase 1 resource limits and unmeasured-baseline finalization.
 
-(a) Cumulative Phase-1 wall cap: OPTIONAL analysis steps stop launching
-    once Phase 1 has consumed phase1_wall_frac (default 15%) of
-    max_wall_seconds, and an optional step's scaled timeout is clamped
-    to the allowance still remaining.  Uncapped optional steps ×
-    phase1_timeout_scale 3.0 was the one remaining alpha=0 mechanism on
-    a much-bigger-than-boom hidden design.  Mandatory steps
-    (open_checkpoint, report_timing_summary) are never capped.
+Optional analysis steps stop launching when Phase 1 reaches `phase1_wall_frac`,
+which defaults to 15% of `max_wall_seconds`. Each optional step's scaled
+timeout is clamped to the remaining allowance.
 
-(c) initial_wns=None finalize guard: an unmeasured baseline makes any
-    "improvement" unverifiable — the old inline no_improvement
-    expression treated initial_wns=None as improvement whenever
-    best_wns > -inf, so the first measured WNS of ANY LLM op could ship
-    a regressed DCP as VALID_OPTIMIZED.  initial_wns=None must force
-    the baseline-copy branch.
+Mandatory checkpoint-opening and timing-report steps are not capped. If
+`initial_wns` is `None`, improvement is unverifiable and finalization must copy
+the baseline.
 
-Stub-driven: no Vivado/RapidWright/MCP — we mock the call surface.
+The tests use stubs and do not invoke FPGA tools or external analysis services.
 """
 from __future__ import annotations
 
@@ -106,7 +99,7 @@ class Phase1WallCapTests(unittest.TestCase):
 
     def test_no_cap_when_wall_budget_unset(self):
         # Legacy/dev mode (max_wall_seconds=None) must behave exactly as
-        # before C1-T4a: full scaled timeout, no skips.
+        # before the hardening: full scaled timeout, no skips.
         self.opt.max_wall_seconds = None
         self.opt.phase1_timeout_scale = 3.0
         self.opt._phase1_start_ts = time.time() - 10_000  # huge elapsed, irrelevant
@@ -218,7 +211,7 @@ class Phase1WallCapTests(unittest.TestCase):
 
 
 class FinalizeInitialWnsNoneTests(unittest.TestCase):
-    """C1-T4c — initial_wns=None ⇒ no_improvement=True (ship baseline).
+    """initial_wns=None ⇒ no_improvement=True (ship baseline).
 
     Why unconditional (no routed-scored-clock exception): the best-valid
     lineage records mirror mechanics (eager_mirror/piggyback/backstop),
@@ -253,7 +246,7 @@ class FinalizeInitialWnsNoneTests(unittest.TestCase):
     def test_no_improvement_truth_table(self):
         cases = [
             # (initial_wns, best_wns, expected_no_improvement)
-            (None, -1.0, True),    # C1-T4c: unmeasured baseline
+            (None, -1.0, True),    # unmeasured baseline
             (None, 5.0, True),     # even timing-met "best" is unverifiable
             (None, float("-inf"), True),
             (-10.0, -1.0, False),  # measured improvement — unchanged
@@ -272,10 +265,9 @@ class FinalizeInitialWnsNoneTests(unittest.TestCase):
     # --- end-to-end finalize behavior -------------------------------------
 
     def test_initial_wns_none_ships_baseline_not_best(self):
-        # The audit shape: Phase 1 parsed no WNS (initial_wns=None,
-        # best_wns seeded to -inf), then an LLM op measured -1.0 which
-        # became "best" and got mirrored.  Old finalize: fast path ships
-        # the mirror as VALID_OPTIMIZED.  New finalize: baseline copy.
+        # If baseline WNS is unknown, a later mirrored result cannot be proven
+        # to improve it. Finalization must ship the baseline fallback rather
+        # than report the mirror as VALID_OPTIMIZED.
         self.opt.initial_wns = None
         self.opt.best_wns = -1.0
         out = self.tmp_path / "optimized.dcp"

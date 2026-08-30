@@ -14,19 +14,13 @@ from unittest import mock
 
 from optimizer.strategy_memory import (
     DEFAULT_MEMORY_BASENAME,
-    DESIGN_NOTES,
     RunRecord,
-    all_for_design,
     append_run,
-    best_for_design,
-    design_note_for,
     fingerprint_match,
     format_for_prompt,
-    format_top_n_for_prompt,
     global_aggregate,
     load_memory,
     seed_prompt_for,
-    top_n_for_design,
     winning_tools_from_call_details,
 )
 
@@ -78,24 +72,9 @@ class LoadMemoryTests(unittest.TestCase):
 
     def test_load_picks_up_env_path(self):
         records = load_memory()
-        # The malformed row is permissively kept (RunRecord with all-None fields),
-        # but it has no design — best_for_design will skip it.
+        # The malformed row is permissively kept (RunRecord with all-None
+        # fields); downstream consumers filter on usable fields.
         self.assertGreaterEqual(len(records), 3)
-
-    def test_best_for_design_picks_highest_delta(self):
-        records = load_memory()
-        best = best_for_design(records, "amd_mini-isp")
-        self.assertIsNotNone(best)
-        self.assertEqual(best.candidate, "anchor")
-        self.assertAlmostEqual(best.delta_fmax_mhz, 87.35)
-
-    def test_best_for_design_unknown_returns_none(self):
-        records = load_memory()
-        self.assertIsNone(best_for_design(records, "nonexistent_design"))
-
-    def test_best_for_design_none_name_returns_none(self):
-        records = load_memory()
-        self.assertIsNone(best_for_design(records, None))
 
 
 class FingerprintMatchTests(unittest.TestCase):
@@ -183,7 +162,8 @@ class SeedPromptForTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "mem.jsonl"
         _write_jsonl(self.path, [
             {"design": "amd_mini-isp", "candidate": "anchor",
-             "delta_fmax_mhz": 87.35, "completed": True},
+             "delta_fmax_mhz": 87.35, "completed": True,
+             "lut_count": 24_000, "critical_path_spread": 42.0},
         ])
         self._env = mock.patch.dict(os.environ,
                                     {"STRATEGY_MEMORY_PATH": str(self.path)},
@@ -198,120 +178,25 @@ class SeedPromptForTests(unittest.TestCase):
         self._env.stop()
         self.tmp.cleanup()
 
-    def test_known_design_returns_snippet(self):
-        snippet = seed_prompt_for("amd_mini-isp")
+    def test_fingerprint_query_returns_matched_snippet(self):
+        snippet = seed_prompt_for(lut_count=24_500,
+                                  critical_path_spread=41.0)
         self.assertIn("anchor", snippet)
         self.assertIn("87.35", snippet)
 
-    def test_unknown_design_falls_back_to_global_aggregate(self):
-        # Records have no lut/spread → fingerprint match returns None.
-        # New behaviour: fall back to global_aggregate so the LLM still
-        # sees *some* prior, not nothing.
-        snippet = seed_prompt_for("nonexistent")
+    def test_design_name_is_ignored_for_retrieval(self):
+        # Retrieval is fingerprint-only: passing the exact stored design
+        # name without a fingerprint must NOT retrieve that record.
+        snippet = seed_prompt_for("amd_mini-isp")
+        self.assertIn("PRIOR-CAMPAIGN HISTORY:", snippet)
+        self.assertIn("prior campaigns", snippet)  # global aggregate
+
+    def test_no_fingerprint_falls_back_to_global_aggregate(self):
+        # No lut/spread given → fingerprint match returns None → fall
+        # back to global_aggregate so the LLM still sees *some* prior.
+        snippet = seed_prompt_for()
         self.assertIn("PRIOR-CAMPAIGN HISTORY:", snippet)
         self.assertIn("prior campaigns", snippet)
-
-
-class TopNForDesignTests(unittest.TestCase):
-    def setUp(self):
-        self.records = [
-            RunRecord(design="x", candidate="anchor", delta_fmax_mhz=20, completed=True),
-            RunRecord(design="x", candidate="v0_3", delta_fmax_mhz=50, completed=True),
-            RunRecord(design="x", candidate="v0_3_seed2", delta_fmax_mhz=53, completed=True),
-            RunRecord(design="x", candidate="v0_3_seed3", delta_fmax_mhz=46, completed=True),
-            RunRecord(design="other", candidate="anchor", delta_fmax_mhz=99, completed=True),
-        ]
-
-    def test_filters_by_design(self):
-        out = top_n_for_design(self.records, "x", n=10)
-        for r in out:
-            self.assertEqual(r.design, "x")
-
-    def test_dedups_seeds_by_candidate_class(self):
-        # v0_3, v0_3_seed2, v0_3_seed3 should collapse to one entry (highest)
-        out = top_n_for_design(self.records, "x", n=10)
-        candidate_classes = [(r.candidate or "").split("_seed")[0] for r in out]
-        self.assertEqual(len(candidate_classes), len(set(candidate_classes)))
-
-    def test_returns_highest_per_class(self):
-        out = top_n_for_design(self.records, "x", n=10)
-        # The single v0_3 representative should be seed2 (highest delta=53)
-        v03 = next(r for r in out if (r.candidate or "").startswith("v0_3"))
-        self.assertEqual(v03.candidate, "v0_3_seed2")
-        self.assertEqual(v03.delta_fmax_mhz, 53)
-
-    def test_caps_at_n(self):
-        out = top_n_for_design(self.records, "x", n=1)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0].candidate, "v0_3_seed2")  # highest
-
-    def test_empty_for_unknown_design(self):
-        self.assertEqual(top_n_for_design(self.records, "nonexistent"), [])
-        self.assertEqual(top_n_for_design(self.records, None), [])
-
-
-class FormatTopNForPromptTests(unittest.TestCase):
-    def test_empty_returns_empty_string(self):
-        self.assertEqual(format_top_n_for_prompt([], "x"), "")
-
-    def test_single_record_uses_single_format(self):
-        # When only one record, falls back to format_for_prompt's single style
-        r = RunRecord(design="x", candidate="anchor", delta_fmax_mhz=10)
-        out = format_top_n_for_prompt([r], "x")
-        single = format_for_prompt(r, "x")
-        self.assertEqual(out, single)
-
-    def test_multi_record_lists_all(self):
-        r1 = RunRecord(design="x", candidate="anchor", delta_fmax_mhz=20, iterations=3)
-        r2 = RunRecord(design="x", candidate="v0_3", delta_fmax_mhz=50, iterations=5,
-                       force_continues=2)
-        out = format_top_n_for_prompt([r2, r1], "x")
-        self.assertIn("anchor", out)
-        self.assertIn("v0_3", out)
-        self.assertIn("+50.00", out)
-        self.assertIn("+20.00", out)
-        # Hints should come from the best (first) record
-        self.assertIn("force-continue", out)
-
-    def test_fingerprint_match_relabels(self):
-        r = RunRecord(design="other_design", candidate="v0_3", delta_fmax_mhz=50)
-        out = format_top_n_for_prompt([r, r], "brand_new")
-        self.assertIn("closest fingerprint match", out)
-        self.assertIn("other_design", out)
-
-
-class SeedPromptTopNTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.path = Path(self.tmp.name) / "mem.jsonl"
-        _write_jsonl(self.path, [
-            {"design": "x", "candidate": "anchor", "delta_fmax_mhz": 20.0, "completed": True},
-            {"design": "x", "candidate": "v0_3", "delta_fmax_mhz": 50.0, "completed": True},
-            {"design": "x", "candidate": "v0_3_seed2", "delta_fmax_mhz": 55.0, "completed": True},
-        ])
-        self._env = mock.patch.dict(os.environ,
-                                    {"STRATEGY_MEMORY_PATH": str(self.path)},
-                                    clear=False)
-        self._env.start()
-        self._cwd = mock.patch("optimizer.strategy_memory.Path.cwd",
-                               return_value=Path(self.tmp.name))
-        self._cwd.start()
-
-    def tearDown(self):
-        self._cwd.stop()
-        self._env.stop()
-        self.tmp.cleanup()
-
-    def test_default_top_n_3_includes_multiple_candidates(self):
-        snippet = seed_prompt_for("x")
-        # Both anchor and v0_3 (deduped from seeds) should appear
-        self.assertIn("anchor", snippet)
-        self.assertIn("v0_3", snippet)
-
-    def test_top_n_1_returns_single_format(self):
-        snippet = seed_prompt_for("x", top_n=1)
-        # Should not have the "top candidates" header
-        self.assertNotIn("top candidates", snippet)
 
 
 class GlobalAggregateTests(unittest.TestCase):
@@ -346,7 +231,8 @@ class SeedPromptFallbackTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "mem.jsonl"
         _write_jsonl(self.path, [
             {"design": "known_a", "candidate": "anchor",
-             "delta_fmax_mhz": 50.0, "completed": True},
+             "delta_fmax_mhz": 50.0, "completed": True,
+             "lut_count": 5_000, "critical_path_spread": 12.0},
             {"design": "known_b", "candidate": "v0_3",
              "delta_fmax_mhz": 70.0, "completed": True},
         ])
@@ -363,47 +249,17 @@ class SeedPromptFallbackTests(unittest.TestCase):
         self._env.stop()
         self.tmp.cleanup()
 
-    def test_unknown_design_falls_back_to_global_aggregate(self):
+    def test_unknown_fingerprint_falls_back_to_global_aggregate(self):
         snippet = seed_prompt_for("brand_new")
         self.assertIn("PRIOR-CAMPAIGN HISTORY:", snippet)
         self.assertIn("prior campaigns", snippet)
 
-    def test_known_design_uses_match_not_global(self):
-        snippet = seed_prompt_for("known_a")
+    def test_fingerprint_uses_match_not_global(self):
+        snippet = seed_prompt_for(lut_count=5_200,
+                                  critical_path_spread=13.0)
         self.assertIn("anchor", snippet)
         # Should NOT show the "Across N prior campaigns" aggregate header
         self.assertNotIn("Across", snippet)
-
-
-class DesignNoteTests(unittest.TestCase):
-    def test_known_loss_design_returns_note(self):
-        out = design_note_for("corescore_500_mod")
-        self.assertTrue(out.startswith("DESIGN-SPECIFIC NOTE:"))
-        self.assertIn("LOSS", out)
-        self.assertIn("retiming", out.lower())
-
-    def test_known_tight_design_returns_note(self):
-        out = design_note_for("vexriscv_re-place_v2")
-        self.assertTrue(out.startswith("DESIGN-SPECIFIC NOTE:"))
-        self.assertIn("tight", out.lower())
-
-    def test_unknown_design_returns_empty(self):
-        self.assertEqual(design_note_for("brand_new_design"), "")
-        self.assertEqual(design_note_for(None), "")
-
-    def test_all_table_entries_have_substantive_notes(self):
-        # Sanity — every entry should be a non-trivial sentence
-        for design, note in DESIGN_NOTES.items():
-            self.assertGreater(len(note), 50,
-                               f"DESIGN_NOTES[{design!r}] is too short")
-
-    def test_note_appears_in_seed_prompt_when_known(self):
-        # corescore appears in DESIGN_NOTES — should land in the iter-1 snippet
-        # even when we use the canonical seed memory (which has corescore data).
-        snippet = seed_prompt_for("corescore_500_mod")
-        self.assertIn("DESIGN-SPECIFIC NOTE:", snippet)
-        # The campaign-history section should also be there (memory has corescore)
-        self.assertIn("PRIOR-CAMPAIGN HISTORY", snippet)
 
 
 class WinningToolsTests(unittest.TestCase):

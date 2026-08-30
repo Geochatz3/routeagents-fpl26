@@ -1,8 +1,7 @@
-"""Tests for the intra-attempt wall-economics stop rule.
+"""Test the intra-attempt wall-economics stop rule.
 
-The rule is DERIVED from the contest scoring function, so the tests pin the
-arithmetic against hand-computed values and against the real chain12 run —
-not against a tuned threshold.
+The rule is derived from the scoring function, so these tests pin its
+arithmetic to hand-computed values rather than a tuned threshold.
 """
 import pytest
 
@@ -102,10 +101,12 @@ def test_keeps_going_when_the_realized_rate_clears_the_hurdle():
 
 # ------------------------------------------------ the run that motivated it
 def test_chain12_boom_soc_would_have_stopped():
-    """MEASURED, jul25: alpha +36.33 banked at 18:09:25; the attempt then ran
-    to 18:37 (1730 s) and BOTH non-recipe MUX candidates came back at the
-    untouched baseline -19.162, i.e. zero gain. The heavy-move window on this
-    design is the phys_opt cost, ~1106 s."""
+    """Verify the stop rule halts after a banked gain when further expensive
+    candidates cannot repay their wall-time cost.
+
+    The scenario models a long optimization window followed by candidates that
+    leave timing unchanged.
+    """
     stop, why = should_stop_for_wall(
         alpha_mhz=36.33, remaining_s=1730.0,
         since_last_gain_s=1730.0, observation_window_s=1106.0,

@@ -1,315 +1,95 @@
-# RapidWright MCP Server
+# RapidWrightMCP — the structural analysis server
 
-An MCP (Model Context Protocol) server that provides AI assistant access to [RapidWright](https://github.com/Xilinx/RapidWright), an open-source FPGA design tool framework from AMD.
+An [MCP](https://modelcontextprotocol.io/) server that exposes
+[RapidWright](https://github.com/Xilinx/RapidWright) — AMD's open-source
+framework for reading and transforming design checkpoints — to the agent as
+17 named tools.
 
-This server enables AI assistants like Cursor to interact with FPGA designs, query device information, analyze design checkpoints, and explore Xilinx/AMD device architectures through natural language.
+The companion server is [VivadoMCP](../VivadoMCP/README.md). Vivado is what
+changes and measures a design; RapidWright is what makes the checkpoint
+legible in between — cell placement coordinates, net topology, fabric
+geometry — without paying for a Vivado invocation.
 
-## Features
+## The 17 tools
 
-- **Device Information**: Query supported FPGA devices and families, get detailed device specifications
-- **Design Checkpoint Analysis**: Load Vivado .dcp files, inspect design statistics, search for cells
-- **Device Architecture Exploration**: Get tile/site information, query device resources
-- **Design Optimization**: LUT input cone optimization and high fanout net splitting
+| group | tools |
+|---|---|
+| session | `initialize_rapidwright`, `read_checkpoint`, `write_checkpoint` |
+| device | `get_supported_devices`, `get_device_info`, `get_tile_info`, `search_sites` |
+| design | `get_design_info`, `search_cells`, `compare_design_structure` |
+| geometry | `analyze_critical_path_spread`, `analyze_net_detour` |
+| floorplan | `analyze_fabric_for_pblock`, `convert_fabric_region_to_pblock` |
+| transform | `optimize_lut_input_cone`, `optimize_fanout`, `optimize_cell_placement` |
 
-## Quick Start
+`initialize_rapidwright` must be called before any other tool; the JVM starts
+once per session.
 
-### Prerequisites
+**All 17 come from the contest starter kit** and this server's tool surface is
+unchanged from it — verify with
+`diff <(curl -s https://raw.githubusercontent.com/Xilinx/fpl26_optimization_contest/main/RapidWrightMCP/server.py) server.py`.
+What this project added is above the tool layer, not in it.
 
-- Python 3.8+
-- Java 11+
+Four of them carry the rest of the system: `analyze_critical_path_spread`
+produces the critical-path spread that, with the LUT count, forms the design
+fingerprint the recipe router and the strategy memory key on;
+`analyze_net_detour` tells a placement play which cells are worth moving;
+`analyze_fabric_for_pblock` and `convert_fabric_region_to_pblock` are what make
+an automatic pblock play possible. The plays built on them are catalogued in
+[docs/PLAYBOOK.md](../docs/PLAYBOOK.md). The organizers' own worked example
+chains `analyze_net_detour` into `optimize_cell_placement`; the detour-ratio
+definition it turns on is excerpted in
+[docs/optimization_example.md](../docs/optimization_example.md), and
+`recipes/cell_replacement.py` is this repository's version of that chain.
 
-### Installation
+## Running it
 
-The recommended setup uses the contest repo's Makefile, which builds RapidWright from a git submodule:
-
-```bash
-cd fpl26_optimization_contest
-make setup
-```
-
-This automatically:
-1. Installs Python dependencies (including the `rapidwright` pip package for JPype bridging)
-2. Builds RapidWright from the `RapidWright/` git submodule (`./gradlew compileJava`)
-3. Sets `RAPIDWRIGHT_PATH` and `CLASSPATH` so the pip package uses the local source
-
-To rebuild RapidWright after modifying its source code:
-
-```bash
-make build-rapidwright
-```
-
-### Manual Setup (standalone)
-
-```bash
-cd RapidWrightMCP
-./setup.sh
-python3 test_server.py
-```
-
-## Usage with Cursor
-
-Add to your MCP configuration file:
-
-```json
-{
-  "mcpServers": {
-    "rapidwright": {
-      "command": "python3",
-      "args": ["/absolute/path/to/RapidWrightMCP/server.py"],
-      "env": {
-        "RAPIDWRIGHT_PATH": "/absolute/path/to/RapidWright",
-        "CLASSPATH": "/absolute/path/to/RapidWright/bin:/absolute/path/to/RapidWright/jars/*"
-      }
-    }
-  }
-}
-```
-
-Restart Cursor after saving.
-
-## Available Tools
-
-| Tool | Description |
-|------|-------------|
-| `initialize_rapidwright` | Initialize RapidWright (must be called first) |
-| `get_supported_devices` | List all supported FPGA devices |
-| `get_device_info` | Get detailed information about a specific device |
-| `read_checkpoint` | Load a Vivado Design Checkpoint (.dcp) file |
-| `write_checkpoint` | Save design to a .dcp file |
-| `get_design_info` | Get statistics about the loaded design |
-| `search_cells` | Search for cells by name or type |
-| `get_tile_info` | Get information about a specific tile |
-| `search_sites` | Search for sites by type on a device |
-| `optimize_lut_input_cone` | Optimize LUT chains by combining into single LUTs |
-| `optimize_fanout` | Split high fanout nets by replicating drivers |
-
-## Example Usage
-
-```
-User: "Initialize RapidWright and show me what devices are available"
-AI: [calls initialize_rapidwright and get_supported_devices]
-    "RapidWright supports 50+ devices including xcvu3p, xcvu9p, xcku040..."
-
-User: "Load my design from ~/my_design.dcp and tell me how many LUTs it uses"
-AI: [calls read_checkpoint, then get_design_info and search_cells]
-    "Your design uses 15,432 LUT6 cells..."
-
-User: "Optimize the LUT input cone for pin 'top/cpu/alu/result[0]'"
-AI: [calls optimize_lut_input_cone]
-    "Successfully combined 3 chained LUTs into a single LUT6."
-
-User: "The net 'clk_enable' has very high fanout. Split it into 4 parts."
-AI: [calls optimize_fanout]
-    "Split 'clk_enable' (original fanout: 2,456) into 4 nets with ~614 loads each."
-```
-
-## Tips
-
-- **Initialize once** per session, then use other commands freely
-- **Use absolute paths** for .dcp files
-- **Be specific** with device names (e.g., "xcvu9p" not "vu9p")
-- **Chain requests**: "Load design X and tell me Y"
-- Use natural language - no need for exact tool names
-
-## Common Cell & Site Types
-
-| Cell Type | Description |
-|-----------|-------------|
-| LUT6 | 6-input Lookup Table |
-| FDRE | D Flip-Flop with Clock Enable and Sync Reset |
-| FDCE | D Flip-Flop with Clock Enable and Async Clear |
-| CARRY8 | Carry Logic (UltraScale+) |
-| DSP48E2 | DSP Block (UltraScale+) |
-| RAMB36E2 | 36Kb Block RAM (UltraScale+) |
-| BUFGCE | Global Clock Buffer |
-
-| Site Type | Description |
-|-----------|-------------|
-| SLICEL | Logic Slice (LUTs, FFs, Carry) |
-| SLICEM | Memory Slice (+ Distributed RAM) |
-| DSP48E2 | DSP/Math Block |
-| RAMB36/RAMB18 | Block RAM |
-| URAM288 | 288Kb Ultra RAM |
-
----
-
-## Design Optimization Guide
-
-### LUT Input Cone Optimization
-
-Combines chained small LUTs into a single larger LUT (up to LUT6) to reduce logic depth.
-
-```
-Before:  Input -> LUT2 -> LUT3 -> LUT4 -> Output  (3 logic levels)
-After:   Input -> LUT6 -> Output                   (1 logic level)
-```
-
-**When to use:**
-- Critical path optimization when timing shows multiple LUT levels
-- Post-place-and-route ECO fixes without full re-synthesis
-
-**Parameters:**
-- `hierarchical_input_pins`: List of pins to optimize (e.g., `["top/cpu/alu/result[0]"]`)
-- `output_dcp_path`: Optional path to save the optimized design
-
-**Limitations:**
-- Maximum 6 inputs (LUT6 is the largest)
-- Only works on paths driven exclusively by LUTs
-- Cannot optimize paths with flip-flops, DSPs, or other non-LUT elements
-
-### Fanout Optimization
-
-Splits high-fanout nets by replicating the source driver. Each replica drives a subset of loads.
-
-```
-Before:  Driver -> [1000 loads]
-After:   Driver_1 -> [250 loads]
-         Driver_2 -> [250 loads]
-         Driver_3 -> [250 loads]
-         Driver_4 -> [250 loads]
-```
-
-**When to use:**
-- High-fanout enable/control signals (>500 loads)
-- Routing congestion from heavily loaded nets
-- Timing closure for high-fanout paths
-
-**Choosing split factor:**
-- k=2: Moderately high fanout (500-1000 loads)
-- k=3-4: Very high fanout (1000-3000 loads)
-- k≥5: Extremely high fanout (>3000 loads)
-
-**Trade-offs:**
-- Higher k = lower fanout per net = better routing/timing
-- Higher k = more driver cells = increased area and power
-
-**Limitations:**
-- Only works on routed nets
-- Not beneficial for small fanouts (<100 loads)
-
-### Optimization Troubleshooting
-
-| Error | Solution |
-|-------|----------|
-| "Pin not found" | Check hierarchical path, use full name including top module |
-| "No optimization possible" | Pin not driven by LUTs, or already optimal single LUT |
-| "6 maximum inputs" | Cone requires >6 inputs; try optimizing a later stage |
-| "Net not found" | Use physical net name, not hierarchical logical name |
-
----
-
-## Architecture
-
-```
-┌─────────────────┐
-│     Cursor      │
-│  AI Assistant   │
-└────────┬────────┘
-         │ MCP Protocol (JSON-RPC over stdio)
-┌────────▼────────┐
-│  server.py      │  ← MCP Server
-└────────┬────────┘
-┌────────▼────────────┐
-│ rapidwright_tools.py│  ← Tool Wrappers
-└────────┬────────────┘
-┌────────▼────────┐
-│  RapidWright    │  ← pip package (JPype + Java libs)
-└─────────────────┘
-```
-
-The `rapidwright` pip package provides the JPype/Python bridge, while the
-`RAPIDWRIGHT_PATH` and `CLASSPATH` environment variables redirect it to use
-Java classes compiled from the local `RapidWright/` git submodule. This allows
-contestants to modify and rebuild RapidWright source code directly.
-
-## Development
-
-### Project Structure
-
-```
-RapidWrightMCP/
-├── server.py              # Main MCP server
-├── rapidwright_tools.py   # RapidWright wrapper functions
-├── requirements.txt       # Python dependencies (mcp + rapidwright pip bridge)
-├── setup.sh              # Setup script
-├── test_server.py        # Test suite
-└── rapidwright_mcp.log   # Log file (created at runtime)
-
-../RapidWright/            # Git submodule (Xilinx/RapidWright source)
-├── src/                   # Java source (modifiable by contestants)
-├── bin/                   # Compiled classes (after ./gradlew compileJava)
-├── jars/                  # Third-party dependencies
-└── gradlew               # Gradle wrapper for building
-```
-
-### Adding New Tools
-
-To add a new tool:
-
-1. **Add the function** to `rapidwright_tools.py`:
-   ```python
-   def my_new_tool(param1: str) -> Dict[str, Any]:
-       """Your tool implementation."""
-       if not _initialized:
-           return {"error": "RapidWright not initialized"}
-       # ... implementation
-       return {"status": "success", "result": ...}
-   ```
-
-2. **Register the tool** in `server.py` `list_tools()`:
-   ```python
-   Tool(
-       name="my_new_tool",
-       description="What your tool does",
-       inputSchema={
-           "type": "object",
-           "properties": {
-               "param1": {"type": "string", "description": "..."}
-           },
-           "required": ["param1"]
-       }
-   )
-   ```
-
-3. **Add the handler** in `call_tool()`:
-   ```python
-   elif name == "my_new_tool":
-       result = rw.my_new_tool(arguments["param1"])
-   ```
-
-### Running Tests
+The optimizer starts this server itself; you do not normally launch it by
+hand. `make setup` from the repository root installs the Python dependencies,
+builds RapidWright from the `RapidWright/` submodule (`./gradlew
+compileJava`), and sets `RAPIDWRIGHT_PATH` and `CLASSPATH`.
 
 ```bash
-python3 test_server.py
-tail -f rapidwright_mcp.log
+python3 server.py            # stdio MCP server
 ```
+
+The `rapidwright` pip package supplies the JPype bridge to Java. The two
+environment variables redirect it away from the package's own bundled jars
+and onto the classes compiled from the local submodule — which is what makes
+a modified RapidWright take effect:
+
+| Variable | Value |
+|---|---|
+| `RAPIDWRIGHT_PATH` | absolute path to the `RapidWright/` submodule |
+| `CLASSPATH` | `…/RapidWright/bin:…/RapidWright/jars/*` |
+
+After changing RapidWright's Java source, rebuild with `make
+build-rapidwright` from the repository root. Java 11 or newer is required;
+Vivado's bundled JRE works.
+
+## Adding a tool
+
+Three edits, in this order: implement it in `rapidwright_tools.py` (return a
+dict, and guard on `_initialized`), register a `Tool(...)` in `server.py`'s
+`list_tools()`, and add its branch in `call_tool()`. Then add its name to the
+table above — `tests/test_tool_surface.py` fails if the code and this README
+disagree, which is how the starter kit's version of this file came to document
+11 of its own 17 tools.
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| "RapidWright not initialized" | Call `initialize_rapidwright` first; check Java 11+ is installed |
-| Server not appearing | Use absolute paths in config; restart Cursor/Claude completely |
-| Out of memory | Increase `jvm_max_memory` (e.g., "8G", "16G") |
-| Local changes not picked up | Rebuild: `make build-rapidwright` from the repo root |
-| Installation issues | `pip3 install --force-reinstall rapidwright` (for the JPype bridge) |
+| Symptom | Cause |
+|---|---|
+| `RapidWright not initialized` | call `initialize_rapidwright` first, or Java is missing (`java -version`) |
+| Local Java changes have no effect | not rebuilt (`make build-rapidwright`), or `CLASSPATH` still points at the pip package's jars |
+| Out of memory | raise `jvm_max_memory` on `initialize_rapidwright` (e.g. `"8G"`) |
+| JPype import errors | `pip3 install --force-reinstall rapidwright` |
 
-**Checklist:**
-- [ ] Python 3.8+? (`python3 --version`)
-- [ ] Java 11+? (`java -version`)
-- [ ] RapidWright pip bridge installed? (`pip3 show rapidwright`)
-- [ ] RapidWright submodule present? (`ls RapidWright/gradlew`)
-- [ ] RapidWright compiled? (`ls RapidWright/build/libs/main.jar`)
-- [ ] `RAPIDWRIGHT_PATH` set? (`echo $RAPIDWRIGHT_PATH`)
-- [ ] Config paths absolute?
-- [ ] Cursor restarted?
-- [ ] Check logs? (`cat rapidwright_mcp.log`)
+`rapidwright_mcp.log` is written next to the server at runtime.
+`test_server.py` is a manual smoke check against real RapidWright — it is
+**not** part of `make test`, which needs no Java and no Vivado.
 
+## Reference
 
-## Resources
-
-- [RapidWright Documentation](https://www.rapidwright.io/docs/)
-- [RapidWright Javadoc](https://www.rapidwright.io/javadoc/)
-- [RapidWright GitHub](https://github.com/Xilinx/RapidWright)
-- [Model Context Protocol](https://modelcontextprotocol.io/)
-
+[RapidWright docs](https://www.rapidwright.io/docs/) ·
+[Javadoc](https://www.rapidwright.io/javadoc/) ·
+[Model Context Protocol](https://modelcontextprotocol.io/)

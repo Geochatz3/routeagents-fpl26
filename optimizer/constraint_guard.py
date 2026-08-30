@@ -1,39 +1,30 @@
-"""XDC / timing-constraint integrity guard.
+"""Timing-constraint integrity guard.
 
-WHY THIS EXISTS (jul25 panel, gemini seat, Confidence 5/5 — the only charge
-rated above every MHz on the board):
+Contest rules make edits to the timing constraints disqualifying, and a
+disqualification is a zero, which outranks any amount of gain.  The stack
+otherwise has no defence: the model has unrestricted raw Tcl, the risk
+classifier reads Tcl only to estimate runtime rather than legality, the
+forbidden-token list validates advisory labels rather than commands, and the
+submission validator checks slack and routing state but never whether the
+constraints themselves were altered.  A false-path exception on the critical
+path would inflate the reported slack, pass every gate, and be a hard
+disqualification.
 
-Contest rules make XDC timing-constraint edits **disqualifying**. Our stack
-had no defence at all:
+Honest scope: this is a latent hole, not an observed leak.  A search across
+every historical run log found no constraint-modifying command ever issued
+inside a raw-Tcl payload.  The guard exists because the downside is
+catastrophic and the guard is cheap.
 
-  * the LLM has unrestricted ``vivado_run_tcl`` (boom_soc issued 13 raw Tcl
-    calls last night, rend3d 86);
-  * ``_is_risky()`` classifies Tcl only for RUNTIME estimation, not legality;
-  * ``_FORBIDDEN_COMMAND_TOKENS`` in hidden_fingerprint_card validates advisory
-    LABELS, not commands;
-  * the submission validator checked WNS and (since jul25) routing state — but
-    never whether the constraints had been altered.
+Two layers:
 
-So ``set_false_path`` on the critical path would inflate WNS, sail through
-every gate we own, and be a hard DQ. A DQ is a zero, which outranks any alpha.
-
-HONEST SCOPE — this is a LATENT hole, not an observed leak. A grep across every
-historical run log found **zero** constraint-modifying commands ever issued
-inside a ``run_tcl`` payload. We are adding this because the downside is
-catastrophic and the guard is cheap, NOT because it is happening. The panel's
-framing ("the LLM is heavily utilizing raw Tcl and will discover this") is not
-supported by our own history and should not be repeated as fact.
-
-TWO LAYERS:
-  1. PREVENTION — a deny-list checked at the ``run_tcl`` boundary. Refuses the
+  1. PREVENTION — a deny-list checked at the raw-Tcl boundary.  It refuses the
      command and tells the model why, so it can pick a legal move.
-  2. DETECTION — a constraint fingerprint captured after ``open_checkpoint``
-     and re-checked before ship. Prevention can be bypassed (an alias, a
-     ``source``d file, an ``eval``); detection catches the effect regardless of
-     the route taken.
+  2. DETECTION — a constraint fingerprint captured after the checkpoint is
+     opened and re-checked before ship.
 
-Detection is the load-bearing layer. Deny-lists are string matching and string
-matching is defeatable; a fingerprint diff is not.
+Detection is the load-bearing layer.  Prevention can be bypassed through an
+alias, a sourced file or an eval; deny-lists are string matching and string
+matching is defeatable, while a fingerprint diff is not.
 """
 
 from __future__ import annotations
@@ -181,25 +172,12 @@ def parse_exception_report(text: Optional[str]) -> List[str]:
 
 def build_fingerprint(clock_report: Optional[str],
                       exception_report: Optional[str]) -> ConstraintFingerprint:
-    """Build a fingerprint from two Vivado report strings.
+    """Build a constraint fingerprint from clock and exception reports.
 
-    Either report being None means we could not measure — recorded as
-    ``captured=False`` so the comparison reports UNVERIFIED rather than
-    silently claiming 'unchanged'.
-
-    ⚠️ aug06 REGRESSION FIX. This condition used to be ``and``, contradicting
-    the paragraph above: a PARTIAL capture was marked ``captured=True`` and the
-    missing report parsed to an empty list, i.e. a count of 0 — which is
-    indistinguishable from "every constraint was deleted". Observed live on
-    ispd16: ``report_clocks`` hit its 120 s budget timeout, ``report_exceptions``
-    succeeded, and the guard announced
-
-        *** TIMING CONSTRAINTS CHANGED *** clock count 1 -> 0
-
-    on a design whose constraints were untouched. That false alarm then hit the
-    bookkeeping append whose missing ``elapsed_time`` crashed the summary
-    printer, failing ``optimize()`` and costing the whole benchmark (alpha
-    +0.00). A partial fingerprint is NOT comparable — fail open, and say so.
+    If either report is `None`, the result has `captured=False`; partial
+    fingerprints are not comparable and must produce an `UNVERIFIED` result
+    rather than a change warning. This guard fails open because a missing
+    report cannot distinguish absent measurements from deleted constraints.
     """
     fp = ConstraintFingerprint()
     if clock_report is None or exception_report is None:

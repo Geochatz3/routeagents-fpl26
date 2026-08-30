@@ -2,11 +2,12 @@
 # Build a strict, leak-proof contest submission archive (.tar.gz, which the
 # harness accepts: "unzip submission.zip OR tar -xzf submission.tar.gz").
 #
-# WHY working-tree (not `git archive`): some optimizer/*.py modules used in
-# --contest-mode (e.g. negative_memory.py) are currently UNTRACKED. `git
-# archive HEAD` would silently omit them, shipping a submission that runs but
-# with features disabled — differing from what was validated on AWS. We build
-# from the working tree so the archive matches the validated runtime exactly.
+# WHY working-tree (not `git archive`): the archive must match the runtime that
+# was actually validated, including anything not yet committed. `git archive
+# HEAD` ships the last commit instead, which during a campaign silently omitted
+# untracked modules and produced an archive that ran with features disabled.
+# (In this public tree every module is tracked, so the two would agree today —
+# the working-tree build is what keeps that from being a coincidence.)
 #
 # Strictness (the alpha-0.0 / "fails on their env" class):
 #   - EXCLUDE .env  (leaks VIVADO_EXEC=/home/<dev>/.local/bin/vivado + local
@@ -29,8 +30,8 @@ OUT="${1:-/tmp/fpl26_submission.tar.gz}"
 
 # The archive's TOP-LEVEL DIRECTORY is part of the contract: the harness
 # extracts and enters `fpl26_optimization_contest/`. It used to be taken from
-# the CHECKOUT dirname, so building from a git worktree (jul29:
-# `wt_final_round_dev/`) produced an archive rooted at the worktree's name —
+# the CHECKOUT dirname, so building from a git worktree (e.g.
+# `wt_dev/`) produced an archive rooted at the worktree's name —
 # and every check below, which derived its expected prefix from that SAME
 # dirname, agreed with it and printed "SUBMISSION READY". The verifier was
 # validating the build against itself rather than against the contract, so the
@@ -45,10 +46,10 @@ ARCHIVE_ROOT="${SUBMISSION_ROOT:-fpl26_optimization_contest}"
 #
 # The archive-root bug above was invisible from the MAIN checkout, because that
 # directory happens to be named `fpl26_optimization_contest`. The mirror-image
-# hazard is worse and is live: on jul29 the main checkout sat on
-# `final-dev-portfolio-scheduler`, a STRICT ANCESTOR 140 commits behind
-# `final-round-dev`. Packaging it would have shipped a tree with none of the
-# final round in it — including the jul29 fix that put the uniform ILS stack on
+# hazard is worse and is live: the main checkout once sat on a stale
+# branch — a STRICT ANCESTOR 140 commits behind the active development
+# branch. Packaging it would have shipped a tree with none of the
+# final round in it — including the fix that put the uniform ILS stack on
 # the ship path at all — and every check in this script would have passed,
 # because the dirname is right and the files are all present. Correct-looking
 # archive, wrong decade of code.
@@ -142,7 +143,7 @@ strays="$(printf '%s\n' "$listing" | grep -vE "^${ARCHIVE_ROOT}(/|$)" || true)"
 [ -n "$strays" ] && fail "archive members outside '$ARCHIVE_ROOT/':"$'\n'"$(printf '%s\n' "$strays" | head -20)"
 echo "[build_submission] OK: every member is under $ARCHIVE_ROOT/"
 
-for f in Makefile dcp_optimizer.py requirements.txt SYSTEM_PROMPT.TXT \
+for f in Makefile dcp_optimizer.py requirements.txt prompts/system_prompt_scored.txt \
          optimizer/recipe_router.py VivadoMCP/vivado_mcp_server.py \
          scripts/multi_restart_optimize.py; do
   printf '%s\n' "$listing" | grep -qx "$ARCHIVE_ROOT/$f" || fail "missing required file: $f"

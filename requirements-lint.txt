@@ -1,0 +1,8 @@
+# Lint gate only (`make lint`). Deliberately NOT in requirements-dev.txt: the
+# offline test suite passes with exactly the three packages listed there, and
+# `make test` must stay runnable without installing a linter.
+#
+# Pinned to a minor band, for the same reason requirements.txt carries upper
+# bounds: a new ruff minor can add rules to an existing code, and a gate that
+# turns red on its own is a gate people learn to skip.
+ruff>=0.16.0,<0.17.0

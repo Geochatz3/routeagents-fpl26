@@ -1,28 +1,12 @@
-"""`phys_opt_design -directive Default` to fixpoint, pre-loop. (jul31)
+"""Test repeated default physical optimization and its safety gates.
 
-WHY. `VivadoMCP/vivado_mcp_server.py` builds its phys_opt command with an
-if/else: when `directive` is set, every other argument is DISCARDED, including
-`path_groups`. So the LLM calls that FIR_VARIANCE_IS_PHYSOPT_DEPTH_jul29 §4 read
-as "aimed at the re-grouped critical path" actually ran a full-design
-`phys_opt_design -directive Default` with the group thrown away. The variable is
-directive-vs-sub-option, not scope.
-
-Corpus, 833 phys_opt tool calls in 199 agent.logs, replicating on BOTH boxes:
-    directive=Default   26/30  = 86.7%
-    sub-option only     70/479 = 15%
-fir's alpha is decided by how many Default calls the LLM happens to emit —
-nDefault>=2 selected the 21.30 mode 8/8; nDefault<=1 gave 9.07. 12.23 MHz.
-
-Every branch that can cost something is pinned here in BOTH directions, because
-a gate that only ever takes one branch in the suite is untested, not proven:
-  * OFF by default — the flag is one design's evidence (fir, all 30 calls);
-  * stops on the FIRST non-gain, and REVERTS to best_valid.dcp so the LLM loop
-    never inherits a degraded placement;
-  * the wall gate is a MEASUREMENT — call 1 sized from the design-aware model,
-    calls 2+ from the OBSERVED duration of the one before, so a big design
-    (ispd16/boom, est 600 s) stops before spending a second call;
-  * caps at 4 calls (streak gains: 10/11, 8/8, 6/6, 1/4);
-  * fails OPEN on a tool error or an exception.
+A directive call applies to the full design because the command builder
+discards sub-options, including path groups, when a directive is present. The
+optional stage is disabled by default and runs after the main optimization
+loop. A non-gaining pass stops the stage and restores the best valid
+checkpoint. The first pass uses a design-aware duration estimate; later passes
+use the preceding observed duration. The stage permits at most four passes and
+fails open on tool errors or exceptions.
 """
 from __future__ import annotations
 
@@ -36,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dcp_optimizer  # noqa: E402
 from dcp_optimizer import DCPOptimizer  # noqa: E402
+from tests.source_corpus import dcp_source_lines, dcp_source_text
 
 PODF = "FPL26_PHYSOPT_DEFAULT_FIXPOINT"
 
@@ -98,10 +83,10 @@ class _Stub:
 
 
 def run(stub):
-    """Drive the stage against the stub's FAKE clock.
+    """Run the stage with deterministic simulated elapsed time.
 
-    The measured-cost gate is the whole point of the stage, so the suite must
-    not read a real ~0 s elapsed for a call the test declares takes 400 s.
+    Budget decisions use the stub's declared call durations rather than the
+    near-zero wall time of the test process.
     """
     real = dcp_optimizer.time.time
     dcp_optimizer.time.time = lambda: stub.clock
@@ -129,9 +114,9 @@ class PhysoptDefaultFixpointTests(unittest.TestCase):
         s = run(_Stub(gains=[0.05, 0.05, 0.05]))
         self.assertEqual(s.n_physopt, 0, "OFF must not call Vivado at all")
 
-    # ---- the fir case it exists for --------------------------------------
+    # Diminishing gains walk the baseline until the fixpoint.
     def test_fir_shape_walks_the_baseline_and_stops_at_the_fixpoint(self):
-        # jul30's fir: -0.313 -> -0.249 -> -0.223 -> -0.218, then dry.
+        #'s fir: -0.313 -> -0.249 -> -0.223 -> -0.218, then dry.
         s = run(_Stub(gains=[0.064, 0.026, 0.005, 0.0]))
         self.assertEqual(s.n_physopt, 4)
         self.assertAlmostEqual(s.best_wns, -0.218, places=3)
@@ -177,8 +162,8 @@ class PhysoptDefaultFixpointTests(unittest.TestCase):
 
     # ---- the wall gate, BOTH directions ----------------------------------
     def test_big_design_is_blocked_before_the_first_call(self):
-        # ispd16 / boom: size model returns the 600s cap. 600*1.3=780 >
-        # 15% of 2900s = 435s.
+        # A 600 s estimate expands to 780 s, exceeding 15% of the
+        # 2,900 s remaining budget (435 s).
         s = run(_Stub(gains=[0.05] * 4, est_s=600.0, remaining=2900.0))
         self.assertEqual(s.n_physopt, 0,
                          "a 600s-estimate design must not spend even one call")
@@ -225,37 +210,34 @@ if __name__ == "__main__":
 
 
 class CallSiteIsPostLoopTests(unittest.TestCase):
-    """v2's whole fix is WHERE it is called. Pin that, or a refactor undoes it.
+    """Verify that the fixpoint stage is invoked after the main optimization loop.
 
-    v1 ran pre-loop and its own all-16 A/B killed it: on digit, from an identical
-    -1.025 start, ship default let the LLM's own phys_opt bank +0.204 (alpha
-    72.59) while v1's stage banked +0.110 first and the loop then found nothing
-    (alpha 59.65). The stage competes with the LLM rather than adding to it.
-    Post-loop there is no call left to pre-empt.
-
-    A behavioural test cannot see this — both placements produce identical stage
-    logs. The ordering is only visible in the source, so that is what is asserted.
+    Running it earlier can consume opportunities that the agent loop would
+    otherwise exploit. Stage logs do not reveal this ordering, so the test
+    inspects the call site directly.
     """
 
     def setUp(self):
-        self.src = (Path(__file__).resolve().parents[1] / "dcp_optimizer.py").read_text()
+        self.src = dcp_source_text()
 
     def test_called_exactly_once(self):
         self.assertEqual(self.src.count("await self._physopt_default_fixpoint()"), 1)
 
     def test_call_is_inside_the_loop_exit_tail_not_before_the_loop(self):
-        call = self.src.index("await self._physopt_default_fixpoint()")
-        tail = self.src.index("async def _exit_with_ils_polish")
-        loop = self.src.index("while self.iteration < max_iterations:")
-        self.assertGreater(call, tail,
-                           "the stage must be called from _exit_with_ils_polish")
-        self.assertLess(call, loop,
-                        "_exit_with_ils_polish is defined above the loop; if this "
-                        "fails the call has drifted out of the exit tail")
+        # Pinned to the holder rather than to a byte offset: the two methods no
+        # longer share a file, so "appears earlier in the text" stopped meaning
+        # anything. Asking which method contains the call is what was always meant.
+        import inspect
+        import dcp_optimizer as _d
+        call_str = "await self._physopt_default_fixpoint()"
+        self.assertIn(call_str, inspect.getsource(_d.DCPOptimizer._exit_with_ils_polish),
+                      "the stage must be called from _exit_with_ils_polish")
+        self.assertNotIn(call_str, inspect.getsource(_d.DCPOptimizer.optimize),
+                         "the call has drifted into the main loop")
 
     def test_it_runs_before_the_ILS_trigger_reads_best_wns(self):
-        # The gain must be visible to the ILS entry baseline, which is the whole
-        # mechanism by which fir converts -0.249 into -0.218.
+        # The fixpoint must run before the ILS trigger so its gain updates
+        # the entry baseline.
         call = self.src.index("await self._physopt_default_fixpoint()")
         trig = self.src.index("ILS-polish LOOP-EXIT trigger (generalizable)")
         self.assertLess(call, trig,

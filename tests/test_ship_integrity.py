@@ -1,4 +1,4 @@
-"""C1-T5 corrupt_output fault class — checksum-verified shipping (2026-07-21).
+"""corrupt_output fault class — checksum-verified shipping.
 
 Farm matrix finding (2/2 designs, verify_cell G4): the T5 harness injected
 1081344B of garbage at the multi-restart ATTEMPT path mid-run, then SIGTERMed
@@ -36,6 +36,7 @@ from scripts.multi_restart_optimize import (
     _plausible_dcp,
     _read_shipped_manifest,
 )
+from tests.source_corpus import dcp_source_lines, dcp_source_text
 
 # Exact byte pattern + size the T5 matrix injects (runner.sh corrupt_output).
 T5_GARBAGE = b"T5_GARBAGE_DCP__NOT_A_CHECKPOINT\n" * 32768
@@ -253,11 +254,11 @@ class TestEmergencyPublishChecksumTruth:
 # ------------------------------------------- agent-side lifecycle pinning --
 
 def _src() -> str:
-    return Path(dopt.__file__).read_text()
+    return dcp_source_text()
 
 
 class TestAgentLifecycleSourcePins:
-    """Source pins in the style of test_review_jul20_whole_file_fixes.py —
+    """Source pins in the style of test_whole_file_review_fixes.py —
     the emergency handler is a closure inside main() and cannot be imported;
     these pin the decision wiring the behavioral tests above rely on."""
 
@@ -284,7 +285,7 @@ class TestAgentLifecycleSourcePins:
     def test_regression_pin_prefinalize_injection_still_covered(self):
         # Injection BEFORE finalize: _finalize_completed is False, so
         # need_dcp must remain True regardless of the on-disk file — the
-        # jul20 S5 gate.  (The T5 pre-finalize cells passed via this.)
+        # S5 gate.  (The T5 pre-finalize cells passed via this.)
         assert "or not finalize_done" in _src()
 
     def test_mirror_size_recorded_and_checked(self):

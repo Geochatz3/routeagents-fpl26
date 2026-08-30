@@ -93,9 +93,11 @@ class RecipeGateTests(unittest.TestCase):
 
 
 class LutRecipeBasicTests(unittest.TestCase):
-    """recipe_lut_optimization has no per-design applicability gate (the
-    underlying optimize_lut_input_cone short-circuits cleanly on non-LUT
-    pins), so we just verify the call structure."""
+    """Verify the LUT optimization recipe's tool-call structure.
+
+    The recipe has no design-specific applicability gate because the underlying
+    input-cone optimization safely short-circuits for non-LUT pins.
+    """
     def _run(self, fake, args=None):
         return asyncio.run(_lut_method(fake, args or {}))
 

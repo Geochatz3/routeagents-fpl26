@@ -1,8 +1,8 @@
-"""Tests for RAG contest-mode — session 4 P5.
+"""Tests for RAG hidden-design hygiene.
 
-Pins the hard-rule hygiene contract:
-  - contest_mode=True must NOT inject DESIGN_NOTES
-  - contest_mode=True must NOT use exact-name retrieval as primary
+Pins the hygiene contract:
+  - retrieval never injects curated per-design notes (none exist)
+  - retrieval never uses the design name as a lookup key
   - feature-first retrieval (LUT count + spread) is the primary path
   - negative-memory advisory block appears when applicable
   - retrieval metadata is exposed for decision-tracer consumption
@@ -13,6 +13,7 @@ mocked DCPOptimizer (no MCP / no Vivado).
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -22,9 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from optimizer.strategy_memory import (
-    DESIGN_NOTES,
     RunRecord,
-    design_note_for,
     fingerprint_match,
     negative_memory_block,
     retrieval_metadata_for,
@@ -33,9 +32,11 @@ from optimizer.strategy_memory import (
 
 
 def _fake_memory():
-    """A small synthetic memory covering: exact-match for known
-    benchmark + a feature-similar untested record + a regressed
-    record."""
+    """Build synthetic memory with exact, similar, and regressed records.
+
+    The records cover an exact known-design match, a feature-similar unseen
+    design, and a regression.
+    """
     return [
         RunRecord(
             design="corescore_500_mod", candidate="v0_3",
@@ -75,37 +76,27 @@ class ContestModeRetrievalTests(unittest.TestCase):
     def tearDown(self):
         self._patch.stop()
 
-    def test_contest_mode_skips_design_notes(self):
-        """In contest mode the curated DESIGN_NOTES block must not
-        appear in the seed prompt, even for known benchmarks."""
-        # corescore_500_mod IS a key in DESIGN_NOTES — sanity check.
-        self.assertIn("corescore_500_mod", DESIGN_NOTES)
-        # Normal mode: the note IS injected (design recognized).
-        prompt_normal = seed_prompt_for(
-            "corescore_500_mod", lut_count=24_000,
-            critical_path_spread=42.0,
-            contest_mode=False,
-        )
-        self.assertIn("DESIGN-SPECIFIC NOTE", prompt_normal)
-        # Contest mode: the note is NOT injected.
-        prompt_contest = seed_prompt_for(
-            "corescore_500_mod", lut_count=24_000,
-            critical_path_spread=42.0,
-            contest_mode=True,
-        )
-        self.assertNotIn("DESIGN-SPECIFIC NOTE", prompt_contest)
+    def test_no_design_notes_in_any_mode(self):
+        """Curated per-design notes were removed from the tree; the
+        seed prompt must never contain one, in either mode."""
+        for contest_mode in (False, True):
+            prompt = seed_prompt_for(
+                "corescore_500_mod", lut_count=24_000,
+                critical_path_spread=42.0,
+                contest_mode=contest_mode,
+            )
+            self.assertNotIn("DESIGN-SPECIFIC NOTE", prompt)
 
-    def test_contest_mode_does_not_use_exact_name_primary(self):
-        """In contest mode the prompt must not echo the contest
-        design's own name as a retrieval key."""
-        prompt_contest = seed_prompt_for(
-            "corescore_500_mod", lut_count=24_000,
-            critical_path_spread=42.0,
-            contest_mode=True,
-        )
-        # The original design name passed in must NOT appear in
-        # the returned prompt under contest mode.
-        self.assertNotIn("corescore_500_mod", prompt_contest)
+    def test_never_uses_exact_name_as_key(self):
+        """The prompt must not echo the design's own name as a
+        retrieval key — in any mode."""
+        for contest_mode in (False, True):
+            prompt = seed_prompt_for(
+                "corescore_500_mod", lut_count=24_000,
+                critical_path_spread=42.0,
+                contest_mode=contest_mode,
+            )
+            self.assertNotIn("corescore_500_mod", prompt)
 
     def test_contest_mode_feature_first_works_with_fingerprint(self):
         """Even when design_name is None (truly hidden), the
@@ -120,7 +111,7 @@ class ContestModeRetrievalTests(unittest.TestCase):
 
     def test_contest_mode_empty_when_no_memory(self):
         """When memory is empty, contest mode returns empty string
-        (no fallback to design_note_for or other leaks)."""
+        (no fallback content of any kind)."""
         with mock.patch(
             "optimizer.strategy_memory.load_memory",
             return_value=[],
@@ -132,16 +123,16 @@ class ContestModeRetrievalTests(unittest.TestCase):
             )
             self.assertEqual(prompt, "")
 
-    def test_normal_mode_unchanged(self):
-        """Non-contest-mode path must remain bit-equivalent to the
-        prior session's behavior (DESIGN_NOTES injected when known)."""
-        prompt = seed_prompt_for(
-            "corescore_500_mod", lut_count=24_000,
-            critical_path_spread=42.0,
-            contest_mode=False,
-        )
-        # Both DESIGN_NOTES and exact-name retrieval should fire.
-        self.assertIn("DESIGN-SPECIFIC NOTE", prompt)
+    def test_normal_mode_is_also_feature_first(self):
+        """Non-contest mode uses the same fingerprint-only retrieval
+        as contest mode — the two paths return identical content."""
+        kwargs = dict(lut_count=24_000, critical_path_spread=42.0)
+        prompt_normal = seed_prompt_for(
+            "corescore_500_mod", contest_mode=False, **kwargs)
+        prompt_contest = seed_prompt_for(
+            "corescore_500_mod", contest_mode=True, **kwargs)
+        self.assertEqual(prompt_normal, prompt_contest)
+        self.assertIn("PRIOR-CAMPAIGN HISTORY", prompt_normal)
 
 
 class NegativeMemoryBlockTests(unittest.TestCase):
@@ -202,16 +193,16 @@ class RetrievalMetadataTests(unittest.TestCase):
     def tearDown(self):
         self._patch.stop()
 
-    def test_metadata_normal_mode_exact_name(self):
+    def test_metadata_normal_mode_feature_first(self):
         meta = retrieval_metadata_for(
             "corescore_500_mod", lut_count=24_000,
             critical_path_spread=42.0,
             contest_mode=False,
         )
         self.assertEqual(meta["rag_mode"], "normal")
-        self.assertEqual(meta["retrieval_mode"], "exact_name")
-        self.assertTrue(meta["exact_name_used"])
-        self.assertTrue(meta["design_notes_injected"])
+        self.assertEqual(meta["retrieval_mode"], "feature_first")
+        self.assertFalse(meta["exact_name_used"])
+        self.assertFalse(meta["design_notes_injected"])
         self.assertGreater(len(meta["retrieved_episode_ids"]), 0)
 
     def test_metadata_contest_mode_feature_first(self):
@@ -263,7 +254,7 @@ class RetrievalMetadataTests(unittest.TestCase):
 
 class OptimizerIntegrationTests(unittest.TestCase):
     """End-to-end: DCPOptimizer with contest_mode=True emits the right
-    trace event and does NOT see DESIGN_NOTES in its iter-1 prompt."""
+    trace event with feature-first retrieval metadata."""
 
     def test_optimize_contest_mode_emits_rag_retrieval_trace(self):
         # Late import to keep top-level import paths clean.
@@ -277,6 +268,18 @@ class OptimizerIntegrationTests(unittest.TestCase):
             baseline = run_dir / "baseline.dcp"
             baseline.write_bytes(b"DCP_FIXTURE")
             output = run_dir / "out.dcp"
+            # Finalization writes strategy memory during a real optimize call.
+            # Redirect it to the temporary directory to avoid modifying the
+            # checkout's persistent priors.
+            # addCleanup rather than TestCase.enterContext: the latter is
+            # Python 3.11+, and README.md promises 3.10. The CI matrix caught
+            # this on the day it started testing the stated floor.
+            _memory_env = mock.patch.dict(
+                os.environ,
+                {"STRATEGY_MEMORY_PATH": str(Path(tmp) / "strategy_memory.jsonl")},
+            )
+            _memory_env.start()
+            self.addCleanup(_memory_env.stop)
 
             opt = DCPOptimizer(api_key="test", run_dir=run_dir)
             opt.contest_mode = True

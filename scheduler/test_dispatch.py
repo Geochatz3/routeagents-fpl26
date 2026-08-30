@@ -117,7 +117,7 @@ class RecipeApplicabilityTests(unittest.TestCase):
 
     def test_no_op_designs_allowed(self):
         # The recipe's no-candidates short-circuit handles these cleanly,
-        # so we don't block them — they just return early.
+        # so they are not blocked — they just return early.
         for d in ("finn_radioml", "rosetta_optical-flow"):
             self.assertTrue(recipe_safe_for(d), f"{d} no_op should not be blocked")
 

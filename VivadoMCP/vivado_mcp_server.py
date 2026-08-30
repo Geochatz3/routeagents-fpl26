@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Portions of this file consist of AI-generated content.
-# SPDX-License-Identifier: Apache 2.0
+# SPDX-License-Identifier: Apache-2.0
 
 """
 MCP Server for Vivado - manages Vivado via pexpect for stdin/stdout control.
@@ -48,10 +48,8 @@ _design_open: bool = False
 _command_pending: bool = False  # True if a command timed out and may still be running
 
 
-# =============================================================================
-# ENV-COMPAT PATCH (beta-mimic-anchor; see ../ENV_COMPAT_PATCHES.md)
-# =============================================================================
-# Upstream uses pexpect+PTY to drive Vivado.  On WSL2 the PTY backend hangs
+# ENVIRONMENT COMPATIBILITY PATCH.
+# The upstream driver uses pexpect+PTY to drive Vivado.  On WSL2 the PTY backend hangs
 # during Vivado startup (Windows ConPTY issue).  This patch adds:
 #   * _VivadoSession    — subprocess.Popen + PIPE driver
 #   * _PexpectShim      — pexpect.spawn-API-compatible adapter (sendline,
@@ -60,7 +58,6 @@ _command_pending: bool = False  # True if a command timed out and may still be r
 # All other upstream code (tool implementations, exception handlers, etc.)
 # is UNCHANGED — the shim implements the pexpect surface those callers use.
 # Cherry-picked from local master HEAD; algorithm-equivalent.
-# -----------------------------------------------------------------------------
 
 import queue as _queue
 import re as _re
@@ -69,7 +66,7 @@ import threading as _threading
 import time as _time
 import uuid as _uuid
 
-# Detect runtime env (WSL2 vs native Linux).  See ENV_COMPAT_PATCHES.md.
+# Detect runtime env (WSL2 vs native Linux); see the patch note above.
 def _detect_wsl2() -> bool:
     try:
         with open('/proc/sys/kernel/osrelease') as _f:
@@ -81,9 +78,13 @@ def _detect_wsl2() -> bool:
 _IS_WSL2 = _detect_wsl2()
 
 if _IS_WSL2:
-    _VIVADO_BAT = r'D:\Xilinx\2025.1\Vivado\bin\vivado.bat'
+    # VIVADO_EXEC must point at the Windows vivado.bat (e.g.
+    # 'D:\\Xilinx\\2025.1\\Vivado\\bin\\vivado.bat'); FPL26_WSL2_WIN_CWD is a
+    # Windows-side working directory the wrapper cd's into (any /mnt/<drive>
+    # path the Windows binary can also see).
+    _VIVADO_BAT = os.environ.get('VIVADO_EXEC') or r'D:\Xilinx\2025.1\Vivado\bin\vivado.bat'
     _CMD_EXE = shutil.which('cmd.exe') or '/mnt/c/WINDOWS/system32/cmd.exe'
-    _WSL2_WIN_CWD = '/mnt/c/Users/Giorgos'
+    _WSL2_WIN_CWD = os.environ.get('FPL26_WSL2_WIN_CWD') or '/mnt/c/'
 else:
     _VIVADO_BAT = None
     _CMD_EXE = None
@@ -226,12 +227,31 @@ def _build_vivado_session(log_file=None, journal_file=None) -> _VivadoSession:
     """Spawn Vivado via subprocess PIPE.  Branch on env: WSL2 uses
     cmd.exe -> vivado.bat; Linux uses vivado directly from PATH."""
     if _IS_WSL2:
-        args = [_CMD_EXE, '/c', _VIVADO_BAT, '-mode', 'tcl']
-        if log_file:
-            args.extend(['-log', _to_windows_path(log_file)])
-        if journal_file:
-            args.extend(['-journal', _to_windows_path(journal_file)])
-        cwd_for_subprocess = _WSL2_WIN_CWD
+        # ENV-COMPAT FIX (WSL2 only): VIVADO_EXEC usually names a Linux-side
+        # wrapper script (or bare 'vivado' on PATH), NOT the Windows
+        # vivado.bat.  Handing that to cmd.exe dies instantly ("'vivado' is
+        # not recognized"), the boot probe sees EOF in <100 ms, and every
+        # tool call respawns and fails.  If VIVADO_EXEC resolves to an
+        # executable Linux file, spawn it DIRECTLY over the pipe — the
+        # wrapper handles cmd.exe -> vivado.bat and /mnt path translation
+        # itself.  Only a genuine Windows .bat/.exe path keeps the cmd.exe
+        # route below.  Linux-native (non-WSL2) behavior is untouched.
+        _exec_name = os.environ.get('VIVADO_EXEC') or 'vivado'
+        _linux_exec = shutil.which(_exec_name)
+        if _linux_exec and not _linux_exec.lower().endswith(('.bat', '.exe')):
+            args = [_linux_exec, '-mode', 'tcl']
+            if log_file:
+                args.extend(['-log', log_file])
+            if journal_file:
+                args.extend(['-journal', journal_file])
+            cwd_for_subprocess = None
+        else:
+            args = [_CMD_EXE, '/c', _VIVADO_BAT, '-mode', 'tcl']
+            if log_file:
+                args.extend(['-log', _to_windows_path(log_file)])
+            if journal_file:
+                args.extend(['-journal', _to_windows_path(journal_file)])
+            cwd_for_subprocess = _WSL2_WIN_CWD
     else:
         vivado_path = os.environ.get('VIVADO_EXEC') or shutil.which('vivado') or 'vivado'
         args = [vivado_path, '-mode', 'tcl']
@@ -243,32 +263,30 @@ def _build_vivado_session(log_file=None, journal_file=None) -> _VivadoSession:
     env = os.environ.copy()
     env.pop('DISPLAY', None)
     env['TERM'] = 'dumb'
-    # ---- ENGINE-LEAK FIX (jul28). start_new_session is what makes killpg SAFE. ----
+    # ---- Engine-leak fix.  start_new_session is what makes killpg safe. ----
     #
-    # Spawn chain is  MCP -> bash bin/vivado (wrapper) -> bash bin/loader -> vivado.
-    # `_vivado_pid` is the WRAPPER, so cleanup_vivado()'s SIGKILL kills a shell that
-    # cannot propagate it; loader+engine reparent to init and idle at 0 CPU holding full
-    # RSS. Measured jul28: box1 reached 11 engines / ~19 GB of dead RSS, and the orphans
-    # SURVIVE their MCP's exit, so the leak accumulates rather than being bounded per
-    # design. The eval runs one design for ~1h on a 31 GB swapless box and jul27 held
-    # 21.8 GB on the SMALLEST design — an OOM there is a 0 for that benchmark.
+    # The spawn chain is: this server -> wrapper shell -> loader shell ->
+    # Vivado.  The tracked pid is the WRAPPER, so a plain kill sends the signal
+    # to a shell that cannot propagate it; the loader and the engine reparent
+    # to init and idle at zero CPU while holding their full resident memory.
+    # Those orphans survive this server's exit, so the leak accumulates across
+    # designs rather than being bounded per design — and on a swapless
+    # evaluation box, an out-of-memory kill costs the whole benchmark.
     #
-    # WHY A GROUP KILL IS CORRECT HERE AND WAS WRONG BEFORE. The jul28 handoff warns
-    # "never kill by pgid — the leaked engines share the LIVE run's pgid". That is true
-    # TODAY, because everything inherits one group. start_new_session=True gives THIS
-    # Vivado subtree its own session and process group, so the group holds the wrapper,
-    # the loader and the engine and NOTHING else. Killing it cannot reach our own
-    # process, the driver, or a concurrent run.
+    # Why a group kill is correct here.  The usual objection is that leaked
+    # engines share the live run's process group, which is true only while
+    # everything inherits one group.  start_new_session=True gives this Vivado
+    # subtree its own session and process group, containing the wrapper, the
+    # loader and the engine and nothing else, so killing that group cannot
+    # reach this server, the driver, or a concurrent run.
     #
-    # DEFAULT ON (jul29): validated on box1 — a full vexriscv_v2 run banked normally with
-    # the subtree confirmed in its own session/pgroup (wrapper 341 -> loader 361 -> engine
-    # 432, all pgid 341, distinct from the MCP group) and ORPHANS=0 afterwards. Disable
-    # with FPL26_VIVADO_LEAK_FIX=0, which restores the byte-identical previous spawn.
+    # Default on; FPL26_VIVADO_LEAK_FIX=0 restores the previous spawn exactly.
     #
-    # This MUST stay coupled to the identical read in cleanup_vivado(): if the spawn were
-    # off while the cleanup were on, killpg would target OUR OWN process group and take
-    # the driver and any concurrent run with it. Both sites read the same variable with
-    # the same default precisely so they cannot disagree.
+    # This must stay coupled to the identical read in cleanup_vivado(): with
+    # the spawn off and the cleanup on, killpg would target this process's own
+    # group and take the driver and any concurrent run with it.  Both sites
+    # read the same variable with the same default precisely so they cannot
+    # disagree.
     _leak_fix = os.environ.get(
         "FPL26_VIVADO_LEAK_FIX", "1").strip().lower() in ("1", "true", "on", "yes")
     proc = _subprocess.Popen(
@@ -285,17 +303,15 @@ def _build_vivado_session(log_file=None, journal_file=None) -> _VivadoSession:
                     f"(pid={proc.pid}); cleanup will killpg that group only.")
     session = _VivadoSession(proc)
     # Boot probe — wait for the Tcl interpreter to accept stdin.  On a fresh
-    # AWS instance the first-ever Vivado launch can take >120s (cold disk
-    # cache + JIT); a too-short probe crashes the whole run -> alpha 0.0 ->
-    # ~0 score for that benchmark.  Generous default is pure insurance: the
-    # probe returns the instant the sentinel appears, so a warm boot is
-    # unaffected.  Override with VIVADO_BOOT_TIMEOUT (seconds).
+    # cloud instance the first Vivado launch can take several minutes from a
+    # cold disk cache, and a probe that gives up first fails the whole run.
+    # The generous default is pure insurance: the probe returns the instant
+    # the sentinel appears, so a warm boot is unaffected.  Override with
+    # VIVADO_BOOT_TIMEOUT, in seconds.
     _boot_timeout = float(os.environ.get("VIVADO_BOOT_TIMEOUT", "600"))
     session.send_command("puts {Vivado started}", timeout=_boot_timeout)
     return session
-# =============================================================================
 # END ENV-COMPAT PATCH
-# =============================================================================
 
 
 def get_vivado_path() -> str:
@@ -315,24 +331,16 @@ def get_vivado_path() -> str:
 
 
 def cleanup_vivado():
-    """Kill Vivado process if running. Called on exit.
+    """Terminate the Vivado subprocess tree during exit cleanup.
 
-    ENGINE-LEAK FIX (jul28): kill the process GROUP, not just `_vivado_pid`.
-
-    `_vivado_pid` is the bin/vivado WRAPPER SHELL. SIGKILLing it kills a shell that
-    cannot forward the signal, so bin/loader and the real engine reparent to init and
-    idle at 0 CPU holding 4-6 GB each. They also never see EOF, because our stdin pipe
-    stays open. Both halves are fixed here: close stdin, then killpg.
-
-    This is only SAFE because _build_vivado_session now spawns with
-    start_new_session=True, so the group contains this Vivado subtree and nothing else.
-    With the kill switch off (FPL26_VIVADO_LEAK_FIX=0) the spawn has no separate group,
-    so we deliberately fall back to the single-PID kill rather than killpg OUR OWN group
-    — killing our process group would take the driver and any concurrent run with it,
-    which is exactly the mistake the jul28 handoff warns about.
+    Close stdin before signaling the process group so descendants receive EOF
+    and cannot remain orphaned. Group termination is safe only when the process
+    was started in a new session. If FPL26_VIVADO_LEAK_FIX is disabled,
+    terminate only the recorded PID to avoid signaling the caller's process
+    group.
     """
     global _vivado_process, _vivado_pid
-    # DEFAULT ON (jul29, validated). Same variable and same default as the spawn site in
+    # DEFAULT ON (validated). Same variable and same default as the spawn site in
     # _build_vivado_session — they must never disagree, see the note there.
     _leak_fix = os.environ.get(
         "FPL26_VIVADO_LEAK_FIX", "1").strip().lower() in ("1", "true", "on", "yes")
@@ -352,8 +360,9 @@ def cleanup_vivado():
         if _leak_fix:
             try:
                 _pgid = os.getpgid(_vivado_pid)
-                # Refuse to group-kill if it somehow IS our own group — that would take
-                # the driver down with it. Belt and braces; start_new_session prevents it.
+                # Refuse to group-kill if it somehow IS this server's own group
+                # — that would take the driver down with it. Belt and braces;
+                # start_new_session prevents it.
                 if _pgid != os.getpgrp():
                     os.killpg(_pgid, signal.SIGKILL)
                     killed_group = True
@@ -392,10 +401,10 @@ signal.signal(signal.SIGINT, signal_handler)
 
 def start_vivado(log_file: Optional[str] = None, journal_file: Optional[str] = None) -> pexpect.spawn:
     """Start Vivado in Tcl mode and wait for prompt.
-    
-    Args:
-        log_file: Path to Vivado log file (default: vivado.log in current directory)
-        journal_file: Path to Vivado journal file (default: vivado.jou in current directory)
+
+    Args: log_file: Path to Vivado log file (default: vivado.log in current
+    directory) journal_file: Path to Vivado journal file (default: vivado.jou
+    in current directory)
     """
     global _vivado_process, _vivado_pid
 
@@ -485,7 +494,7 @@ def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
     if _command_pending:
         sync_output = sync_after_timeout(proc)
         if sync_output:
-            # Previous command completed, we can continue
+            # Previous command completed; safe to continue
             pass
     
     # Use provided timeout or default
@@ -514,7 +523,7 @@ def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
         return output.strip()
     
     except pexpect.TIMEOUT:
-        # Mark that we have a pending command
+        # Mark a command as pending
         _command_pending = True
         logger.error(f"Command timed out after {effective_timeout}s: {cmd_log}")
         raise
@@ -556,7 +565,6 @@ def get_critical_high_fanout_nets(
     Net names are automatically resolved to their PARENT net names, which is
     required for RapidWright compatibility.
     """
-    import re
     from collections import defaultdict
     
     # Flush buffer before generating timing report
@@ -673,8 +681,9 @@ def get_critical_high_fanout_nets(
             parent_name = parent_result.strip()
             logger.info(f"[DEBUG] PARENT for '{net_name[-60:]}...': result='{parent_name}'")
             
-            # Validate the result - should not be empty, should contain '/' for hierarchical nets,
-            # and should not look like a Tcl command or error
+            # Validate the result - should not be empty, should contain '/' for
+            # hierarchical nets, and should not look like a Tcl command or
+            # error
             if (parent_name and 
                 parent_name != net_name and
                 '/' in parent_name and
@@ -764,7 +773,6 @@ def extract_critical_path_cells(
     Returns:
         JSON string with list of paths, or success message if output_file is specified
     """
-    import re
     import json
     
     pin_suffixes = ['/C', '/D', '/Q', '/O', '/CE', '/R', '/S', '/CLR', '/PRE',
@@ -855,7 +863,6 @@ def extract_critical_path_pins(
     Returns:
         JSON string with list of pin paths
     """
-    import re
     import json
 
     cmd = f"report_timing -return_string -max_paths {num_paths} -delay_type max -sort_by slack -nworst 1"
@@ -1035,15 +1042,14 @@ def report_utilization_for_pblock(timeout: float = 300.0) -> str:
 
 def validate_pblock_resources(pblock_name: str) -> Dict[str, Any]:
     """
-    Validate that a pblock has sufficient resources for the design primitives assigned to it.
-    
-    Returns:
-        Dictionary with validation results including:
-        - is_valid: True if resources are sufficient
-        - resource_checks: Dict of resource type -> {required, available, margin}
-        - errors: List of resource insufficiency errors
+    Validate that a pblock has sufficient resources for the design primitives
+    assigned to it.
+
+    Returns: Dictionary with validation results including:
+            - is_valid: True if resources are sufficient
+            - resource_checks: Dict of resource type -> {required, available, margin}
+            - errors: List of resource insufficiency errors
     """
-    import re
     
     # Get pblock properties
     pblock_info = run_tcl_command(f"report_property [get_pblocks {pblock_name}]", timeout=30.0)
@@ -1108,7 +1114,7 @@ def validate_pblock_resources(pblock_name: str) -> Dict[str, Any]:
     
     logger.info(f"DRC result length: {len(drc_result)} chars")
     
-    # Debug: show what we're checking
+    # Log what is being checked
     utlz1_found = "UTLZ-1" in drc_result
     error_found = "Error" in drc_result
     logger.info(f"DRC content check: 'UTLZ-1' in result={utlz1_found}, 'Error' in result={error_found}")
@@ -1116,17 +1122,18 @@ def validate_pblock_resources(pblock_name: str) -> Dict[str, Any]:
         # Log first 600 chars to understand format
         logger.info(f"DRC result preview: {drc_result[:600]}")
     
-    # First, simple check: if UTLZ-1 appears in the output, we have a hard error
+    # First, simple check: UTLZ-1 in the output means a hard error
     # The DRC summary table shows: "| UTLZ-1 | Error            |"
     # Also check for "UTLZ-1#" which indicates individual errors like "UTLZ-1#1 Error"
     has_utlz1_error = utlz1_found and error_found
     has_utlz2_warning = "UTLZ-2" in drc_result
     
-    # Log what we found
+    # Log what was found
     logger.info(f"DRC check: has_utlz1_error={has_utlz1_error}, has_utlz2_warning={has_utlz2_warning}")
     
-    # Look for UTLZ-1 errors (hard over-utilization)
-    # Format: "LUT6 over-utilized in Pblock ... requires 24377 of such cell types but only 6520 compatible"
+    # Look for UTLZ-1 errors (hard over-utilization) Format: "LUT6 over-
+    # utilized in Pblock ... requires 24377 of such cell types but only 6520
+    # compatible"
     utlz1_pattern = r"(\w+(?:\s+\w+)*?) over-utilized.*?requires (\d+) of such cell types but only (\d+) compatible"
     for match in re.finditer(utlz1_pattern, drc_result, re.IGNORECASE | re.DOTALL):
         resource_type = match.group(1).strip()
@@ -1141,8 +1148,9 @@ def validate_pblock_resources(pblock_name: str) -> Dict[str, Any]:
         errors.append(f"{resource_type}: requires {required}, only {available} available (shortage: {required - available})")
         logger.info(f"Found UTLZ-1 error: {resource_type} requires {required}, available {available}")
     
-    # Look for UTLZ-2 warnings (over-utilized but placer might handle)
-    # Format: "LUT as Logic over-utilized ... has 31370 LUT as Logic(s) assigned ... only 6520 ... available"
+    # Look for UTLZ-2 warnings (over-utilized but placer might handle) Format:
+    # "LUT as Logic over-utilized ... has 31370 LUT as Logic(s) assigned ...
+    # only 6520 ... available"
     utlz2_pattern = r"(\w+(?:\s+\w+)*?) over-utilized.*?has (\d+).*?only (\d+).*?available"
     for match in re.finditer(utlz2_pattern, drc_result, re.IGNORECASE | re.DOTALL):
         resource_type = match.group(1).strip()
@@ -1159,7 +1167,7 @@ def validate_pblock_resources(pblock_name: str) -> Dict[str, Any]:
             errors.append(f"{resource_type}: {assigned} assigned, only {available} available (may cause issues)")
             logger.info(f"Found UTLZ-2 warning: {resource_type} has {assigned}, available {available}")
     
-    # Fallback: if we detected UTLZ-1 errors but couldn't parse details, add generic error
+    # Fallback: UTLZ-1 detected but details unparsed — add a generic error
     if has_utlz1_error and not resource_issues:
         logger.warning("UTLZ-1 error detected but could not parse details")
         errors.append("UTLZ-1 error detected - pblock resources insufficient")
@@ -1184,11 +1192,10 @@ def validate_pblock_resources(pblock_name: str) -> Dict[str, Any]:
 def expand_pblock_range(ranges: str, expansion_factor: float = 1.5) -> str:
     """
     Expand a pblock range by the given factor.
-    
-    Parses SLICE_X#Y#:SLICE_X#Y# format and expands the range.
-    Area scales with the square of the linear factor, so expansion_factor=2.0 gives ~4x area.
+
+    Parses SLICE_X#Y#:SLICE_X#Y# format and expands the range. Area scales with
+    the square of the linear factor, so expansion_factor=2.0 gives ~4x area.
     """
-    import re
     
     expanded_parts = []
     
@@ -1243,19 +1250,17 @@ def create_and_apply_pblock(
 ) -> str:
     """
     Create a pblock and apply it to the design with resource validation.
-    
-    Args:
-        pblock_name: Name for the pblock (e.g., "pblock_tight")
-        ranges: Pblock range specification (e.g., "SLICE_X0Y0:SLICE_X100Y100" or 
-                "CLOCKREGION_X0Y0:CLOCKREGION_X2Y3")
-        apply_to: What to apply pblock to - "current_design" applies to all cells in the design,
-                 or provide a cell pattern (e.g., "design_1_wrapper_i/*")
-        is_soft: If False, sets IS_SOFT property to 0 (hard constraint)
-        validate_resources: If True, validate resources and auto-expand if needed
-        max_expansion_attempts: Maximum times to try expanding the pblock
-    
-    Returns:
-        Status message
+
+    Args: pblock_name: Name for the pblock (e.g., "pblock_tight") ranges:
+    Pblock range specification (e.g., "SLICE_X0Y0:SLICE_X100Y100" or
+    "CLOCKREGION_X0Y0:CLOCKREGION_X2Y3") apply_to: What to apply pblock to -
+    "current_design" applies to all cells in the design, or provide a cell
+    pattern (e.g., "design_1_wrapper_i/*") is_soft: If False, sets IS_SOFT
+    property to 0 (hard constraint) validate_resources: If True, validate
+    resources and auto-expand if needed max_expansion_attempts: Maximum times
+    to try expanding the pblock
+
+    Returns: Status message
     """
     result_lines = []
     current_ranges = ranges
@@ -1881,14 +1886,16 @@ async def call_tool(name: str, arguments: dict):
         
         elif name == "report_route_status":
             timeout = arguments.get("timeout", 300)
-            # Run a quick command first to flush any leftover output from previous commands
+            # Run a quick command first to flush any leftover output from
+            # previous commands
             run_tcl_command("puts {route_status_start}", timeout=5)
             output = run_tcl_command("report_route_status -return_string", timeout=timeout)
             return [TextContent(type="text", text=output)]
         
         elif name == "report_timing_summary":
             timeout = arguments.get("timeout", 300)
-            # Run a quick command first to flush any leftover output from previous commands
+            # Run a quick command first to flush any leftover output from
+            # previous commands
             run_tcl_command("puts {timing_summary_start}", timeout=5)
             output = run_tcl_command("report_timing_summary -return_string", timeout=timeout)
             return [TextContent(type="text", text=output)]

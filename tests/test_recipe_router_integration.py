@@ -44,7 +44,7 @@ class RouterIntegrationTests(unittest.TestCase):
         self.assertEqual(block, [])
 
     def test_boom_soc_phase1_state_triggers_r1_block(self):
-        # boom_soc fingerprint: huge failing set + extreme WNS.
+        # Extreme negative slack and a very large failing set select this path.
         self.opt.initial_wns = -19.16
         self.opt.clock_period = 1.666
         self.opt.initial_failing_endpoints = 217_988
@@ -62,7 +62,8 @@ class RouterIntegrationTests(unittest.TestCase):
         self.assertEqual(self.opt.recipe_router_plan.rule_id, "R1")
 
     def test_ispd16_phase1_state_triggers_r2_with_block(self):
-        # ispd16 fingerprint: high spread + large WNS + medium failing set.
+        # High path spread, large negative slack, and a medium failing set
+        # select this path.
         self.opt.initial_wns = -7.75
         self.opt.clock_period = 1.587
         self.opt.initial_failing_endpoints = 30_000
@@ -77,7 +78,7 @@ class RouterIntegrationTests(unittest.TestCase):
         self.assertIn("recipe_cell_replacement", text)
 
     def test_finn_phase1_state_triggers_r3_when_budget_allows(self):
-        # finn fingerprint requires ≥25 min wall budget for Class G.
+        # This moderate-WNS, medium-failing-set case requires at least 25 min for R3.
         self.opt.initial_wns = -1.91
         self.opt.clock_period = 1.628
         self.opt.initial_failing_endpoints = 30_000
@@ -89,7 +90,7 @@ class RouterIntegrationTests(unittest.TestCase):
         self.assertIn("Explore", text)
 
     def test_finn_phase1_state_does_not_trigger_r3_when_budget_tight(self):
-        # Same fingerprint as finn but only 20 min remain → R3 must not fire.
+        # With the same timing profile and only 20 min remaining, R3 stays disabled.
         self.opt.initial_wns = -1.91
         self.opt.clock_period = 1.628
         self.opt.initial_failing_endpoints = 30_000
@@ -103,7 +104,8 @@ class RouterIntegrationTests(unittest.TestCase):
         self.opt.initial_wns = -1.24
         self.opt.clock_period = 1.644
         self.opt.initial_failing_endpoints = 3_000
-        # Real corescore spread ≈ 232 (placement-limited) → R4 Explore path.
+        # An average critical-path distance of 232 indicates placement-limited timing
+        # and selects the R4 Explore path.
         self.opt.critical_path_spread_info = {"avg_distance": 232.0}
         self.opt._budget_deadline = time.time() + 30 * 60
         block = self.opt._build_recipe_router_block()

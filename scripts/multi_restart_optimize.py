@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Multi-restart, keep-best-valid orchestration wrapper.
+"""Run a stochastic optimizer repeatedly within one wall budget and retain the
+best valid artifact.
 
-The contest re-runs `make run_optimizer DCP=X` once per benchmark with a 1h
-wall budget and scores the best `<stem>_optimized*.dcp` left on disk. The
-agent is stochastic and often stops well before the budget, so we run the
-UNCHANGED agent multiple times within the budget and keep the best valid
-output. This converts an "unlucky single draw" into "best of N" without any
-change to dcp_optimizer.py.
-
-Pure decision logic lives in `select_best()` (unit-tested, no Vivado).
-The orchestration (`run`) shells out to `make run_optimizer_contest` per
-attempt, which already handles JAVA_HOME/Vivado env + contest-mode.
-
-Empirical motivation (2026-05-30 variance study): vexriscv_re-place draws
-0 or +113 across runs; finn_radioml draws 16 or ~53. Best-of-N reliably
-captures the high draw. See .planning/FIX_multi_restart.md.
+Each attempt invokes the existing optimizer target without changing its search
+behavior. Pure selection logic is isolated in `select_best`, while `run`
+manages subprocesses, budgets, and publication.
 """
 from __future__ import annotations
 
@@ -66,6 +56,21 @@ def _atomic_publish(src, dst) -> bool:
             print(f"[multi-restart] WARNING: publish failed entirely: {e2}",
                   flush=True)
             return False
+
+
+def _discard_scratch_dcp(path) -> None:
+    """Drop a /tmp staging DCP once it can no longer be published.
+
+    Attempt outputs and the polish staging file are 100-300MB each and live
+    in /tmp.  Nothing else removes them, so a 4-attempt run stranded ~1GB and
+    back-to-back benchmarks on one eval box accumulated until /tmp filled --
+    at which point _atomic_publish's temp copy is the first thing to fail.
+    Best-effort by construction: losing a scratch file must never take the
+    run down, so every failure is swallowed."""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 # Shared with the signal handler: the scored location and the in-flight
@@ -120,7 +125,7 @@ def _matches_manifest(cur, manifest) -> bool:
 
 def _plausible_dcp(cur) -> bool:
     """Cheap sanity gate: a Vivado DCP is a zip archive → 'PK' magic +
-    nonzero size.  Rejects the T5 random-garbage injection class even when
+    nonzero size.  Rejects the random-garbage injection class even when
     no manifest is available.  Never raises."""
     try:
         p = Path(cur)
@@ -135,33 +140,18 @@ def _plausible_dcp(cur) -> bool:
 def _emergency_publish(final_output, current_out,
                        wait_s: float = 20.0,
                        incumbent_tier=None) -> str:
-    """On a harness wall kill, make sure SOMETHING valid is scored.
+    """Publish a valid in-flight artifact when the harness terminates the wrapper.
 
-    The agent's own SIGTERM handler atomically finalizes its best/baseline
-    DCP to the attempt path in /tmp — but the scored location is only written
-    by this wrapper, so a kill during attempt 1 would otherwise ship nothing.
-    Never-worse rule: if the scored file already exists it is the best of all
-    completed attempts; leave it (the in-flight emergency copy may be a mere
-    baseline pass-through). ONE exception (aug08): an incumbent the wrapper
-    itself published at ship_tier 0 is alpha == 0 by construction, so a
-    manifest-VERIFIED in-flight artifact replaces it — see the inline note.
+    Preserve an existing scored artifact unless it is a wrapper-published
+    tier-zero fallback and the in-flight artifact is manifest-verified.
 
-    C1-T5 corrupt_output (2026-07-21, farm matrix G4 fail on 2/2 designs):
-    "the attempt file exists" is NOT proof the agent wrote it — the T5
-    harness injected garbage bytes at the attempt path mid-run, and this
-    function used to publish them instantly, WINNING THE RACE against the
-    agent's own EMERGENCY_BEST_VALID_COPY that was concurrently restoring
-    the attempt path (both processes receive the group SIGTERM together).
-    Checksum-truth discipline now:
+    Wait up to `wait_s` for the agent's shipment manifest and an attempt file
+    whose size and MD5 match it. This pair is the authoritative proof that
+    finalization produced the file.
 
-      1. Wait (up to ``wait_s``) for the agent's ``<cur>.shipped.json``
-         identity manifest AND an attempt file whose size+md5 match it —
-         that pair is written by the agent's finalize/emergency path and
-         is the only proof of authorship.  Publish verified bytes.
-      2. Deadline fallback (agent died before manifest, pre-manifest
-         agent): publish only if the bytes are a plausible DCP (zip 'PK'
-         magic).  NEVER publish implausible bytes — shipping injected
-         garbage is strictly worse than shipping nothing.
+    If no verified pair appears before the deadline, publish only bytes with
+    plausible DCP ZIP magic. Never publish an implausible file merely because
+    the attempt path exists.
     """
     if final_output is None:
         return "no_final_output"
@@ -169,13 +159,13 @@ def _emergency_publish(final_output, current_out,
     incumbent_is_tier0 = fo.exists() and incumbent_tier == 0
     if fo.exists() and not incumbent_is_tier0:
         return "kept_existing"
-    # aug08: a tier-0 incumbent is alpha == 0 BY CONSTRUCTION (the artifact
-    # IS the input), so a manifest-VERIFIED in-flight win must replace it —
-    # otherwise "attempt 1 shipped the fallback baseline, attempt 2 banked a
-    # real win, harness SIGTERM" forfeits the whole benchmark to the
-    # never-worse rule. Replacement demands the full authorship proof; the
-    # unverified 'PK' deadline fallback still never overwrites an incumbent
-    # (a valid baseline beats plausible-but-unproven bytes).
+    # A tier-0 incumbent scores nothing by construction — the artifact is the
+    # unmodified input — so a manifest-verified in-flight win must be allowed
+    # to replace it, or a harness kill at the wrong moment forfeits the whole
+    # benchmark to the never-worse rule.  Replacement demands the full
+    # authorship proof; the unverified deadline fallback still never
+    # overwrites an incumbent, since a valid baseline beats plausible but
+    # unproven bytes.
     if current_out is None:
         return "kept_existing_tier0" if incumbent_is_tier0 \
             else "nothing_to_publish"
@@ -229,24 +219,16 @@ def _install_signal_publisher() -> None:
 
 
 def ship_tier(status) -> int:
-    """Is this attempt's artifact KNOWN to be worth nothing?
+    """Classify whether an attempt artifact is known to have no optimization
+    value.
 
-    0 = known worthless — `VALID_FALLBACK_BASELINE*` (the shipped DCP IS the
-        input, alpha == 0 BY CONSTRUCTION), `NO_IMPROVEMENT`, `HARD_FAIL_*`;
-    1 = everything else — `VALID_OPTIMIZED*` AND unknown/unrecognised status.
+    Return tier 0 for baseline fallbacks, no-improvement outcomes, and hard
+    failures. Return tier 1 for optimized outcomes and unrecognized or missing
+    statuses.
 
-    ⚠️ UNKNOWN IS **NOT** DEMOTED, AND THAT IS THE WHOLE POINT (aug07 review,
-    F1). An earlier version of this ranked optimized(2) > unknown(1) >
-    fallback(0), which loses alpha on a REAL and reachable path: when the
-    harness kills an attempt before finalize, `_emergency_baseline_copy`
-    ships the best_valid mirror and writes `lifecycle_metadata.json` with
-    `"final_status": getattr(optimizer, "final_status", None)` -> **None**
-    (dcp_optimizer.py:19412), while ALSO writing a truthful token_usage.json
-    from the tracked best whenever the artifact really is that best
-    (:19467-19472). That attempt is a genuine win carrying `status=None`, and
-    demoting it hands the run to any completed VALID_OPTIMIZED at a LOWER
-    Fmax. Tier must therefore separate "known worthless" from everything
-    else, and nothing finer.
+    Unknown status remains tier 1 because emergency publication can preserve a
+    genuinely improved artifact before final lifecycle metadata is available.
+    The tier distinguishes only known-zero outcomes from all others.
     """
     s = str(status or "")
     if (s.startswith("VALID_FALLBACK") or s.startswith("NO_IMPROVEMENT")
@@ -256,75 +238,57 @@ def ship_tier(status) -> int:
 
 
 def select_best(attempts: list[dict]) -> Optional[dict]:
-    """Pick the best attempt.
+    """Select the best usable attempt while demoting artifacts known to be
+    fallbacks.
 
-    Each attempt dict: {i, fmax, status, output, exists(bool)}.
-    Rule: among attempts whose output DCP exists, drop the ones KNOWN to be
-    worth nothing (`ship_tier` 0) below everything else, and otherwise rank
-    exactly as before — highest `fmax`, then VALID_OPTIMIZED over anything
-    else, then the earliest attempt. Returns None if no attempt produced a
-    usable output.
+    Consider only attempts whose output exists. Rank by `ship_tier` first, then
+    highest tracked frequency, then recognized optimized status, and finally
+    earliest attempt. Return `None` when no usable output exists.
 
-    THE DEFECT THIS FIXES (aug07 carried-risk #1). `fmax` is read from the
-    attempt's `token_usage.json` summary — the best Fmax the agent ever
-    TRACKED — while `status` comes from a different file
-    (`lifecycle_metadata.json`) and describes what actually SHIPPED. A run
-    that tracks 200 MHz and then fails structural validation ships the
-    baseline unchanged (alpha == 0 by construction, the artifact IS the
-    input) while still reporting fmax=200, so the old fmax-first key handed
-    the run to a worthless artifact over a genuine VALID_OPTIMIZED at 100.
-
-    WHY THE KEY IS EXACTLY "old key with ONE leading term". Everything after
-    the tier is byte-identical to the pre-aug07 ordering, deliberately. The
-    only ranking change this makes is to push a POSITIVELY IDENTIFIED
-    zero-alpha artifact down — which cannot cost alpha, because the thing
-    demoted is worth zero by construction. Every richer ordering we tried
-    lost alpha somewhere (see `ship_tier`'s F1 note): an unknown status is
-    not evidence of a fallback, and `VALID_OPTIMIZED_NO_EDIF` is scoreable
-    (VERIFIED aug08: upstream-synced validate_dcps.py regenerates a fresh
-    EDIF sidecar via open_checkpoint + write_edif on any RapidWright
-    readability error, and distrusts submitted sidecars anyway), so neither
-    is re-ranked here.
+    Frequency and shipment status come from different records: a high tracked
+    frequency may accompany a shipped baseline after validation fails. Tiering
+    therefore precedes frequency. Unknown statuses remain eligible because they
+    do not prove fallback publication.
     """
     usable = [a for a in attempts if a.get("exists") and a.get("fmax") is not None]
     if not usable:
         return None
 
     def key(a):
-        # Tail is the pre-aug07 key, unchanged: (fmax, opt, -i).
+        # Tail is the previous key, unchanged: (fmax, opt, -i).
         opt = 1 if a.get("status") == "VALID_OPTIMIZED" else 0
         return (ship_tier(a.get("status")), a["fmax"], opt, -a["i"])
 
     return max(usable, key=key)
 
 
-# WS3a (jun10 regret analysis): high-spread (placement-limited) designs draw
-# bimodally (corescore-class 0/0/+85) — stopping on 2 agreeing draws forfeits
-# the heavy tail. Above this spread (R4's Explore band), require a 3rd attempt.
+# Placement-limited designs above the 100-tile spread threshold can have
+# bimodal outcomes, so the exploration band requires at least three attempts.
 HIGH_SPREAD_TILES = 100.0
 HIGH_SPREAD_MIN_ATTEMPTS = 3
-# TRUNCATION GATE (jul04 preview #8 record-run evidence): a new attempt whose
-# budget is well below what a completed full-stack attempt needed on THIS
-# design can only reach recipe-stage quality — keep-best discards it, yet its
-# wall still bills gamma. #8 logicnets: restart-2 got 1461s vs the ~2100s the
-# completed attempt needed, burned ~4.4 alpha-points of gamma for a discarded
-# recipe-stage -0.507 (score 94.1 -> ~97.5 without it). 0.75 still allows
-# attempts with a plausible shot (durations vary by draw / futility stops).
+# Truncation gate: a new attempt whose budget is well below what a completed
+# full-stack attempt needed on this design can only reach recipe-stage
+# quality, which keep-best then discards — while its wall is still charged
+# against the score.  This factor still admits attempts with a plausible
+# shot, since attempt durations vary with the draw and with where futility
+# stops them.
 TRUNCATION_FACTOR = 0.75
 
-# C1-T1 β circuit-breaker (jul20): hard CUMULATIVE LLM-spend ceiling across
-# attempts. The eval bills LLM cost per benchmark and ZEROES the design at
-# $1.00 cumulative (preview #15: grok-4.5 vexriscv_v2 "no_improvement" zero
-# at the cap); reh-1 (jul20, flags ON) fir hit cum $0.76. The pre-existing
-# --cost-cap 0.85 check was RETROSPECTIVE-only: at $0.84 spent it still
-# launched another attempt carrying a fresh $0.75 in-attempt allowance
-# (worst case ~$1.59). cost_gate() closes both holes: a predictive
-# pre-launch estimate AND a shrinking per-attempt budget (ceiling − spent)
-# handed to the agent via LLM_COST_BUDGET. Ceiling default 0.80 leaves
-# $0.20 margin under $1.00 for one-call overshoot (the agent's exit is
-# checked after each call lands). Kill switch: ceiling <= 0 (CLI
-# --cost-ceiling 0 / env FPL26_COST_CEILING=0 / make COST_CEILING=0).
+# Cumulative LLM-spend ceiling across attempts.  Cost is billed per
+# benchmark and a design that crosses the contest cap scores zero, so a
+# retrospective per-attempt check is not enough: at just under the cap it
+# will still launch another attempt carrying a fresh full allowance.
+# cost_gate() closes both holes with a predictive pre-launch estimate and a
+# shrinking per-attempt budget — the ceiling less what is already spent —
+# handed to the agent.  The default leaves margin under the cap for a single
+# call's overshoot, since the agent's exit is checked after each call lands.
+# Kill switch: set the ceiling to zero.
 COST_CEILING_DEFAULT = 0.80
+
+# Cumulative OpenRouter spend at which no further attempt is launched.
+# One definition: the function default and the CLI default were the same
+# literal in two places, which is how they drift.
+COST_CAP_DEFAULT = 0.85
 
 
 def cost_gate(attempts: list[dict], cost_so_far: float,
@@ -358,43 +322,35 @@ def cost_gate(attempts: list[dict], cost_so_far: float,
         if attempts:
             return False, 0.0, (f"remaining allowance ${allowance:.2f} < "
                                 f"$0.01")
-        # FIX 4 (S5, jul20 C1 review): never refuse the FIRST attempt
-        # outright — a sub-cent ceiling clamps the allowance UP to one
-        # minimal $0.01 LLM-lean attempt (one lean draw beats shipping
-        # nothing).  Attempts 2+ keep the strict floor: with an incumbent
-        # banked, an LLM-less redraw only burns wall keep-best discards.
+        # Never refuse the FIRST attempt outright: a sub-cent ceiling clamps
+        # the allowance up to one minimal attempt, because one lean draw beats
+        # shipping nothing.  Attempts 2 and later keep the strict floor — with
+        # an incumbent banked, a model-less redraw only burns wall that
+        # keep-best discards.
         allowance = 0.01
     return True, allowance, ""
 
 
-# ---------------------------------------------------------------------------
-# D4 FEATURE-AWARE RESTART SPLIT (04-01, --split-aware, DEFAULT OFF pending
-# the 04-02 A/B). Beta 2026-07-14 evidence: attempt 1 consumed nearly the
-# whole 3500s budget on 4/5 designs (fir ~2438s, optical ~2700s, vtr_v2
-# ~2924s, boom ~3214s), leaving 286-1062s < the 1200s attempt floor — so
-# attempt 2 NEVER fired and best-of-N variance protection silently degraded
-# to single-shot. Only amd_mini-isp (~1215s used) got a second draw.
-# Attempt-1 consumption scales monotonically with DCP FILE SIZE on the known
-# set, so the split key is os.stat().st_size (instant, zero Vivado cost —
-# cell count would need open_checkpoint INSIDE the agent, too late for a
-# pre-launch decision).
+# FEATURE-AWARE RESTART SPLIT (--split-aware, default off).  Attempt 1 can
+# consume nearly the whole budget, leaving less than the attempt floor, so
+# attempt 2 never fires and best-of-N variance protection silently degrades
+# to a single shot.  Attempt-1 consumption scales monotonically with
+# checkpoint file size, so the split key is os.stat().st_size: instant and
+# free, where a cell count would need a checkpoint open inside the agent —
+# far too late for a pre-launch decision.
 #
-# Size-class boundaries (bytes). The known benchmark set has a clean ~2.1x
-# cliff between corescore (66.4MB, largest "normal" design) and the
-# boom/ispd16 class (141-152MB); 70MB separates them with margin while any
-# threshold in [70MB, 130MB] would work. 20MB splits the fast-saturating
-# small designs (vexriscv 1.7/2.0MB .. digit 17.9MB) from the mediums
-# (optical 26.4 .. corescore 66.4MB).
+# Size-class boundaries, in bytes.  The thresholds sit in the gaps between
+# the observed size clusters, so they separate the classes with margin
+# rather than cutting through one.
 SMALL_MAX_BYTES = 20_000_000
 MEDIUM_MAX_BYTES = 70_000_000
-# Attempt-1 caps (seconds, eval scale). Conservative: ≈ observed productive
-# beta attempt-1 usage so a capped attempt 1 can still complete a full stack
-# while leaving the 1200s floor reachable for attempt 2. Small designs
-# saturate fast (mini-isp local BEST-EVER came at wall 1370s); mediums used
-# 2438-2924s in beta, 2400 ≈ that band's floor. Large (boom-class) is
-# UNCAPPED: route_design ALONE measured 2153.13s (AWS leg 2) — any cap
-# risks re-introducing the alpha=0 boom failure mode the D1 gate just fixed.
-# Exact tightening is 04-02 A/B territory; change ONLY these constants.
+# Attempt-1 caps in seconds at evaluation scale.  Conservative: about the
+# observed productive attempt-1 usage, so a capped attempt 1 can still
+# complete a full stack while leaving the floor reachable for attempt 2.
+# Small designs saturate quickly; mediums use most of the wall.  The largest
+# class is deliberately uncapped — a single route can take most of an hour
+# there, and any cap risks leaving such a design unrouted, which scores
+# nothing.
 ATTEMPT1_CAP_SMALL_S = 1800.0
 ATTEMPT1_CAP_MEDIUM_S = 2400.0
 
@@ -403,8 +359,8 @@ def classify_design(dcp_path: Path) -> str:
     """Pure pre-launch size classification: "small" | "medium" | "large".
 
     Keyed on DCP file size only (os.stat — no Vivado, no subprocess).
-    Fail-open (T-04-01): a missing/unreadable/malformed path returns
-    "large", i.e. today's uncapped single-shot behavior — mirrors the
+    Fail-open: a missing/unreadable/malformed path returns
+    "large", i.e. the uncapped single-shot behavior — mirrors the
     _input_cell_count fail-open in dcp_optimizer.py.
     """
     try:
@@ -420,41 +376,21 @@ def classify_design(dcp_path: Path) -> str:
 
 def attempt1_budget(total_wall: float, size_class: str,
                     attempt_floor: Optional[float] = None) -> float:
-    """Pure D4 split table: the wall slice attempt 1 may consume.
+    """Compute the wall-time budget available to the first optimization attempt.
 
-    small -> min(total_wall, ATTEMPT1_CAP_SMALL_S)
-    medium -> min(total_wall, ATTEMPT1_CAP_MEDIUM_S)
-    large (or any unknown class) -> total_wall (UNCAPPED, fail-open).
-    Never returns more than total_wall.
+    Small and medium designs use their configured caps; large or unknown
+    classes use the full wall budget. The result never exceeds the total wall
+    time.
 
-    ---- WHY attempt_floor IS AN INPUT (jul29) ----------------------------------
-    The whole point of capping attempt 1 is to leave room for a SECOND DRAW, and
-    attempt 2 must clear TWO independent gates, not one. With E = attempt 1's
-    elapsed and W = total_wall, remaining = W - E, both must hold:
+    When `attempt_floor` is provided, also cap the first attempt so the
+    remainder can satisfy both launch gates: `total_wall - elapsed >=
+    attempt_floor` and `total_wall - elapsed >= TRUNCATION_FACTOR * elapsed`.
+    This derives ceilings of `total_wall - attempt_floor` and `total_wall / (1
+    + TRUNCATION_FACTOR)`.
 
-        W - E >= attempt_floor            (the loop's floor, 1200 s)
-        W - E >= TRUNCATION_FACTOR * E    (should_skip_truncated, 0.75)
-
-    giving  E <= W - attempt_floor  AND  E <= W / (1 + TRUNCATION_FACTOR).
-    On the 3500 s eval wall that is min(2300, 2000) = **2000 s**. The MEDIUM cap
-    is 2400 s, so a medium design capped at 2400 fails BOTH gates and attempt 2
-    can never fire — on the contest wall `--split-aware` was a GUARANTEED NO-OP
-    for exactly the class it was written for, which includes rosetta_optical-flow.
-    The cap was doing the arithmetic of a wall it was not run on.
-
-    Rather than refit the constant, DERIVE the ceiling from the two gates that
-    invalidate it, so they cannot drift apart again. When attempt_floor is not
-    supplied the behaviour is unchanged, which keeps this a pure function for
-    callers that only want the table.
-
-    HONEST LIMIT: this is a NECESSARY condition computed from attempt 1's BUDGET.
-    Its actual elapsed can exceed that budget (finalize and publish happen after
-    the wall check), and the truncation gate compares against elapsed, so an
-    overrunning attempt 1 can still be refused a second draw. The cap now makes
-    attempt 2 reachable; it does not make it guaranteed.
-
-    (Unused on the ship path today: --split-aware is DEFAULT OFF. This is a knob
-    that could not do what it claimed, not a live regression.)
+    The derived cap is necessary but not sufficient because finalization may
+    make actual elapsed time exceed the budget. Without `attempt_floor`, only
+    the class table applies.
     """
     if size_class == "small":
         budget = min(total_wall, ATTEMPT1_CAP_SMALL_S)
@@ -501,26 +437,24 @@ def should_skip_truncated(attempts: list[dict], remaining: float,
 def should_stop_early(attempts: list[dict], eps: float = 1.0,
                       min_attempts: int = 2, min_confirmations: int = 2,
                       high_spread: bool = False) -> bool:
-    """Stop launching more attempts once a strong result is CONFIRMED.
+    """Stop launching attempts after a strong result receives sufficient
+    confirmation.
 
-    Returns True when there are >= min_confirmations VALID_OPTIMIZED attempts
-    whose fmax is within `eps` MHz of the best fmax seen, and at least
-    min_attempts have run. This keeps full variance protection (we don't stop
-    on a single lucky draw, and we never early-stop while the best is only a
-    fallback/baseline) while avoiding wasted cost/time on deterministic
-    winners (e.g. amd_mini-isp: 4/4 identical +100.7 -> stop after 2).
+    Return `True` only after at least `min_attempts` have run and at least
+    `min_confirmations` valid optimized attempts fall within `eps` MHz of the
+    best observed frequency. Baseline or fallback outcomes never establish
+    confirmation.
     """
     if high_spread:
         min_attempts = max(min_attempts, HIGH_SPREAD_MIN_ATTEMPTS)
     if len(attempts) < min_attempts:
         return False
-    # v5.4 fix: VALID_OPTIMIZED_NO_EDIF is the same scoreable artifact class
-    # (the eval validator regenerates the EDIF from the DCP; sidecars are
-    # distrusted) — the exact-match filter silently broke this stop on the
-    # design that is its own docstring example: v5.3 gate mini-ISP attempts
-    # 1/2 were bit-identical fmax but NO_EDIF (post-loop recipe pass mutates
-    # the session; the EDIF guard correctly refuses), so attempt 3 burned
-    # ~840s + $0.08 to re-derive the same number a third time.
+    # A result that shipped without a refreshed EDIF is the same scoreable
+    # artifact class: the validator regenerates the EDIF from the checkpoint
+    # and distrusts sidecars.  An exact-status match therefore breaks this
+    # stop exactly where it is needed most — on a design whose attempts are
+    # bit-identical but carry that status — and spends another attempt to
+    # re-derive the same number.
     opt = [a for a in attempts
            if a.get("status") in ("VALID_OPTIMIZED", "VALID_OPTIMIZED_NO_EDIF")
            and a.get("fmax") is not None]
@@ -549,15 +483,16 @@ def _read_run_spread(run_dir: Path) -> Optional[float]:
 
 
 def _read_run_metrics(run_dir: Path) -> dict:
-    """Read best_fmax_mhz + final_status + elapsed + LLM cost from a run dir.
+    """Read frequency, final status, elapsed time, and LLM cost from a run
+    directory.
 
-    Cost source order (FIX 1b, jul20 C1 review — C1/S7 breaker bypass):
-      1. token_usage.json (normal-exit summary, richest record);
-      2. cost_ledger.json (incremental crash-safe ledger, rewritten by the
-         agent after EVERY API call) when token_usage.json is missing or
-         unparseable — a crash after real spend must not read as $0.
-    cost stays None only when BOTH are unreadable; run() then charges the
-    predictive estimate (never a silent $0 for an LLM-budgeted attempt).
+    Prefer `token_usage.json` for cost because it contains the complete
+    normal-exit summary. If it is missing or unreadable, use the crash-safe
+    incremental `cost_ledger.json`.
+
+    Leave cost as `None` only when both sources are unreadable; the caller must
+    then charge its predictive estimate rather than treating the attempt as
+    free.
     """
     out = {"fmax": None, "status": None, "elapsed": None, "cost": None,
            "initial_fmax": None}
@@ -591,16 +526,14 @@ def _read_run_metrics(run_dir: Path) -> dict:
     return out
 
 
-# FIX 1b (jul20 C1 review): predictive per-attempt cost estimate, charged
-# when an attempt launched WITH an LLM budget leaves NO readable cost record
-# (no new run dir at all, or both token_usage.json and cost_ledger.json
-# unreadable).  Max of prior attempts' known costs, else this conservative
-# fixed prior — the TOP of the documented per-attempt band ("each attempt
-# ~$0.1-0.35", see the cost guard in run()).  With the agent's $0-seeded
-# incremental ledger (FIX 1a), benign no-LLM crashes leave an explicit $0
-# record and are charged $0 — the estimate only fires when spend is
-# genuinely unknowable, preserving the never-cross-the-ceiling guarantee
-# without bricking retries.
+# Predictive per-attempt cost estimate, charged when an attempt launched with
+# a model budget leaves no readable cost record at all.  Uses the maximum of
+# prior attempts' known costs, or this conservative prior — the top of the
+# documented per-attempt band.  Because the agent seeds its ledger at zero,
+# a benign crash with no model calls leaves an explicit zero record and is
+# charged nothing; the estimate only fires when spend is genuinely
+# unknowable, which preserves the never-cross-the-ceiling guarantee without
+# bricking retries.
 COST_ESTIMATE_FALLBACK_USD = 0.35
 
 
@@ -612,12 +545,12 @@ def _estimate_attempt_cost(attempts: list[dict]) -> float:
 
 
 def _wrapper_run_dir_base(repo: Path) -> Path:
-    """FIX 3 (S6): the SAME base dir the agent's _run_dir_base() will use.
+    """The SAME base dir the agent's _run_dir_base() will use.
 
     Replicates dcp_optimizer._run_dir_base(): FPL26_RUN_DIR_BASE wins when
     set (pre-existing bug: the agent honored it while the wrapper globbed
     the repo only, so attribution silently missed every run dir on local
-    ops boxes); otherwise the attempt's cwd — the make subprocess runs
+    ops machines); otherwise the attempt's cwd — the make subprocess runs
     with cwd=repo, so that is `repo`."""
     base = os.environ.get("FPL26_RUN_DIR_BASE", "").strip()
     if base:
@@ -631,7 +564,7 @@ def _wrapper_run_dir_base(repo: Path) -> Path:
 
 
 def _snapshot_run_dirs(base: Path) -> "set[str]":
-    """FIX 3: names of the run dirs that exist BEFORE an attempt launches."""
+    """Names of the run dirs that exist BEFORE an attempt launches."""
     try:
         return {p.name for p in base.glob("dcp_optimizer_run-*")}
     except Exception:
@@ -639,12 +572,12 @@ def _snapshot_run_dirs(base: Path) -> "set[str]":
 
 
 def _attribute_run_dir(base: Path, before: "set[str]") -> Optional[Path]:
-    """FIX 3 (S6/S8): snapshot-diff attribution — the newest run dir NOT in
+    """Snapshot-diff attribution — the newest run dir NOT in
     the pre-attempt snapshot.  Returns None when the attempt created no run
     dir (crashed pre-init, or only foreign/concurrent dirs exist): the
     caller must NOT fall back to the newest pre-existing dir — that is
-    exactly the S8 double-count/mis-attribution bug the repo-global mtime
-    glob had — and charges the predictive estimate instead (FIX 1b)."""
+    exactly the double-count/mis-attribution bug the repo-global mtime
+    glob had — and charges the predictive estimate instead."""
     try:
         new = [p for p in base.glob("dcp_optimizer_run-*")
                if p.name not in before]
@@ -655,31 +588,25 @@ def _attribute_run_dir(base: Path, before: "set[str]") -> Optional[Path]:
         return None
 
 
-# aug08 wedge guard: how long past its own wall budget an attempt may stay
-# alive before the wrapper intervenes. The agent finalizes at its internal
-# deadline (with reserve) and normally exits well inside its budget; elapsed
-# can legitimately overrun by a bounded teardown, so the grace is generous.
-# What this closes: a wedged attempt (e.g. MCP/Vivado teardown hanging in
-# exit_stack.aclose AFTER a successful finalize) used to block the unbounded
-# subprocess.run forever — silently converting best-of-N into best-of-1 and
-# leaving the scored location unwritten until the harness SIGTERM.
+# Wedge guard: how long past its own wall budget an attempt may stay alive
+# before the wrapper intervenes.  The agent finalizes at its internal
+# deadline and normally exits well inside its budget, but elapsed time can
+# legitimately overrun by a bounded teardown, so the grace is generous.
+# What this closes: an attempt wedged in teardown after a successful
+# finalize used to block an unbounded wait forever, silently turning
+# best-of-N into best-of-one and leaving the scored location unwritten.
 WEDGE_GRACE_S = 420.0
 
 
 def _pids_with_cmdline_token(token: str) -> list:
-    """PIDs (excluding our own) whose /proc cmdline contains `token`.
+    """Return process IDs whose command lines contain an attempt token, excluding
+    the current process.
 
-    `token` must be the BARE attempt path /tmp/mr_<stem>_<pid>_<i>.dcp —
-    NOT the `OUTPUT=<path>` form (aug08 review, refuted first fix): the
-    prefixed string exists only in make's argv; sh's cmdline renders it as
-    `_OUTPUT="/tmp/…` and the python agent's as `--output\\0/tmp/…`, so an
-    OUTPUT=-prefixed scan matches make alone and the agent survives. The
-    bare path appears contiguously inside one argv element at every level
-    of the lineage (make -> sh -> python), is PID+index-unique to one
-    attempt, and is absent from the wrapper's own argv (attempt paths are
-    constructed internally, never passed to the wrapper). Direct /proc
-    scan, no pgrep: a pattern-taking process tool matches itself (jul28
-    lesson); an explicit self-pid exclusion cannot.
+    The token must be the bare `/tmp/mr_<stem>_<pid>_<i>.dcp` path, not an
+    environment assignment. This path remains contiguous across the process
+    lineage, uniquely identifies an attempt, and is absent from the wrapper
+    command line. Direct `/proc` scanning avoids pattern-matching tools that
+    can match their own invocation.
     """
     me = os.getpid()
     out = []
@@ -700,16 +627,16 @@ def _run_attempt_process(cmd, repo, budget_s: float, attempt_i: int,
                          grace_s: float = WEDGE_GRACE_S) -> int:
     """Run one agent attempt, bounded at budget + grace.
 
-    Termination order matters, and the TARGET matters more (aug08 review
-    M1, verified empirically): `cmd` is a make invocation, and SIGTERM to
+    Termination order matters, and the TARGET matters more (verified
+    empirically): `cmd` is a make invocation, and SIGTERM to
     make kills make and its sh while the PYTHON GRANDCHILD SURVIVES —
     orphaned, still holding a 10-26 GB Vivado while the next attempt
-    launches on a 32 GB box. So the guard signals every process that
+    launches on a 32 GB machine. So the guard signals every process that
     carries this attempt's unique OUTPUT= token directly: the agent's
     SIGTERM handler runs its emergency finalize (artifacts + token_usage
     land on disk) and a wedged attempt degrades to "the design's normal
     result", not a loss. SIGKILL only if the SIGTERM path is itself wedged.
-    Deliberately NO process-group games (no start_new_session): the T5
+    Deliberately NO process-group games (no start_new_session): the eval
     harness delivers its group SIGTERM to wrapper AND agent together, and
     that design must keep working.
     """
@@ -737,11 +664,11 @@ def _run_attempt_process(cmd, repo, budget_s: float, attempt_i: int,
             rc = proc.wait(timeout=90.0)
         except subprocess.TimeoutExpired:
             pass
-        # make may be gone while the agent still finalizes — give the
-        # lineage a bounded window to finish writing before metrics are
-        # read, then hard-kill whatever remains. If make ITSELF wedged past
-        # the 90 s SIGTERM grace (rc None), skip the window: nothing in
-        # this lineage is finalizing sanely, straight to SIGKILL.
+        # The build tool may be gone while the agent is still finalizing — give
+        # the lineage a bounded window to finish writing before metrics are
+        # read, then hard-kill whatever remains.  If the build tool itself
+        # wedged past its own termination grace, skip the window: nothing in
+        # this lineage is finalizing sanely.
         deadline = time.monotonic() + (30.0 if rc is not None else 0.0)
         remaining = [p for p in (_pids_with_cmdline_token(token)
                                  if token else [])]
@@ -782,13 +709,13 @@ def _attempt_cmd(input_dcp: Path, out_i: Path, remaining: float,
                  ils_polish: bool, wall_handback: bool = False,
                  llm_cost_budget: Optional[float] = None) -> list[str]:
     """Build the per-attempt make invocation. ILS=1 turns on the in-agent
-    ILS-polish stage (AWS-validated 2026-06-10: converts leftover wall on
+    ILS-polish stage (AWS-validated: converts leftover wall on
     stuck/ceiling designs into gains; trigger gates keep it off when the
-    budget is tight or the recipe met timing). WALL_HANDBACK=1 (04-01 D3,
-    default off) turns on the agent's saturation early-exit so a saturated
+    budget is tight or the recipe met timing). WALL_HANDBACK=1
+    (default off) turns on the agent's saturation early-exit so a saturated
     attempt hands its unused wall back to this wrapper's next-loop
     `remaining` computation."""
-    cmd = ["make", "run_optimizer_contest",
+    cmd = ["make", "run_once",
            f"DCP={input_dcp}", f"OUTPUT={out_i}",
            f"MAX_WALL={int(remaining)}"]
     if ils_polish:
@@ -838,8 +765,8 @@ def polish_corrected_fmax(fmax_mhz: Optional[float],
 
 def winner_polish(final_output: Path, remaining: float, repo: Path,
                   report: Optional[dict] = None) -> bool:
-    """WS1c (jun10 wall audit: 723-940s stranded below the attempt floor per
-    run): spend stranded wall on one never-worse phys_opt pass over the shipped
+    """Wall-audit evidence: 723-940s stranded below the attempt floor per
+    run. Spend stranded wall on one never-worse phys_opt pass over the shipped
     winner. Replaces the scored file ONLY on the Tcl script's verified IMPROVED
     verdict (wns strictly better AND still fully routed); any failure/timeout
     leaves the existing winner untouched. Returns True iff polished."""
@@ -851,64 +778,70 @@ def winner_polish(final_output: Path, remaining: float, repo: Path,
               flush=True)
         return False
     tcl = repo / "scripts" / "winner_polish.tcl"
-    # The polish candidate must NOT live next to the scored file: a name like
-    # <stem>_optimized.polished.dcp MATCHES the eval's <stem>_optimized*.dcp
-    # glob, and polish runs at the very end of the wall — a harness kill mid
-    # write_checkpoint (not atomic) would leave a TRUNCATED mtime-newest file
-    # that gets scored and fails validation (zero). Stage in /tmp; only the
-    # gated atomic publish ever touches the scored location.
+    # The polish candidate must not live next to the scored file: a sibling
+    # name matches the evaluation glob, and polish runs at the very end of the
+    # wall, so a kill mid-checkpoint-write — the write is not atomic — would
+    # leave a truncated, newest-mtime file that gets scored and fails
+    # validation.  Stage elsewhere; only the gated atomic publish ever touches
+    # the scored location.
     polished = Path("/tmp") / f"mr_polish_{os.getpid()}.dcp"
-    print(f"[multi-restart] winner-polish: {remaining:.0f}s stranded -> "
-          f"phys_opt pass on {final_output.name}", flush=True)
     try:
-        budget = max(60.0, remaining - POLISH_RESERVE_S)
-        p = subprocess.run(
-            [vivado, "-mode", "batch", "-nolog", "-nojournal",
-             "-source", str(tcl), "-tclargs", str(final_output), str(polished),
-             "AggressiveExplore", "4", str(int(budget))],
-            cwd=str(repo), capture_output=True, text=True, timeout=budget)
-        out = (p.stdout or "") + (p.stderr or "")
-    except subprocess.TimeoutExpired:
-        print("[multi-restart] polish: timed out; keeping unpolished winner",
-              flush=True)
+        print(f"[multi-restart] winner-polish: {remaining:.0f}s stranded -> "
+              f"phys_opt pass on {final_output.name}", flush=True)
+        try:
+            budget = max(60.0, remaining - POLISH_RESERVE_S)
+            p = subprocess.run(
+                [vivado, "-mode", "batch", "-nolog", "-nojournal",
+                 "-source", str(tcl), "-tclargs", str(final_output), str(polished),
+                 "AggressiveExplore", "4", str(int(budget))],
+                cwd=str(repo), capture_output=True, text=True, timeout=budget)
+            out = (p.stdout or "") + (p.stderr or "")
+        except subprocess.TimeoutExpired:
+            print("[multi-restart] polish: timed out; keeping unpolished winner",
+                  flush=True)
+            return False
+        except Exception as e:
+            print(f"[multi-restart] polish: failed ({e}); keeping winner", flush=True)
+            return False
+        # Vivado in batch mode echoes every script line, prefixed, before
+        # executing it — and the polish script's usage text contains the verdict
+        # token itself, so a naive first-match grabs the echo and masks the real
+        # verdict.  Skip echo lines.
+        verdict = next((l for l in out.splitlines()
+                        if "POLISH_VERDICT=" in l
+                        and not l.lstrip().startswith("#")), "")
+        print(f"[multi-restart] polish: {verdict or 'no verdict emitted'}", flush=True)
+        if "POLISH_VERDICT=IMPROVED" in verdict and polished.exists():
+            _atomic_publish(polished, final_output)
+            print(f"[multi-restart] polish: scored output REPLACED with improved "
+                  f"DCP -> {final_output}", flush=True)
+            if report is not None:
+                m = re.search(r"delta=([0-9.eE+-]+)", verdict)
+                if m:
+                    try:
+                        report["delta_ns"] = float(m.group(1))
+                    except ValueError:
+                        pass
+            return True
         return False
-    except Exception as e:
-        print(f"[multi-restart] polish: failed ({e}); keeping winner", flush=True)
-        return False
-    # Vivado -mode batch ECHOES every script line prefixed with "# " before
-    # executing it — winner_polish.tcl's usage line contains the literal
-    # string POLISH_VERDICT=, so a naive first-match grabs the ECHO and masks
-    # the real verdict (found 2026-06-12: replacement had NEVER fired; a real
-    # IMPROVED was silently discarded). Skip echo lines.
-    verdict = next((l for l in out.splitlines()
-                    if "POLISH_VERDICT=" in l
-                    and not l.lstrip().startswith("#")), "")
-    print(f"[multi-restart] polish: {verdict or 'no verdict emitted'}", flush=True)
-    if "POLISH_VERDICT=IMPROVED" in verdict and polished.exists():
-        _atomic_publish(polished, final_output)
-        print(f"[multi-restart] polish: scored output REPLACED with improved "
-              f"DCP -> {final_output}", flush=True)
-        if report is not None:
-            m = re.search(r"delta=([0-9.eE+-]+)", verdict)
-            if m:
-                try:
-                    report["delta_ns"] = float(m.group(1))
-                except ValueError:
-                    pass
-        return True
-    return False
+    finally:
+        # The staging DCP is a 100-300MB copy source for the gated
+        # publish above and nothing else.  Left behind, one per run,
+        # back-to-back benchmarks on a single eval box fill /tmp until
+        # a later _atomic_publish cannot write its temp copy.
+        _discard_scratch_dcp(polished)
 
 
 def run(input_dcp: Path, final_output: Path, total_wall: float,
         attempt_floor: float, max_attempts: int, repo: Path,
-        cost_cap: float = 0.85, ils_polish: bool = False,
+        cost_cap: float = COST_CAP_DEFAULT, ils_polish: bool = False,
         polish: bool = True, spread_aware: bool = False,
         split_aware: bool = False, wall_handback: bool = False,
         cost_ceiling: Optional[float] = COST_CEILING_DEFAULT) -> dict:
     stem = input_dcp.stem
     attempts: list[dict] = []
     cost_so_far = 0.0
-    # FIX 3 (S8): run dirs whose cost has been accumulated — the same dir
+    # Run dirs whose cost has been accumulated — the same dir
     # must never be charged twice (crashed attempts used to re-attribute
     # and double-count the previous attempt's dir).
     charged_run_dirs: "set[str]" = set()
@@ -928,7 +861,7 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
         if _trunc:
             print(f"[multi-restart] stop: {_why} — a truncated attempt cannot "
                   f"beat the full-stack incumbent; exiting saves gamma "
-                  f"(jul04 record-run evidence)", flush=True)
+                  f"(measured record-run evidence)", flush=True)
             break
         # Cost guard: respect the eval's $1/benchmark hard cap. Stop launching
         # once spend would risk exceeding cost_cap (each attempt ~$0.1-0.35).
@@ -938,20 +871,19 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
             break
         # C1-T1 β circuit-breaker: predictive cumulative-ceiling gate. The
         # retrospective cap above launched attempt N at $0.84 spent with a
-        # fresh $0.75 in-attempt allowance — the #15 zeroing shape ($1.00
-        # cumulative zeroes the benchmark; reh-1 fir hit cum $0.76).
+        # fresh $0.75 in-attempt allowance — the observed zeroing shape
+        # ($1.00 cumulative zeroes the benchmark; a rehearsal hit cum $0.76).
         _launch, _allowance, _cost_why = cost_gate(attempts, cost_so_far,
                                                    cost_ceiling)
         if not _launch:
-            print(f"[multi-restart] stop (C1-T1 cost breaker): {_cost_why}; "
+            print(f"[multi-restart] stop (cost breaker): {_cost_why}; "
                   f"shipping banked best", flush=True)
             break
         i += 1
-        # D4 restart split (--split-aware, DEFAULT OFF): cap ONLY attempt 1's
-        # MAX_WALL by size class so a second draw can fire on small/medium
-        # designs. Attempts 2+ always get `remaining` unchanged, and the
-        # wrapper's own elapsed/remaining accounting is untouched — only the
-        # slice handed to the agent subprocess changes.
+        # Restart split (default off): cap only attempt 1's wall by size class,
+        # so a second draw can fire on small and medium designs.  Attempts 2
+        # and later get the remaining budget unchanged, and the wrapper's own
+        # accounting is untouched — only the slice handed to the agent changes.
         budget_i = remaining
         if split_aware and i == 1:
             _cls = classify_design(input_dcp)
@@ -961,7 +893,7 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
                 print(f"[multi-restart] split-aware: attempt 1 capped to "
                       f"{budget_i:.0f}s (size class {_cls}; D4 restart split)",
                       flush=True)
-        # PID-suffixed so two wrappers on the same box (parallel benchmarks
+        # PID-suffixed so two wrappers on the same machine (parallel benchmarks
         # sharing a stem, or a retried harness) can't clobber each other's
         # attempt outputs in /tmp.
         out_i = Path("/tmp") / f"mr_{stem}_{os.getpid()}_{i}.dcp"
@@ -971,11 +903,10 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
                            wall_handback=wall_handback,
                            llm_cost_budget=_allowance)
         _SIG_STATE["current_attempt_out"] = out_i
-        # FIX 3 (S6/S8): snapshot-diff run-dir attribution, in the SAME
-        # base dir the agent will write to (FPL26_RUN_DIR_BASE honored —
-        # the agent's _run_dir_base() does, the old repo-global mtime glob
-        # did not).  Only a dir CREATED by this attempt is attributed;
-        # no new dir -> None (never reuse the previous attempt's dir).
+        # Snapshot-diff run-dir attribution, in the same base directory the
+        # agent will write to, so an overridden base is honoured.  Only a
+        # directory created by this attempt is attributed; if none appeared,
+        # the result is None rather than the previous attempt's directory.
         _rd_base = _wrapper_run_dir_base(repo)
         _before = _snapshot_run_dirs(_rd_base)
         _run_attempt_process(cmd, repo, budget_i, i)
@@ -985,12 +916,16 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
                    "cost": None})
         attempt_cost = m.get("cost")
         cost_estimated = False
-        if attempt_cost is None and _allowance is not None:
-            # FIX 1b: an attempt launched WITH an LLM budget left no
-            # readable cost record (no new run dir, or both token_usage
-            # and cost_ledger unreadable) — charge the predictive
-            # estimate, never $0 (the silent-$0 path was the C1/S7
-            # breaker bypass: a crash after real spend reset the meter).
+        if attempt_cost is None:
+            # An attempt left no readable cost record — charge the predictive
+            # estimate rather than zero.  A silent zero here is a breaker
+            # bypass: a crash after real spend would reset the meter.  This
+            # must NOT be gated on the breaker being armed: `cost_so_far` is
+            # also the meter the retrospective cost_cap guard above reads, so
+            # gating it on `_allowance is not None` made `--cost-ceiling 0`
+            # (the documented ceiling kill switch) blind the independent
+            # $1.00/benchmark cap as well.  A genuinely free attempt still
+            # writes cost=0.0, which is not None and is charged nothing.
             attempt_cost = _estimate_attempt_cost(attempts)
             cost_estimated = True
             print(f"[multi-restart] attempt {i}: no readable cost record "
@@ -1006,15 +941,23 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
                 cost_so_far += attempt_cost
                 if _rd_key is not None:
                     charged_run_dirs.add(_rd_key)
-        if spread_aware and high_spread is None and rd is not None:
+        # Measured unconditionally: the B3-floor-exit's high-spread guard
+        # below is a safety check, not a lever, and gating the measurement on
+        # --spread-aware (which no ship target passes) left that guard reading
+        # None on every scored run.  --spread-aware still gates the only
+        # BEHAVIOUR this number drives, the early-stop floor.
+        if high_spread is None and rd is not None:
             _sp = _read_run_spread(rd)
             if _sp is not None:
                 high_spread = _sp >= HIGH_SPREAD_TILES
+                _floor = (HIGH_SPREAD_MIN_ATTEMPTS
+                          if (spread_aware and high_spread) else 2)
                 print(f"[multi-restart] spread={_sp:.1f} tiles -> "
                       f"high_spread={high_spread} (early-stop floor "
-                      f"{HIGH_SPREAD_MIN_ATTEMPTS if high_spread else 2})",
+                      f"{_floor}"
+                      f"{'' if spread_aware else '; --spread-aware off'})",
                       flush=True)
-        # rec carries the CHARGED cost (measured or FIX-1b estimate) so the
+        # rec carries the CHARGED cost (measured or predictive estimate) so the
         # cost_gate's max-prior predictive estimate stays conservative;
         # cost_estimated flags the difference for forensics.
         rec = {"i": i, "fmax": m["fmax"], "status": m["status"],
@@ -1040,32 +983,34 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
                 print(f"[multi-restart] refreshed scored output "
                       f"(attempt {best_so_far['i']}, fmax={best_so_far['fmax']})"
                       f" -> {final_output}", flush=True)
-        # B3-FLOOR-EXIT (v5.4, env FPL26_B3_FLOOR_EXIT, default off in code,
-        # armed by the Makefile like the other levers): the agent attests via
-        # a run-dir token that this attempt's shipped best IS the
-        # deterministic B3 recipe floor (stochastic tail <= 0.004 ns beyond
-        # it). A further attempt re-rolls only that stochastic tail — census:
-        # the v5.3 gate's attempts 2/3 and the cross-box redraw all
-        # reproduced attempt 1's fmax bit-identically while each billed
-        # ~840s of wall and ~$0.08 of LLM spend for zero alpha. So stop the
-        # attempt loop here and skip the winner polish (phys_opt from this
-        # floor measured NO_GAIN 5/5; polish-positive designs like digit are
-        # unreachable here — B3 never adopts outside the tiny-mid arm set).
+        # Prune superseded attempt DCPs as soon as a better one is banked, so
+        # peak /tmp use stays flat in the number of attempts.  Two files are
+        # never touched: the selected best (still the publish source on a
+        # later refresh) and _SIG_STATE's current_attempt_out, which the
+        # signal handler may verify and publish.
+        _keep = {best_so_far["output"] if best_so_far else None,
+                 str(_SIG_STATE.get("current_attempt_out") or "")}
+        for _a in attempts:
+            if _a["output"] not in _keep:
+                _discard_scratch_dcp(_a["output"])
+        # Floor-exit (default off in code, armed by the Makefile like the other
+        # levers): the agent attests, via a run-directory token, that this
+        # attempt's shipped best is the deterministic recipe floor, with only a
+        # sub-noise stochastic tail beyond it.  A further attempt would re-roll
+        # only that tail, reproducing the same Fmax while billing another
+        # attempt's wall and spend for no gain.  So stop the attempt loop here
+        # and skip the winner polish, which measures no-gain from this floor.
         _b3_exit_on = os.environ.get("FPL26_B3_FLOOR_EXIT", "0").strip(
             ).lower() in ("1", "true", "on", "yes")
-        # Review-1 (v5.4) MAJOR fix: the token attempt must also BE the run's
-        # best (within the same 1.0 MHz eps as should_stop_early). The token
-        # attests ATTEMPT-level determinism; without this check an on-floor
-        # attempt 2 could stop the loop and skip polish while attempt 1 sits
-        # in `attempts` as proof the design has stochastic upside beyond the
-        # floor. Unreachable on the knowns (mini-ISP's floor is its ceiling);
-        # this is hidden-design insurance.
-        # Review-2 (v5.4.1) hardenings: the token attempt must BE the selected
-        # best (best_so_far["i"] == i) — an eps-band comparison could stop the
-        # loop AND cancel winner-polish on a DIFFERENT attempt's artifact,
-        # which the floor attestation does not cover. And never break on a
-        # high-spread design (corescore-class needs its draws; inert on the
-        # ship path where --spread-aware is off, kept as defense-in-depth).
+        # The attesting attempt must also BE the run's selected best.  The
+        # token attests attempt-level determinism only, so without this check
+        # an on-floor later attempt could stop the loop and skip polish while
+        # an earlier attempt stands as proof that the design has stochastic
+        # upside beyond the floor.  Requiring identity with the selected best —
+        # not merely equality within an epsilon band — also prevents stopping
+        # the loop and cancelling polish on a different attempt's artifact,
+        # which the attestation does not cover.  High-spread designs never
+        # break here: they need their draws.
         if (_b3_exit_on and rd is not None
                 and (rd / "b3_floor_saturated.token").exists()
                 and str(m.get("status") or "").startswith("VALID_OPTIMIZED")
@@ -1080,25 +1025,25 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
                   f"a stochastic tail that measured <=0.004ns, and the "
                   f"wall/cost it bills is pure gamma/beta.", flush=True)
             break
-        if should_stop_early(attempts, high_spread=bool(high_spread)):
+        if should_stop_early(attempts,
+                             high_spread=bool(spread_aware and high_spread)):
             print(f"[multi-restart] stop: strong result confirmed by >=2 "
                   f"attempts after {i} runs", flush=True)
             break
 
     best = select_best(attempts)
-    # aug08 review M2: the loop is over — NOTHING is in flight anymore. If
-    # this stays set, a harness SIGTERM landing after winner-polish has
-    # replaced the scored file could manifest-verify the LAST ATTEMPT's
-    # artifact (e.g. a tier-0 fallback whose finalize wrote a manifest) and
-    # overwrite the polished winner via the tier-0 override. Clearing it
-    # makes the handler keep whatever is on disk from here on.
+    # The loop is over, so nothing is in flight any more.  Left set, a signal
+    # landing after the winner polish has replaced the scored file could
+    # verify the last attempt's artifact instead and overwrite the polished
+    # winner through the tier-0 override.  Clearing it makes the handler keep
+    # whatever is on disk from here on.
     _SIG_STATE["current_attempt_out"] = None
     if best is not None:
         if _atomic_publish(best["output"], final_output):
             _SIG_STATE["published_tier"] = ship_tier(best.get("status"))
         print(f"[multi-restart] BEST = attempt {best['i']} fmax={best['fmax']} "
               f"-> {final_output}", flush=True)
-        # FIRING RECORD for the aug07 tier fix: name the attempt the OLD
+        # FIRING RECORD for the tier fix: name the attempt the OLD
         # fmax-first key would have shipped whenever it differs. Additive line
         # (no existing label changes) so an A/B can count firings by grep.
         _usable = [a for a in attempts
@@ -1121,18 +1066,18 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
                   "its budget would be pure gamma.", flush=True)
         if polish and not skip_polish_b3:
             leftover = total_wall - (time.monotonic() - start)
-            # RESTATE THE SUMMARY WHEN THE POLISH MOVED THE ARTIFACT (jul29).
+            # Restate the summary when the polish moved the artifact.
             #
-            # winner_polish replaces the SCORED DCP after the agent has already
-            # printed its summary block, so on IMPROVED that block understates
-            # what shipped. No contest score is lost — the better DCP is what is
-            # scored — but every A/B parses that block, so six of the jul28/29
-            # corpus rows were read low, logicnets by 4.50 MHz, which is above
-            # the 3.5 MHz noise floor and turned a win into "the only loss".
+            # The winner polish replaces the scored checkpoint after the agent
+            # has already printed its summary, so on an improvement that
+            # summary understates what shipped.  No score is lost — the better
+            # checkpoint is what gets scored — but every downstream comparison
+            # parses that block, so the rows read low by more than the
+            # measurement noise floor, which is enough to invert a comparison.
             #
-            # Restate it here, with the SAME labels the harness and our drivers
-            # grep, so a `tail -1` picks the corrected values up automatically.
-            # This is print-only: nothing about the shipped artifact changes.
+            # Restate it here with the same labels the harness greps, so a
+            # tail of the log picks the corrected values up automatically.
+            # Print-only: nothing about the shipped artifact changes.
             _polish: dict = {}
             if winner_polish(final_output, leftover, repo, report=_polish):
                 _delta = _polish.get("delta_ns")
@@ -1172,17 +1117,26 @@ def run(input_dcp: Path, final_output: Path, total_wall: float,
     else:
         print("[multi-restart] WARNING: no usable attempt output", flush=True)
 
+    # The scored artifact is on disk and the polish has run, so no attempt's
+    # /tmp copy can be published again.  `attempts[].exists` keeps recording
+    # what each attempt PRODUCED; it was never a claim about /tmp afterwards.
+    if final_output.exists():
+        for _a in attempts:
+            _discard_scratch_dcp(_a["output"])
+
     summary = {"input": str(input_dcp), "final_output": str(final_output),
                "attempts": attempts, "chosen": best,
                "total_wall": total_wall,
-               # C1-T1 forensics: cumulative KNOWN spend + the active ceiling.
+               # Cost-breaker forensics: cumulative KNOWN spend + active ceiling.
                "llm_cost_total": round(cost_so_far, 4),
                "cost_ceiling": cost_ceiling,
-               # FIX 2: lets main()'s internal budgeted fallback size its
+               # Lets main()'s internal budgeted fallback size its
                # wall slice from what the attempt loop actually consumed.
                "wall_elapsed_s": round(time.monotonic() - start, 1)}
     try:
-        (repo / ".planning_baseline" / f"mr_summary_{stem}.json").write_text(
+        out_dir = repo / ".planning_baseline"
+        out_dir.mkdir(exist_ok=True)
+        (out_dir / f"mr_summary_{stem}.json").write_text(
             json.dumps(summary, indent=2))
     except Exception:
         pass
@@ -1194,21 +1148,12 @@ def _run_internal_fallback(input_dcp: Path, final_output: Path,
                            cost_ceiling: Optional[float],
                            cost_so_far: float, elapsed_s: float,
                            repo: Path) -> int:
-    """FIX 2 (S2, jul20 C1 review): budget-aware last-resort single run
-    INSIDE the wrapper.
+    """Run one budget-aware fallback attempt inside the wrapper.
 
-    The old Makefile `||` fallback launched dcp_optimizer.py with NO
-    --llm-cost-budget — a fresh default $0.75 allowance AFTER a wrapper
-    that may have stopped precisely because spend was already at the
-    ceiling (unbudgeted spend hole).  Run the final contest-mode attempt
-    HERE, where cost_so_far is known: LLM_COST_BUDGET =
-    max($0.01, ceiling − spent) — when the remainder is sub-cent we still
-    pass the minimal $0.01 (an LLM-lean attempt beats shipping nothing).
-    Breaker off (ceiling None/<=0) passes no budget (agent default), same
-    as the attempt loop.  Exit code: 0 iff a scored output exists
-    afterwards — so make's `||` stays a pure pre-Python safety net and the
-    wrapper still exits nonzero ONLY when even this fallback shipped
-    nothing.
+    The remaining LLM budget is the ceiling minus accumulated cost, with a
+    minimum of $0.01 required by the agent. A missing or nonpositive ceiling
+    omits the budget and uses the agent default. The return code is zero only
+    when a valid output exists after the attempt.
     """
     budget: Optional[float] = None
     if cost_ceiling is not None and cost_ceiling > 0:
@@ -1260,44 +1205,44 @@ def main(argv=None):
                          "validation). At the real 3500s budget this still "
                          "allows ~2-3 full attempts on early-stopping designs.")
     ap.add_argument("--max-attempts", type=int, default=4)
-    ap.add_argument("--cost-cap", type=float, default=0.85,
+    ap.add_argument("--cost-cap", type=float, default=COST_CAP_DEFAULT,
                     help="Stop launching attempts once cumulative OpenRouter "
                          "cost reaches this ($). Respects the eval's $1/"
                          "benchmark hard cap.")
     ap.add_argument("--cost-ceiling", type=float,
                     default=_default_cost_ceiling(),
-                    help="C1-T1 β circuit-breaker: hard CUMULATIVE LLM-spend "
+                    help="Beta circuit-breaker: hard CUMULATIVE LLM-spend "
                          "ceiling ($) across attempts, enforced BEFORE launch "
                          "with a predictive estimate (max prior attempt cost) "
                          "and passed down as a shrinking per-attempt budget "
                          "(ceiling − spent). Default 0.80 (the eval ZEROES a "
-                         "benchmark at $1.00 cumulative; preview #15). "
+                         "benchmark at $1.00 cumulative). "
                          "Env default: FPL26_COST_CEILING. Kill switch: 0.")
     ap.add_argument("--repo", type=Path,
                     default=Path(__file__).resolve().parent.parent)
     ap.add_argument("--ils-polish", action="store_true",
                     help="Pass ILS=1 to each attempt: enables the in-agent "
-                         "ILS ruin-and-recreate polish stage (AWS-validated "
-                         "2026-06-10: v2 +24.7, vtr +17.4, 3d +14.4 MHz; "
+                         "ILS ruin-and-recreate polish stage (AWS-validated: "
+                         "v2 +24.7, vtr +17.4, 3d +14.4 MHz; "
                          "never-worse).")
     ap.add_argument("--no-winner-polish", action="store_true",
                     help="Disable the never-worse phys_opt polish of the "
                          "winner on wall stranded below the attempt floor.")
     ap.add_argument("--spread-aware", action="store_true",
                     help="EXPERIMENTAL (default off, needs A/B): on high-spread "
-                         "designs (>=100 tiles, R4's Explore band) require a "
+                         "designs (>=100 tiles, the Explore band) require a "
                          "3rd attempt before early-stop — bimodal draws "
                          "(corescore-class 0/0/+85) defeat 2-confirmation "
                          "stopping.")
     ap.add_argument("--split-aware", action="store_true",
-                    help="EXPERIMENTAL (default off, needs A/B — 04-01 D4): "
+                    help="EXPERIMENTAL (default off, needs A/B): "
                          "cap attempt 1's MAX_WALL by DCP-size class (small "
                          "1800s / medium 2400s / boom-class uncapped) so a "
-                         "second draw can actually fire — beta 2026-07-14: "
+                         "second draw can actually fire — beta evidence: "
                          "attempt 2 never launched on 4/5 designs because "
                          "attempt 1 consumed ~the whole 3500s budget.")
     ap.add_argument("--wall-handback", action="store_true",
-                    help="EXPERIMENTAL (default off, needs A/B — 04-01 D3): "
+                    help="EXPERIMENTAL (default off, needs A/B): "
                          "pass WALL_HANDBACK=1 to each attempt so a "
                          "saturated agent (ILS no-improve stop / LASTMILE "
                          "reject / budget-kill, with a banked accept) "
@@ -1318,11 +1263,11 @@ def main(argv=None):
             cost_ceiling=a.cost_ceiling)
     if s["chosen"] is not None:
         return 0
-    # FIX 2 (S2): the wrapper — which knows cumulative spend — runs the
-    # last-resort contest-mode attempt itself with the REMAINING LLM
-    # budget.  Exit nonzero ONLY if even this produced no output (the
-    # Makefile `||` then fires as a pure pre-Python-crash safety net with
-    # a small fixed $0.10 budget).
+    # No-usable-output path: the wrapper, which knows the cumulative spend,
+    # runs the last-resort contest-mode attempt itself with the remaining
+    # budget.  Exit non-zero only if even that produced no output, at which
+    # point the Makefile's fallback fires as a pure pre-interpreter-crash
+    # safety net on a small fixed budget.
     return _run_internal_fallback(
         a.input_dcp, final_output, a.total_wall, a.ils_polish,
         a.cost_ceiling, float(s.get("llm_cost_total") or 0.0),

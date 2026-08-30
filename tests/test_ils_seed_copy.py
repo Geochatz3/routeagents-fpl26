@@ -1,30 +1,8 @@
-"""DEFECT (jul30 late): the ILS mutated the BANKED MIRROR in place.
+"""Tests that ILS seeds are detached from the banked best-valid checkpoint.
 
-`_ils_polish_body` starts with `recipe_best = self._best_valid_dcp` -- the banked
-best-valid mirror itself. On the DUAL-SEED (STUCK) path it then copied that to
-`ils_recipe_seed.dcp` and the ILS mutated the copy. On the SINGLE-SEED path --
-the common one -- it did NOT copy, so the ILS's accept path
-(`write_checkpoint -force {best_dcp_path}` in optimizer/ils_polish.py) rewrote
-`self._best_valid_dcp` itself.
-
-That breaks an invariant the EMERGENCY path depends on. `_best_valid_mirror_size`
-is stamped when the mirror is banked and re-stamped only AFTER the whole ILS
-stage, while the signal handler distrusts a mirror whose on-disk size no longer
-matches:
-
-    [LIFECYCLE] SHIP INTEGRITY FAIL: best_valid mirror size N != banked size M
-                                     -- distrusting mirror.
-
-so a SIGTERM between the first ILS accept and the end of the stage (~20-40 min on
-a 3500 s wall) makes the emergency path fall through to the BASELINE copy:
-alpha 0 on that design, with the ILS's gain sitting unused on disk. The exposure
-is CORRELATED with lateness, so it is worst exactly when an ILS cycle overruns.
-
-These tests drive the REAL `_ils_polish_body` (bound to a minimal stand-in that
-supplies only the seven attributes it touches before seeding) and stop it at the
-real `run_ils_polish` call site, capturing the seed path it was actually handed.
-They then simulate an accept by writing to that path and assert the banked mirror
-is byte-for-byte untouched.
+The banked mirror must remain byte-for-byte unchanged while ILS runs because
+emergency recovery validates it against its recorded size. Both seed paths
+therefore pass a writable copy to `run_ils_polish`.
 """
 from __future__ import annotations
 
@@ -60,10 +38,9 @@ class _Stub:
         self.target_clock = None
 
     def __getattr__(self, name):
-        # The seed decision -- the only thing under test -- is fully made by the
-        # time the body reaches anything else. Everything past that point is
-        # allowed to read as unset rather than being mocked into a shape that
-        # could silently steer the path we are asserting on.
+        # The seed decision completes before these stubs are reached.
+        # Later state remains unset so the fixture cannot influence the path
+        # under test.
         return None
 
     # Reserve plumbing the body calls after seeding; neutral values so the
@@ -147,7 +124,7 @@ class SeedCopyTests(unittest.TestCase):
             self.assertIsNotNone(seed, "body never reached run_ils_polish")
             self.assertEqual(
                 str(seed), str(mirror),
-                "kill switch did not restore the pre-jul30 in-place path")
+                "kill switch did not restore the earlier in-place path")
             Path(seed).write_bytes(ACCEPT_BYTES)
             self.assertNotEqual(
                 mirror.read_bytes(), MIRROR_BYTES,

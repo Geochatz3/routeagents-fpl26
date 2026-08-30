@@ -1,13 +1,7 @@
-"""FPL26_ILS_MEASURED_PRIORS — the combo cost priors, measured instead of estimated.
+"""Tests measured cost priors for ILS operation combinations.
 
-The anchor case is not a hypothetical: it is the jul30 preview eval's OWN log line
-
-    ExtraNetDelay_high unaffordable (est 1058s > 1000s remaining);
-                                     continuing normal rotation
-
-which cost optical 19.32 MHz (alpha +13.07 shipped vs +32.38 reproduced on the
-farm) by a 58-second margin. These tests pin THAT arithmetic, so a change to the
-prior, the margin, or the accessor fails in the eval's own terms.
+The affordability calculation, safety margin, and prior accessor are pinned so
+overstated costs do not reject combinations that fit the remaining budget.
 """
 import pytest
 
@@ -75,9 +69,11 @@ def test_armed_flips_the_eval_decision(monkeypatch):
 
 
 def test_armed_leaves_every_other_prior_untouched(monkeypatch):
-    """Deliberately surgical: only the two overstated entries move. In particular
-    the three the corpus shows UNDER-priced are NOT raised, because raising them
-    would cause more refusals — the failure mode this whole change is about."""
+    """Verify prior updates are limited to the two overstated entries.
+
+    All other priors remain unchanged; increasing underpriced entries would
+    create additional affordability refusals.
+    """
     monkeypatch.setenv("FPL26_ILS_MEASURED_PRIORS", "1")
     for pd in ("Explore", ip.LASTMILE_PD, ip.ROUTE_ONLY_PD, ip.PARTIAL_RUIN_PD,
                ip.ROUTE_REROLL_PD, ip.INCR_ROUTE_PD, "ExtraTimingOpt",
@@ -103,16 +99,17 @@ def test_measured_values_match_the_corpus_medians():
 
 
 def test_lastmile_is_deliberately_NOT_in_the_measured_table():
-    """wave23 priced it: on logicnets the cheaper LASTMILE prior made the combo
-    RUN (409s) and reject, costing ~0.36 points, while carrying none of the
-    benefit (optical's +19.31 trace contains no LASTMILE). A correct measurement
-    is not automatically a profitable change."""
+    """Verify `LASTMILE` is excluded from measured-prior overrides.
+
+    A more accurate cost estimate does not justify an override unless admitting
+    the operation is expected to improve the optimization result.
+    """
     assert ip.LASTMILE_PD not in ip.MEASURED_COMBO_COST_PRIOR
     assert ip.combo_cost_prior(ip.LASTMILE_PD) == 2.5
 
 
 def test_accessor_is_the_only_read_path():
-    """The jul30 half-deploy lesson applied to a constant: if an affordability
+    """The half-deploy lesson applied to a constant: if an affordability
     site reads the raw table it silently keeps the old behaviour when armed."""
     import inspect
     src = inspect.getsource(ip)

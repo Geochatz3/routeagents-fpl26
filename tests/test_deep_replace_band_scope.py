@@ -1,40 +1,10 @@
-"""How much of the corpus can the FIRST-stage band gate actually change?
+"""Verify the effective scope of the first-stage band gate.
 
-WHY THIS FILE EXISTS. On jul29 the band gate was armed, reverted, and re-armed,
-and the evidence cited on both sides was `rosetta_spam-filter`: six band-OFF runs
-averaging 23.9 with spread 18.4 against three band-ON runs averaging 15.4 with
-spread 1.03, presented as a mean-versus-variance trade.
-
-Those rows cannot speak to the band gate at all. The jul28 affordability override
-(276abd4) disarms `_band_first` whenever the stage's measured cost fits the wall
-left over the tail reserve, and on spam it always does — 114 s against an 846 s
-threshold. Every one of those runs, band ON and band OFF alike, logged the SAME
-first-stage decision:
-
-    deep-replace[first]: armed (UNBANDED: failing=6,786, |WNS|=0.69;
-                                place+route anchor 114sx1.3 + reserve 300s)
-
-with an empty BAND-GATED banner in both arms. The spread between the two clusters
-is run-to-run variance and code-version drift, not a gate effect.
-
-WHAT THIS PINS. Two numbers decide the gate's entire live scope on the ship path:
-
-    first-stage budget = wall x (1 - TAIL_RESERVE_WALL_CLAMP_FRAC) = 1100 s
-    anchor threshold   = budget / DEEP_REPLACE_COST_MARGIN          =  846 s
-
-An anchor at or below that threshold makes the gate a no-op, because the override
-fires before the band is consulted. Above it, the gate still only bites if the
-design MISSES the DEEP-extreme band. Measured anchors from every run banked on
-the parity boxes put exactly one design in that intersection: corescore, which is
-not a scored benchmark.
-
-`--split-aware` is DEFAULT OFF, so attempt 1 receives the full wall; attempts 2+
-get `remaining`, which lowers the threshold. That path is real but rare — attempt
-2 fired in 1 of 27 banked runs.
-
-If either constant moves, the gate's scope moves with it and this fails, which is
-the point: the question "should the band gate ship?" is worth re-opening only when
-these numbers change.
+The affordability override bypasses the band when the measured cost fits the
+wall time remaining after the tail reserve. Otherwise, the band may reject work
+outside its extreme-failure criteria. The threshold is pinned by the
+tail-reserve clamp and deep-replacement cost margin; split-aware retries use
+their remaining wall time.
 """
 from __future__ import annotations
 
@@ -55,15 +25,9 @@ from optimizer.recipe_router import (  # noqa: E402
 
 EVAL_WALL_S = 3500.0
 
-# (design, failing_endpoints, |WNS| ns, place+route cost anchor s).
-#
-# Rows marked MEASURED come from the `armed (UNBANDED: failing=..., |WNS|=...;
-# place+route anchor ...s...)` line in that design's banked agent.log. The one
-# marked PARTIAL is a design whose first stage was SKIPPED, so its gate line
-# carries no |WNS|: its failing count and anchor are from the jul28 affordability
-# table in dcp_optimizer.py and its |WNS| is NOT a measurement. The verdict does
-# not depend on it — corescore misses the band on failing count alone — but do
-# not quote that |WNS| as data.
+# Tuple fields are design, failing endpoints, |WNS| in ns, and place-and-route cost in s.
+# One fixture lacks a WNS sample and uses a placeholder; its verdict depends only
+# on the failing-endpoint count.
 CORPUS = [
     ("boom_soc_v2",       220_131, 11.39, 1650),   # MEASURED
     ("corescore_500_mod",  39_008,  1.44, 1099),   # PARTIAL — |WNS| not banked
@@ -74,7 +38,7 @@ CORPUS = [
     ("logicnets_jscl",      1_529,  0.98,  161),   # MEASURED
     ("rosetta_spam",        6_786,  0.69,  114),   # MEASURED
     ("fir_systolic",          252,  0.31,   54),   # MEASURED
-    ("amd_mini-isp",        4_887,  1.69,   37),   # MEASURED jul29 (shipdef_a)
+    ("amd_mini-isp",        4_887,  1.69,   37),   # MEASURED (shipdef_a)
     ("vexriscv_v2",         2_933,  0.95,   18),   # MEASURED
     ("vexriscv",            1_937,  1.65,   15),   # MEASURED
 ]
@@ -89,7 +53,7 @@ def _first_stage_budget(wall_s: float) -> float:
 
 
 def _override_fires(anchor_s: float, wall_s: float = EVAL_WALL_S) -> bool:
-    """The jul28 affordability override: a stage that fits the leftover budget."""
+    """The affordability override: a stage that fits the leftover budget."""
     return anchor_s * DEEP_REPLACE_COST_MARGIN <= _first_stage_budget(wall_s)
 
 
@@ -138,10 +102,10 @@ def test_band_gate_changes_nothing_outside_the_sensitive_set(name, failing, wns,
 
 
 def test_spam_cannot_inform_the_band_decision():
-    """The design all six jul29 band rows were measured on is a no-op case."""
+    """The design all six band rows were measured on is a no-op case."""
     assert _override_fires(114), (
         "spam's 114s anchor no longer clears the affordability override — the "
-        "jul29 spam rows would now be informative, which they were not")
+        "spam rows would now be informative, which they were not")
 
 
 def test_only_one_corpus_design_is_band_sensitive():

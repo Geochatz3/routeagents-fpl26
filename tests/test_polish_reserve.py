@@ -1,22 +1,12 @@
-"""C1-T3 post-route phys_opt polish reserve tests (U5 / mining #4).
+"""Test wall-clock reservation for pending post-route polish.
 
-Official beta, boom_soc_v2: the budget gate refused the final post-route
-phys_opt polish at estimated 600s > 443s remaining — polish opportunities
-arrive at the END of the wall, after speculative heavy ops have burned
-the window, so the gate (correctly, given its inputs) refuses every
-time.  The fix reserves the polish window in advance: while ARMED
-(routed banked best + polish stages pending + polish not disabled),
-speculative routed-state-DESTROYING dispatch must fit
-(remaining − reserve) while polish / finalize / banking keep the full
-remaining window.  The reserve RELEASES once the polish stages have run
-or been correctly skipped (and unconditionally at finalize).
-
-Layering: the reserve sits ON TOP of the 300s finalize reserve —
-_budget_deadline is already (start + max_wall − 300), so all arithmetic
-here operates inside the finalize-protected window.  Orthogonal to the
-C1-T1 cost ceiling (wall seconds vs LLM $; the gates never couple).
-
-Stub-driven: no Vivado/RapidWright/MCP — we mock the call surface.
+The reserve is armed after a routed best is banked while enabled polish stages
+remain pending. Speculative operations that destroy routed state must fit
+within the remaining time minus this reserve, while polishing, banking, and
+finalization retain the full remaining window. The reserve is released after
+polish runs or is correctly skipped, and always during finalization. All
+calculations occur inside the existing 300-second finalization reserve and
+remain independent of monetary cost limits.
 """
 from __future__ import annotations
 
@@ -168,7 +158,7 @@ class ArmingGuardTests(unittest.TestCase):
         self.opt._ils_polish_cfg = ILSPolishConfig(enabled=False)
         self.assertEqual(self.opt._polish_reserve_armed_s(), 0.0)
 
-    def test_unarmed_when_both_polish_stages_flag_disabled(self):
+    def test_unarmed_when_both_polish_ladder_flag_disabled(self):
         _arm(self.opt, self.tmp, remaining_s=2000.0)
         self.opt._ils_polish_cfg = ILSPolishConfig(
             enabled=True,
@@ -189,14 +179,13 @@ class ArmingGuardTests(unittest.TestCase):
 
 
 class BoomShapeReplayTests(unittest.TestCase):
-    """Replay the boom_soc_v2 official-beta refusal shape.
+    """Exercise a late-budget refusal scenario with and without polish
+    reservation.
 
-    WITHOUT the reserve: the speculative gamble runs, burns the tail to
-    443s, and the final phys_opt polish (est 600s) is refused — today's
-    behavior, pinned.  WITH the reserve armed earlier: the gamble that
-    would eat the polish window is refused instead (steering envelope,
-    run continues), and the state-preserving phys_opt polish stays
-    affordable against the FULL remaining window.
+    Without a reserve, a speculative operation may consume the time needed for
+    final polish. With the reserve armed, that operation is refused non-fatally
+    while state-preserving polish remains affordable against the full remaining
+    window.
     """
 
     def setUp(self):
@@ -224,10 +213,8 @@ class BoomShapeReplayTests(unittest.TestCase):
     def test_with_reserve_speculative_gamble_refused_polish_affordable(self):
         # Reserve armed earlier (banked best exists), 1050s remaining.
         _arm(self.opt, self.tmp, remaining_s=1050.0, reserve_s=500.0)
-        # 1) The speculative destroying gamble (place_design on a routed
-        #    design, est 600s) no longer fits the speculative window
-        #    (1050 - 500 = 550 < 600) -> refused with a steering
-        #    envelope, run NOT budget-killed.
+        # A destructive operation that exceeds the speculative window is
+        # refused before launch, preserving the polish reserve.
         payload = _async(self.opt.call_tool("vivado_place_design", {}))
         data = json.loads(payload)
         self.assertEqual(data["error"], "polish_reserve_refused")
@@ -260,7 +247,7 @@ class BoomShapeReplayTests(unittest.TestCase):
 
     def test_released_reserve_no_longer_blocks(self):
         _arm(self.opt, self.tmp, remaining_s=1050.0, reserve_s=500.0)
-        self.opt._release_polish_reserve("ils_polish_stages_reached")
+        self.opt._release_polish_reserve("ils_polish_ladder_reached")
         _async(self.opt.call_tool("vivado_place_design", {}))
         called = [name for name, _ in self.opt.vivado_session.calls]
         self.assertIn("place_design", called)
@@ -408,7 +395,7 @@ class IlsStageFencingTests(unittest.TestCase):
                                    cycles=1)
         return fake
 
-    def test_armed_ils_cycles_fenced_and_release_at_polish_stages(self):
+    def test_armed_ils_cycles_fenced_and_release_at_polish_ladder(self):
         # LASTMILE plausible (wns −0.5 ≥ −1.0 entry gate) -> reserve
         # holds through the ruin cycles.
         _async(self.opt._ils_polish_body(self._fake_run_ils_polish()))
@@ -416,12 +403,12 @@ class IlsStageFencingTests(unittest.TestCase):
         fenced = self.opt._budget_deadline - 500.0
         self.assertAlmostEqual(self.captured[0], fenced, delta=5.0)
         self.assertEqual(self.opt._polish_reserve_release_reason,
-                         "ils_polish_stages_reached")
+                         "ils_polish_ladder_reached")
 
     def test_polish_ineligible_design_releases_before_cycles(self):
         # boom-class: wns −2.5 fails the LASTMILE entry gate AND no
         # affordable fanout anchor -> reserve released up front, ruin
-        # cycles keep the FULL deadline (today's behavior, no stranding).
+        # cycles keep the FULL deadline (unreserved behavior, no stranding).
         self.opt.best_wns = -2.5
         self.opt._best_valid_dcp_wns = -2.5
         _async(self.opt._ils_polish_body(self._fake_run_ils_polish()))

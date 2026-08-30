@@ -1,39 +1,17 @@
 #!/usr/bin/env python3
-"""Compute the EFFECTIVE configuration a clean eval box produces.
+"""Compute the effective configuration produced by a clean evaluation invocation.
 
-The contest evaluator unpacks our archive onto a fresh instance and runs
-`make run_optimizer DCP=<bench>.dcp` with **no FPL26_* variables set**. So the
-only configuration that ever scores us is the one this module reports.
+Configuration composes Makefile environment injection with Python environment
+defaults. Values exported by `make run_optimizer` take precedence; Python
+defaults apply only when no value is exported, such as during direct execution.
 
-Why this exists — two failures, three days apart, both the same class:
-
-  * jul29: the uniform ILS stack (`PLACE_RETRY_LADDER`/`MEASURED_BASIS`/
-    `INCR_ROUTE`/`INCR_ROUTE_FIRST`) was default-OFF and not on the eval path
-    at all. A campaign's worth of measured gains would not have shipped.
-  * jul30: `FPL26_DEEP_REPLACE_UNBANDED` ships **ON** even though its own code
-    comment says "DEFAULT OFF ... Ships OFF until farm-validated, per house
-    rule" — because a *different layer* sets it.
-
-The root cause both times: the effective config is a **composition**, and no
-single file states it.
-
-    Makefile `run_optimizer` recipe injection     (wins — set before python starts)
-        overrides
-    python `os.environ.get("FPL26_X", "default")` (applies only when the Makefile
-                                                   is bypassed, e.g. running
-                                                   dcp_optimizer.py directly)
-
-Reading either layer alone gives a confidently wrong answer. `tests/
-test_ship_config.py` pins the composed result so drift fails the suite instead of
-waiting for someone to audit it.
-
-Two conventions that read backwards if you skim:
-  * `FPL26_NO_X` is a KILL SWITCH — unset means feature X is ENABLED.
-  * `$(if $(filter 1 true yes on,$(VAR)),--flag)` is a CLI opt-in — unset means
-    the flag is NOT passed.
+`FPL26_NO_X` variables are kill switches, so an unset value enables the
+feature. Makefile predicates that emit a CLI flag are opt-ins, so an unset
+value omits the flag.
 """
 from __future__ import annotations
 
+import argparse
 import re
 from pathlib import Path
 
@@ -49,6 +27,7 @@ MK_CLI = re.compile(
 )
 
 TRUTHY = {"1", "true", "on", "yes"}
+FALSY = {"0", "false", "off", "no", ""}
 
 
 def is_on(value: str) -> bool:
@@ -118,6 +97,22 @@ def effective(root: Path | None = None) -> dict[str, bool]:
     return out
 
 
+def valued_injections(root: Path | None = None) -> dict[str, str]:
+    """Names the Makefile injects with a non-boolean value, e.g. a number.
+
+    `is_on` only recognises the boolean spellings, so a numeric setting would
+    otherwise be classified as "ships off" — which reads as "this mechanism is
+    inactive" when it is in fact armed with a specific value.
+    """
+    root = _as_root(root)
+    out = {}
+    for name, val in makefile_injections(root).items():
+        v = val.strip()
+        if v and not is_on(v) and v.strip().lower() not in FALSY:
+            out[name] = v
+    return out
+
+
 def layer_disagreements(root: Path | None = None) -> dict[str, tuple[list[str], str]]:
     """Names where the python default and the Makefile injection disagree.
 
@@ -134,20 +129,36 @@ def layer_disagreements(root: Path | None = None) -> dict[str, tuple[list[str], 
     return out
 
 
-def main() -> int:
-    eff = effective()
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument(
+        "--root", default=None, metavar="DIR",
+        help="read the configuration off another checkout (e.g. a worktree of "
+             "the fpl26-final-submission tag) instead of this one",
+    )
+    root = ap.parse_args(argv).root
+
+    eff = effective(root)
     on = sorted(n for n, v in eff.items() if v)
     off = sorted(n for n, v in eff.items() if not v)
     print("=== SHIPS ON (clean eval box, no variables set)")
     for n in on:
         print(f"  {n}")
+    valued = valued_injections(root)
+    print("\n=== ships with a value (armed, but not a boolean flag)")
+    for n, v in sorted(valued.items()):
+        print(f"  {n} = {v}")
+    if not valued:
+        print("  none")
     print("\n=== ships off")
     for n in off:
+        if n in valued:
+            continue
         print(f"  {n}")
     print("\n=== CLI opt-ins (unset ⇒ flag not passed)")
-    for var, flag in sorted(cli_optins().items()):
+    for var, flag in sorted(cli_optins(root).items()):
         print(f"  {var} ⇒ {flag}")
-    dis = layer_disagreements()
+    dis = layer_disagreements(root)
     print("\n=== layer disagreements (python default vs Makefile injection)")
     for n, (p, m) in dis.items():
         print(f"  {n}: python={p} Makefile={m!r}")

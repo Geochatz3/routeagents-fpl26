@@ -1,25 +1,10 @@
-"""B2 gets a fresh Vivado before phys_opt on expensive designs. (jul31)
+"""Restart Vivado before the second sibling physical-optimization pass on
+expensive designs.
 
-WHY. boom_soc died THREE times on jul30/31, and the third — alone on a freshly
-idle box, on the full ship build — reproduced B1 bit-for-bit (`wns=-10.256`, the
-value chain33 banked on jul26 en route to +41.43) and then vanished inside
-
-    phys_opt_design -directive AlternateFlowWithRetiming
-
-log stops, driver and multi_restart gone, no traceback: the OOM signature on a
-31 GB swapless box. B2 was running in the SAME Vivado process that had just
-unplaced, re-placed and routed a 250k-cell design, so peak memory was B1's full
-placer+router state plus a retiming pass on top. The pre-B1 restart already in
-this module establishes a fresh session as the right tool for exactly that; B2
-never got one.
-
-Safe by the module's own argument: B1's checkpoint is on disk and registered by
-PATH before B2 starts, so a restart can cost wall but never a result, and
-phys_opt re-reads the identical checkpoint either way.
-
-Gated on MEASURED place+route cost so only the at-risk class pays the reopen —
-and BOTH sides of that gate are exercised here, because a threshold that only
-ever takes one branch in the suite is untested rather than proven.
+A fresh process avoids retaining placer and router memory during physical
+optimization. The restart is gated by measured place-and-route cost; the saved
+checkpoint is registered by path beforehand and is reopened afterward. Tests
+cover both sides of the cost gate.
 """
 from __future__ import annotations
 
@@ -111,7 +96,7 @@ class B2RestartTests(unittest.TestCase):
         v = _Vivado()
         _run(v)
         self.assertEqual(_restarts_before_b2(v.cmds), 1,
-                         "cheap designs must keep the pre-jul31 single restart")
+                         "cheap designs must keep the earlier single restart")
         i_b2 = v.cmds.index(B2_CMD)
         self.assertNotIn("open_checkpoint {/out/cand.dcp}", v.cmds[:i_b2])
 
@@ -124,7 +109,7 @@ class B2RestartTests(unittest.TestCase):
 
     # ------------------------------------------------------------ never fatal
     def test_a_failed_restart_still_runs_B2(self):
-        """B1 is banked; a restart problem must never cost us the phys_opt."""
+        """B1 is banked; a restart problem must never cost the phys_opt."""
         os.environ["FPL26_DEEP_REPLACE_B2_RESTART_MIN_PR_S"] = "0"
         v = _Vivado(restart_fails=True)
         r = _run(v)
@@ -137,8 +122,8 @@ class B2RestartTests(unittest.TestCase):
         """1200 s sits above every non-boom measured place+route in the corpus."""
         self.assertEqual(b2_restart_min_pr_s(),
                          DEEP_REPLACE_B2_RESTART_MIN_PR_S)
-        boom_pr = 798 + 719          # jul31 death; chain33 was 875+781
-        logicnets_pr = 161 + 107     # wave23 anchors
+        boom_pr = 798 + 719          # the run that died; another measured 875+781
+        logicnets_pr = 161 + 107     # measured anchors
         self.assertGreater(boom_pr, DEEP_REPLACE_B2_RESTART_MIN_PR_S)
         self.assertLess(logicnets_pr, DEEP_REPLACE_B2_RESTART_MIN_PR_S)
 

@@ -1,26 +1,16 @@
-"""R-D1-2 unbankable-sequence gate tests (2026-07-19).
+"""Tests the budget gate for operations that destroy routed state.
 
-The boom_soc_2025.1_v2 eval run (2026-07-14, budget 3499s) ran
-`route_design -unroute` (16s, passed the flat 600s risky estimate) with
-~1650s remaining, then the MANDATORY AggressiveExplore full re-route was
-budget-killed at its 1633s allowance → design left unrouted → finalize
-shipped baseline (alpha=0, rank 20/21).  The gate closes that hole: a
-routed-state-DESTROYING op is refused BEFORE it starts when the predicted
-follow-up full re-route + banking cannot fit the remaining wall
-(optimizer/route_gate.py), with a steering envelope pointing the LLM at
-the bankable incremental phys_opt ladder instead.
+Before a destructive operation starts, the predicted mandatory full reroute and
+artifact banking must fit the remaining wall time. A refusal steers toward
+bankable incremental physical optimization.
 
-Covered here:
-  - ClassifierTests: the pure is_routed_state_destroying() classifier —
-    exactly three destroying cases, incremental routed-state-preserving
-    re-routes NEVER classified destroying.
-  - RoutedStateTrackingTests: _design_routed_state harness tracking
-    across open/route/unroute/place through call_tool.
-  - GateIntegrationTests: refusal fires/steers, incremental never
-    blocked, finalize/ILS/kill-switch bypasses, boom scenario.
+Only the three supported destructive command forms classify as destructive.
+Incremental reroutes preserve routed state and must never be blocked by this
+gate.
 
-We never spawn Vivado/RapidWright/MCP — sessions are mocked (same
-_FakeSession/_make_optimizer harness as tests/test_budget_enforcement.py).
+Coverage includes routed-state transitions through open, route, unroute, and
+place operations, plus bypasses for finalization, ILS, and the kill switch.
+External tool sessions are mocked.
 """
 from __future__ import annotations
 
@@ -224,10 +214,8 @@ class RoutedStateTrackingTests(unittest.TestCase):
         self.assertTrue(self.opt._design_routed_state)
 
     def test_compound_unroute_then_reroute_ends_routed(self):
-        # jul20 external review C2: "route_design -unroute; route_design
-        # -directive X" ENDS routed — a bare substring test would record
-        # unrouted and mis-arm the gate on the next heavy op. The LAST
-        # route_design statement decides.
+        # A Tcl command may unroute and then reroute the design.
+        # Routed-state tracking must follow the final route_design statement.
         self._call("vivado_run_tcl", {
             "command": "route_design -unroute; "
                        "route_design -directive AggressiveExplore"})
@@ -390,10 +378,9 @@ class GateIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.opt.vivado_session.calls), 1)
 
     def test_incremental_route_never_gated_even_when_tight(self):
-        # Routed-state-preserving directive route on the boom-sized
-        # design with a tight-but-positive budget: classifier False →
-        # the gate must NOT refuse (only the standard budget skip
-        # applies, and 600s est < 700s remaining passes it too).
+        # A routed, very large design permits a state-preserving directive route.
+        # The unroute gate does not reject it, and the 600 s estimate fits within
+        # the 700 s remaining budget.
         self.opt._design_routed_state = True
         self.opt._input_cell_count = self.BOOM_CELLS
         self.opt._budget_deadline = time.time() + 700.0
@@ -479,9 +466,8 @@ class GateIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.opt.vivado_session.calls), 1)  # unroute only
 
 
-
 class TclStatementParsingTests(unittest.TestCase):
-    """jul20 5-seat review C2 regressions: statement-level parsing.
+    """Review regressions: statement-level parsing.
 
     Filenames embedding route_design, Tcl comments, newline separators,
     and trailing place_design must not desync _design_routed_state or

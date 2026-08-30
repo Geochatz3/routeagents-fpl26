@@ -3,8 +3,7 @@
 Parses the JSON produced by:
     report_design_analysis -qor_summary -json <filename>
 
-Returns a flat dict whose keys map onto the destinations documented in
-`.planning/session12_qor_feature_mapping.md`:
+Returns a flat dict with the following keys:
 
     qor_steps                       : list[str]
     runtime_per_step                : dict[step_name → int_minutes]

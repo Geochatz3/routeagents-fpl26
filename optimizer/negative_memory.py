@@ -1,26 +1,14 @@
-"""Negative-memory persistence v0 — derive only HIGH-confidence
-"don't do this again" records from `decisions.jsonl`.
+"""Persists high-confidence negative-memory records derived from
+`decisions.jsonl`.
 
-Design contract (per Session 5 brief):
-
-- Only emit a NegativeMemory record for events that have either
-  (a) a `tool_error_code` whose policy declares
-  `negative_memory == True` AND a tool-call action_label that
-  represents a real failure (not a false-positive classifier match
-  on a successful call), OR
-  (b) a PathGuard violation (`path_guard_allowed=False`).
-- Explicitly EXCLUDE: `BUDGET_SKIP`, `PARSER_FALSE_POSITIVE`,
-  `RQA_PARSE_FAILED`, `RQS_GENERATOR_REFUSED`, `tool_call_warning`
-  (the optimiser's signal that the classifier matched but the call
-  actually succeeded), parser-warning records, and any code whose
-  policy says `negative_memory == False`.
-- Dedupe by `memory_id` (stable hash of run_id + record_index +
-  error_code + tool_name).
-- design_name is metadata only.  Future code must NOT use it to
-  filter or retrieve memories.
-
-This module is READ-ONLY over `decisions.jsonl`.  It produces an
-append-only `negative_memory.jsonl` next to `episode_store.jsonl`.
+A record is eligible only for a policy-approved tool error with an action label
+confirming failure, or for a PathGuard violation. Budget skips, parser false
+positives, generation or parse failures, successful calls classified as
+warnings, parser warnings, and policy-disabled codes are excluded. Records are
+deduplicated by `memory_id`, a stable hash of run ID, record index, error code,
+and tool name. `design_name` is metadata and must not affect retrieval or
+filtering. The module reads `decisions.jsonl` without modifying it and appends
+records to `negative_memory.jsonl` beside `episode_store.jsonl`.
 """
 from __future__ import annotations
 
@@ -128,15 +116,13 @@ _HEALTHY_FINAL_STATES = frozenset({
 
 def _eligible_tool_error(rec: Dict[str, Any],
                         *, final_status: Optional[str] = None) -> bool:
-    """Is this record a tool-error event that policy says should be a
-    negative memory?
+    """Returns whether a tool-error record is eligible for negative memory.
 
-    Extra rule (per session-5 brief): a MISSING_ARTIFACT on an
-    `open_checkpoint` call is only a real failure when the run's
-    `final_status` confirms it (i.e., the run didn't reach a healthy
-    finalize).  This filters out a known pre-label-gate-fix
-    contamination where the classifier matched a benign info-level
-    Vivado line that mentioned a missing tmp file.
+    The error policy must enable negative memory, and the action label must
+    represent an actual failed tool call. A `MISSING_ARTIFACT` from
+    `open_checkpoint` is eligible only when `final_status` confirms that the
+    run did not reach healthy finalization, preventing benign informational
+    matches from becoming memories.
     """
     code = rec.get("tool_error_code")
     if not code or code not in TOOL_ERROR_CODES:
@@ -248,7 +234,6 @@ def build_negative_memories(decisions_jsonl_path: Path | str
     return out
 
 
-# ---------------------------------------------------------------------------
 # Store I/O — append-only with memory_id dedupe.
 
 def load_negative_memories(store_path: Path | str) -> List[Dict[str, Any]]:

@@ -1,18 +1,9 @@
-"""FPL26_PROMPT_V2 — the prompt A/B switch. DEFAULT OFF must be byte-identical.
+"""Validate feature-gated system prompt selection and fallback behavior.
 
-SYSTEM_PROMPT.TXT is a ship-surface file that had no kill switch and no A/B path,
-so it was the one behavioural surface that could only be changed globally and
-irreversibly. These tests pin the three properties that make it safe to A/B:
-
-  1. unset  -> SYSTEM_PROMPT.TXT, byte for byte (v2.0 unaffected)
-  2. =1     -> SYSTEM_PROMPT_V2.TXT
-  3. =1 but the file is missing -> falls back AND says so loudly, because a
-     silently-missing prompt would make an arm look like a null instead of the
-     broken probe it is (feedback_firing_check_must_key_on_treatment).
-
-Plus a content test: V2 must not MANDATE `-directive Default`. Its 86.7% figure
-is n=1 design (fir) and every panel seat on aug01 named that as the overfitting
-risk. V2 is allowed to state measured rates; it is not allowed to instruct.
+With the flag unset, the default prompt remains byte-identical. Enabling the
+flag selects the alternate prompt; if that file is missing, selection falls
+back to the default and emits a visible warning. The alternate prompt may
+report measured rates but must not mandate `-directive Default`.
 """
 import importlib
 import os
@@ -37,27 +28,27 @@ class PromptV2Switch(unittest.TestCase):
 
     def test_default_off_is_byte_identical(self):
         got = dcp_optimizer.load_system_prompt()
-        expected = (ROOT / "SYSTEM_PROMPT.TXT").read_text()
+        expected = (ROOT / "prompts" / "system_prompt_scored.txt").read_text()
         self.assertEqual(got, expected,
-                         "unset FPL26_PROMPT_V2 must return SYSTEM_PROMPT.TXT unchanged")
+                         "unset FPL26_PROMPT_V2 must return the scored prompt unchanged")
 
     def test_flag_selects_v2(self):
-        v2 = ROOT / "SYSTEM_PROMPT_V2.TXT"
+        v2 = ROOT / "prompts" / "system_prompt_v2_experimental.txt"
         if not v2.exists():
-            self.skipTest("SYSTEM_PROMPT_V2.TXT not present")
+            self.skipTest("system_prompt_v2_experimental.txt not present")
         os.environ["FPL26_PROMPT_V2"] = "1"
         self.assertEqual(dcp_optimizer.load_system_prompt(), v2.read_text())
 
     def test_zero_is_a_real_kill_switch(self):
         os.environ["FPL26_PROMPT_V2"] = "0"
         self.assertEqual(dcp_optimizer.load_system_prompt(),
-                         (ROOT / "SYSTEM_PROMPT.TXT").read_text())
+                         (ROOT / "prompts" / "system_prompt_scored.txt").read_text())
 
     def test_missing_v2_falls_back_loudly(self):
         """A missing V2 must not be a silent behaviour change."""
         import logging
         os.environ["FPL26_PROMPT_V2"] = "1"
-        v2 = ROOT / "SYSTEM_PROMPT_V2.TXT"
+        v2 = ROOT / "prompts" / "system_prompt_v2_experimental.txt"
         backup = None
         if v2.exists():
             backup = v2.read_text()
@@ -65,10 +56,10 @@ class PromptV2Switch(unittest.TestCase):
         try:
             with self.assertLogs(dcp_optimizer.logger, level=logging.WARNING) as cm:
                 got = dcp_optimizer.load_system_prompt()
-            self.assertEqual(got, (ROOT / "SYSTEM_PROMPT.TXT").read_text())
+            self.assertEqual(got, (ROOT / "prompts" / "system_prompt_scored.txt").read_text())
             joined = "\n".join(cm.output)
             self.assertIn("MISSING", joined)
-            self.assertIn("BROKEN PROBE", joined,
+            self.assertIn("broken probe", joined,
                           "the warning must name it a broken probe, not a null")
         finally:
             if backup is not None:
@@ -79,9 +70,9 @@ class PromptV2Content(unittest.TestCase):
     """V2 may report measured rates; it may not mandate a directive."""
 
     def setUp(self):
-        p = ROOT / "SYSTEM_PROMPT_V2.TXT"
+        p = ROOT / "prompts" / "system_prompt_v2_experimental.txt"
         if not p.exists():
-            self.skipTest("SYSTEM_PROMPT_V2.TXT not present")
+            self.skipTest("system_prompt_v2_experimental.txt not present")
         self.text = p.read_text()
 
     def test_states_the_arg_drop_semantics(self):
@@ -103,7 +94,7 @@ class PromptV2Content(unittest.TestCase):
         self.assertIn("recipe_critical_path_focused_phys_opt", self.text)
 
     def test_differs_from_v1_only_in_section_e(self):
-        v1 = (ROOT / "SYSTEM_PROMPT.TXT").read_text()
+        v1 = (ROOT / "prompts" / "system_prompt_scored.txt").read_text()
         # every V1 line outside the edited block must survive verbatim
         edited_markers = ("SCOPED FIRST CHOICE", "MANUAL: vivado_phys_opt_design supports these directives:")
         missing = [ln for ln in v1.splitlines()

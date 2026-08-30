@@ -1,14 +1,9 @@
-"""Tests for the B3 small-floor sibling leg (aug09, v5.3).
+"""Test the low-cost floor for the third deep-replacement sibling.
 
-Discipline notes:
-- The execution tests drive the REAL run_deep_replace_sibling with a fake
-  Vivado whose heavy steps take real (small) wall time, so the B3 arm gate
-  passes through its own arithmetic — nothing injects a synthetic trigger
-  (the null-by-construction rule from the wedge-guard episode).
-- The affordability tests pin the arithmetic to the measured anchors that
-  justify the lever: mini-ISP B1 place+route ~75 s arms; the next-smallest
-  mid-band knowns (3d 260 s, finn 461 s, corescore ~640 s) decline, which is
-  the whole generalization contract.
+Execution tests drive the production sibling runner with a fake Vivado whose
+heavy steps consume short real wall time, so the arm gate uses its own
+arithmetic. Affordability accepts inexpensive measured anchors and rejects
+costlier mid-range anchors.
 """
 import asyncio
 import time
@@ -32,11 +27,6 @@ def _est(pr):
     return pr * DEEP_REPLACE_B3_COST_MULT + DEEP_REPLACE_B3_FIXED_OVERHEAD_S
 
 
-# ------------------------------------------------------------- affordability
-# v5.5.3: affordability ONLY. The class decision moved to the physics
-# admission attestation (tests in test_logic_floor.py) after the AWS
-# eval-parity run showed the dev-calibrated wall-clock separation INVERTS on
-# the contest box (mini-ISP 145s vs vexriscv 130s there; 75-78s vs 92-97s measured on dev).
 def test_miniisp_dev_anchor_passes_affordability():
     ok, why = deep_replace_b3_affordable(
         measured_place_route_s=75.0, remaining_s=3000.0,
@@ -45,9 +35,10 @@ def test_miniisp_dev_anchor_passes_affordability():
 
 
 def test_miniisp_EVAL_anchor_passes_affordability():
-    """THE aug10 fix: the contest instance measured mini-ISP's B1 at 145s
-    (est 409); the old 300s cap priced the eval box out of an unchanged
-    physics. 145s must now pass with margin."""
+    """Accept an inexpensive measured cycle under the small-design affordability gate.
+
+    The gate uses measured place-and-route cost and includes the required safety margin.
+    """
     assert _est(145.0) <= DEEP_REPLACE_B3_MAX_COST_S
     ok, why = deep_replace_b3_affordable(
         measured_place_route_s=145.0, remaining_s=3000.0,
@@ -114,10 +105,13 @@ import re
 
 
 class _Vivado:
-    """Fake Vivado: records commands; heavy steps consume real wall time so
-    the B3 gate's measured-anchor arithmetic runs for real. write_checkpoint
-    CREATES the target file (with a marker payload naming the writing leg) so
-    the B3 temp+rename adopt path exercises the real os.replace."""
+    """Simulate Vivado commands while preserving timing and checkpoint replacement
+    behavior.
+
+    Heavy steps consume real wall time for gate calculations. Checkpoint writes
+    create the target file with a marker identifying the writing leg, allowing
+    the temporary-file adoption path to exercise os.replace.
+    """
 
     def __init__(self, wns_seq, unrouted=0, whs=0.05, fail_on=None,
                  step_s=0.05):
@@ -197,7 +191,7 @@ def test_b3_improvement_is_adopted_and_written(tmp_path):
     r = _run(v, out_dir=tmp_path)
     assert r.stage_banked == "small_floor"
     assert r.post_wns == -0.850 and r.b3_wns == -0.850
-    # the od4 chain ran in order, from the pristine checkpoint
+    # the probe's chain ran in order, from the pristine checkpoint
     joined = "\n".join(v.cmds)
     i_open2 = joined.rindex("open_checkpoint {/in/mini.dcp}")
     i_pl = joined.index(f"place_design -directive "

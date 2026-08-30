@@ -333,10 +333,9 @@ class PhysOptSweepBehaviourTests(unittest.TestCase):
                 return "-0.950"
             return "ok"
 
-        # Budget 400s clears the recipe's internal pre-flight floor
-        # (single_flag_estimate = max(120, 0.5*600) = 300s).  After the
-        # first commit remaining≈400s, which is below the 600s
-        # next-layer floor → exit fires.
+        # A 400 s budget clears the 300 s pre-flight floor.
+        # After the first commit, the remaining budget is below the 600 s
+        # next-layer floor, so the sweep exits before another layer.
         self.opt._budget_deadline = time.time() + 400.0
         self.opt.max_wall_seconds = 400.0
         import dcp_optimizer as _mod

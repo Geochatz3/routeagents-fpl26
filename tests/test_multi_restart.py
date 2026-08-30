@@ -29,7 +29,6 @@ class SelectBestTests(unittest.TestCase):
         self.assertEqual(best["fmax"], 113.0)
 
     def test_best_of_n_recovers_unlucky_draw(self):
-        # vexriscv-style: one attempt draws 0, another draws 113
         best = select_best([_a(1, 0.0, status="VALID_FALLBACK_BASELINE"),
                             _a(2, 113.0)])
         self.assertEqual(best["fmax"], 113.0)
@@ -56,10 +55,9 @@ class SelectBestTests(unittest.TestCase):
         ])
         self.assertIsNotNone(best)
 
-    # --- aug07 carried-risk #1: SHIP TIER leads, not tracked fmax -----------
-    # `fmax` is the best value the agent TRACKED (token_usage.json); `status`
-    # says what actually SHIPPED (lifecycle_metadata.json). A fallback ships
-    # the input unchanged => alpha == 0 no matter how high its tracked fmax.
+    # Selection follows the shipped status, not the best fmax tracked by the
+    # agent. A fallback ships the unchanged input and therefore represents
+    # no optimization regardless of its tracked fmax.
 
     def test_optimized_beats_higher_fmax_fallback(self):
         best = select_best([
@@ -78,10 +76,8 @@ class SelectBestTests(unittest.TestCase):
         self.assertEqual(best["i"], 2)
 
     def test_no_edif_vs_optimized_ordering_is_unchanged_from_before_aug07(self):
-        # NOT a new policy: this is the PRE-aug07 key's own answer. Whether a
-        # NO_EDIF artifact is scoreable at all is UNVERIFIED (the EDIF sidecar
-        # feeds the RapidWright validator), so this fix deliberately does not
-        # re-rank it in either direction.
+        # Missing EDIF affects downstream validation but does not change this
+        # selector's ranking between otherwise optimized artifacts.
         best = select_best([
             _a(1, 120.0, status="VALID_OPTIMIZED_NO_EDIF"),
             _a(2, 110.0, status="VALID_OPTIMIZED"),
@@ -94,7 +90,7 @@ class SelectBestTests(unittest.TestCase):
         self.assertEqual(tie["i"], 2)           # exact tie -> full OPTIMIZED
 
     def test_unknown_status_outranks_known_fallback(self):
-        # A truncated status file (aug06 defect family) is NOT evidence of a
+        # A truncated status file is NOT evidence of a
         # fallback — the DCP may be a real win.
         best = select_best([
             _a(1, 200.0, status="VALID_FALLBACK_BASELINE"),
@@ -103,14 +99,12 @@ class SelectBestTests(unittest.TestCase):
         self.assertEqual(best["i"], 2)
 
     def test_unknown_status_is_NOT_demoted_below_optimized(self):
-        """aug07 review F1 — the alpha-losing case an earlier fix introduced.
+        """Verify that an unknown final status is not ranked below an optimized
+        artifact.
 
-        `_emergency_baseline_copy` writes final_status=None when the harness
-        kills an attempt before finalize (dcp_optimizer.py:19412) while ALSO
-        writing a truthful token_usage.json from the tracked best when the
-        artifact IS that best (:19467-19472). Demoting unknown below optimized
-        hands the run to a lower-Fmax artifact. Mutation-live: re-introducing a
-        3-tier ship_tier fails exactly this test.
+        Emergency metadata may contain a null status while token metadata still
+        identifies the tracked best artifact. Treating that status as inferior
+        could replace a higher-frequency result with a worse fallback.
         """
         best = select_best([
             _a(1, 200.0, status=None),                 # real win, killed early
@@ -167,7 +161,6 @@ class ShouldStopEarlyTests(unittest.TestCase):
         self.assertTrue(should_stop_early([_a(1, 407.8), _a(2, 407.8)]))
 
     def test_no_stop_on_two_fallbacks(self):
-        # ispd16-style: best is only fallback -> keep trying
         self.assertFalse(should_stop_early([
             _a(1, 0.0, status="VALID_FALLBACK_BASELINE"),
             _a(2, 0.0, status="VALID_FALLBACK_BASELINE"),
@@ -178,7 +171,6 @@ class ShouldStopEarlyTests(unittest.TestCase):
         self.assertFalse(should_stop_early([_a(1, 338.9), _a(2, 297.1)]))
 
     def test_stop_after_confirmation_following_unlucky(self):
-        # vexriscv-style: 0 (fallback), then two 113s -> confirmed -> stop
         self.assertTrue(should_stop_early([
             _a(1, 0.0, status="VALID_FALLBACK_BASELINE"),
             _a(2, 113.0), _a(3, 113.0),
@@ -197,7 +189,7 @@ class TestAttemptCmdILS:
         from pathlib import Path
         from scripts.multi_restart_optimize import _attempt_cmd
         cmd = _attempt_cmd(Path("in.dcp"), Path("/tmp/o.dcp"), 1800.4, True)
-        assert cmd[:2] == ["make", "run_optimizer_contest"]
+        assert cmd[:2] == ["make", "run_once"]
         assert "ILS=1" in cmd
         assert "MAX_WALL=1800" in cmd
 
@@ -351,10 +343,9 @@ class TestEmergencyPublish:
     in-flight attempt's emergency DCP in /tmp with nothing scored."""
 
     def test_publishes_inflight_when_nothing_scored(self, tmp_path):
-        # C1-T5 (2026-07-21): bytes must at least be a plausible DCP (zip
-        # 'PK' magic); without a .shipped.json manifest the publish is
-        # tagged unverified but still lands (never-worse vs pre-manifest
-        # agents).
+        # An emergency artifact must have plausible DCP zip bytes.
+        # Without a shipping manifest it is published as unverified rather
+        # than discarded.
         from scripts.multi_restart_optimize import _emergency_publish
         cur = tmp_path / "mr_bench_1_1.dcp"
         cur.write_bytes(b"PK\x03\x04inflight")
@@ -382,10 +373,9 @@ class TestEmergencyPublish:
         assert _emergency_publish(None, None, wait_s=0.1) == "no_final_output"
 
     def test_waits_for_agent_finalize_to_land(self, tmp_path):
-        # The agent's SIGTERM handler atomically finalizes to the attempt path
-        # a moment after the wrapper's handler fires; the wrapper should wait.
-        # C1-T5 (2026-07-21): the agent now also drops a .shipped.json
-        # identity manifest — the wrapper verifies size+md5 before shipping.
+        # The wrapper waits for the agent's signal handler to finalize the
+        # attempt artifact. A shipping manifest then verifies its size and
+        # checksum before publication.
         import threading
         from dcp_optimizer import _artifact_identity, _write_shipped_manifest
         from scripts.multi_restart_optimize import _emergency_publish
@@ -405,12 +395,8 @@ class TestEmergencyPublish:
         finally:
             t.cancel()
 
-    # -- aug08: a tier-0 incumbent (VALID_FALLBACK_BASELINE published by this
-    # wrapper's own refresh, alpha == 0 by construction) must not block a
-    # manifest-verified in-flight win. Scenario that motivated it: attempt 1
-    # ends fallback-baseline and is published; attempt 2 banks a genuine win;
-    # harness SIGTERM lands — the old blanket "kept_existing" forfeited the
-    # whole benchmark.
+    # A published fallback must not block a manifest-verified optimized
+    # artifact finalized by an in-flight attempt.
 
     def test_verified_inflight_replaces_tier0_incumbent(self, tmp_path):
         from dcp_optimizer import _artifact_identity, _write_shipped_manifest
@@ -455,7 +441,7 @@ class TestEmergencyPublish:
 
     def test_unknown_incumbent_tier_keeps_existing(self, tmp_path):
         # incumbent_tier None (pre-publish state lost / old callsite): treat
-        # the incumbent as real — identical to the pre-aug08 behavior.
+        # the incumbent as real — identical to the earlier behavior.
         from scripts.multi_restart_optimize import _emergency_publish
         cur = tmp_path / "mr_bench_1_2.dcp"; cur.write_bytes(b"PK\x03\x04x")
         final = tmp_path / "bench_optimized.dcp"; final.write_bytes(b"best")
@@ -472,7 +458,7 @@ class TestEmergencyPublish:
 
 
 class TestWedgeGuard:
-    """aug08: an attempt that outlives its wall budget must be reaped —
+    """: an attempt that outlives its wall budget must be reaped —
     SIGTERM first (the agent's handler emergency-finalizes on it), SIGKILL
     only as the last resort. Previously subprocess.run had NO timeout and a
     wedged attempt silently converted best-of-N into best-of-1."""
@@ -486,15 +472,14 @@ class TestWedgeGuard:
 
     @staticmethod
     def _make_cmd(tmp_path, py_code: str, token_path: str) -> list:
-        """A cmd with the PRODUCTION topology AND argv shape: a real make
-        target whose recipe does `_OUTPUT="$(OUTPUT)"; python --output
-        "$$_OUTPUT"` — so the literal `OUTPUT=<path>` string exists ONLY in
-        make's argv, sh's cmdline holds `_OUTPUT="<path>` and the python
-        grandchild holds `--output\\0<path>`, exactly like
-        run_optimizer_contest. The aug08 review refuted the first fix
-        against precisely this shape (an OUTPUT=-prefixed token matched
-        make alone and the agent survived); the guard now scans for the
-        BARE path, which this test can therefore fail for real."""
+        """Build a command that reproduces the optimizer's make-shell-Python
+        process topology.
+
+        The literal `OUTPUT=<path>` appears only in make's arguments, while the
+        shell stores the path in a variable and Python receives it as a
+        separate option value. This ensures process guards detect the bare
+        output path rather than relying on make-specific argument syntax.
+        """
         import sys as _sys
         agent_py = tmp_path / "fake_agent.py"
         agent_py.write_text(py_code)
@@ -580,7 +565,7 @@ class TestWedgeGuard:
 
 
 class TestPolishVerdictEchoMasking:
-    """jun12 live finding: vivado -mode batch echoes every script line with a
+    """live finding: vivado -mode batch echoes every script line with a
     '# ' prefix BEFORE executing it; winner_polish.tcl's usage line contains
     the literal POLISH_VERDICT= string, so a naive first-match parsed the
     ECHO and the replacement NEVER fired (silent no-op since WS1c)."""
@@ -635,11 +620,9 @@ class TestPolishVerdictEchoMasking:
 from scripts import multi_restart_optimize as mro
 
 
-# ---------------------------------------------------------------------------
-# 04-01 Task 1 (D4 feature-aware restart split): classify_design +
-# attempt1_budget + --split-aware. Table-driven over the known v1.2.0
-# benchmark DCP sizes (04-RESEARCH.md Code Examples; os.stat, zero Vivado).
-# ---------------------------------------------------------------------------
+# Feature-aware restart split: classify_design + attempt1_budget +
+# --split-aware. Table-driven over the known v1.2.0 benchmark DCP sizes
+# (os.stat only, zero Vivado).
 
 # (filename, exact st_size bytes, expected size class)
 KNOWN_DCP_SIZES = [
@@ -687,7 +670,7 @@ class TestClassifyDesign:
             _sparse(tmp_path / "d.dcp", mro.MEDIUM_MAX_BYTES + 1)) == "large"
 
     def test_missing_file_fails_open_to_large(self, tmp_path):
-        # Fail-open toward today's uncapped single-shot behavior (T-04-01).
+        # Fail-open toward the uncapped single-shot behavior.
         from pathlib import Path
         assert mro.classify_design(tmp_path / "nope.dcp") == "large"
 
@@ -759,13 +742,13 @@ class TestSplitAwareSlice:
         return max_walls
 
     def test_split_aware_small_caps_attempt1_only(self, tmp_path, monkeypatch):
-        # mini-isp size class: attempt 1 capped at 1800s, attempt 2 unchanged.
+        # For this mid-sized input, only the first attempt is capped at 1,800 s.
         mws = self._run_capture(tmp_path, monkeypatch, 3_948_685,
                                 split_aware=True)
         assert mws == [1800, 10_000]
 
     def test_split_aware_medium_caps_attempt1_only(self, tmp_path, monkeypatch):
-        # optical-flow size class: attempt 1 capped at 2400s.
+        # For this larger input, only the first attempt is capped at 2,400 s.
         mws = self._run_capture(tmp_path, monkeypatch, 26_420_875,
                                 split_aware=True)
         assert mws == [2400, 10_000]
@@ -791,9 +774,13 @@ class TestSplitAwareSlice:
 
 
 class TestSplitAwareDefaultOffParity:
-    """04-01 Task 3: pins the locked A/B premise — run() with split_aware
-    DEFAULTED (unset) hands attempt 1 the exact same MAX_WALL as an explicit
-    split_aware=False call, for BOTH a small and a large DCP fixture."""
+    """Verify that the default split-aware setting preserves disabled-mode
+    wall-time allocation.
+
+    The first attempt receives the same wall-time limit when the setting is
+    omitted or explicitly disabled, for both small and large checkpoint
+    fixtures.
+    """
 
     def _capture(self, tmp_path, monkeypatch, dcp_bytes, **run_kwargs):
         return TestSplitAwareSlice()._run_capture(
@@ -848,17 +835,15 @@ class TestSplitAwareFlag:
 
 
 class TestShouldSkipTruncated(unittest.TestCase):
-    """Truncation gate (jul04 preview #8 record-run evidence)."""
+    """Truncation gate."""
 
     def _opt(self, elapsed, exists=True, status="VALID_OPTIMIZED"):
         return {"i": 1, "fmax": 500.0, "status": status, "exists": exists,
                 "elapsed": elapsed, "output": "/tmp/x.dcp"}
 
     def test_record_run_logicnets_replay(self):
-        # #8: attempt 1 completed the full stack in ~2100s (VALID_OPTIMIZED
-        # -0.455); restart-2 was launched into 1461s, died at recipe-stage
-        # -0.507, discarded — but billed ~4.4 alpha-points of gamma. Gate
-        # must block: 1461 < 0.75 * 2100 = 1575.
+        # A restart using less than 75% of a completed attempt's runtime is
+        # treated as truncated and skipped.
         skip, why = mro.should_skip_truncated([self._opt(2100.0)], 1461.0)
         self.assertTrue(skip)
         self.assertIn("1461", why)
@@ -892,17 +877,11 @@ class TestShouldSkipTruncated(unittest.TestCase):
 
 
 class SplitAwareCapLeavesRoomForASecondDraw(unittest.TestCase):
-    """A cap that forbids the attempt it exists to fund is not a cap.
+    """Verify that the split-aware cap leaves enough time for a second attempt.
 
-    `--split-aware` caps attempt 1 so a SECOND draw can fire. The loop refuses to
-    start an attempt with less than `attempt_floor` (1200s) remaining, so on the
-    3500s eval wall any cap must be <= 2300s. ATTEMPT1_CAP_MEDIUM_S is 2400s,
-    leaving 1100s — the loop refuses, and attempt 2 never fires. On the contest
-    wall the flag was a GUARANTEED NO-OP for the medium class it was written for,
-    which includes rosetta_optical-flow, a scored benchmark.
-
-    The ceiling is now derived from the floor that invalidates it, so a future
-    change to one cannot silently disarm the other.
+    The first-attempt ceiling is derived from the minimum remaining time
+    required to start another attempt. This coupling prevents either threshold
+    from silently making split-aware execution ineffective.
     """
 
     EVAL_WALL = 3500.0

@@ -112,20 +112,12 @@ class QoRAssessmentParserTests(unittest.TestCase):
         self.assertIsNone(d["score"])
 
     def test_real_vivado_output_vexriscv_v2(self):
-        """Captured 2026-05-20 from a live `vivado -mode batch` run of
-        report_qor_assessment on the vexriscv_re-place_v2 baseline DCP.
+        """Validate QoR assessment parsing against representative Vivado output.
 
-        Validates the parser against the EXACT shape Vivado 2025.1 emits.
-        Notable shape choices:
-          - Score field is named "QoR Assessment Score" (matches our
-            "Assessment Score" alternation).
-          - Score line contains "2 - <description>" — only the digit
-            must be captured.
-          - The ML Strategy section ends with a disclaimer "* ML
-            Strategies are available only when ..." that the parser
-            must NOT treat as a positive availability signal.
-          - All 4 ML directive rows are "Not OK" → the parser should
-            classify the design as ml_strategy_available=False.
+        The parser accepts the `QoR Assessment Score` field and captures only
+        the numeric score prefix. An ML-strategy disclaimer is not an
+        availability signal, and uniformly unavailable directive rows produce
+        `ml_strategy_available=False`.
         """
         rqa = (
             "+----------------------+--------------------------------------+\n"
@@ -153,10 +145,8 @@ class QoRAssessmentParserTests(unittest.TestCase):
         )
         d = parse_qor_assessment_static(rqa)
         self.assertEqual(d["score"], 2)
-        # Vivado's "To see critical timing paths examine the CSV file..."
-        # is the canned generic line — the P7 audit (2026-05-20) showed
-        # it's not actionable for the LLM (we don't expose the CSV).
-        # Parser must drop it and fall back to the score-2 default.
+        # The generic CSV guidance is unusable because the CSV is not exposed
+        # to the LLM, so the parser drops it and uses the default guidance.
         self.assertNotIn("critical timing paths", (d["flow_guidance"] or "").lower())
         self.assertEqual(d["flow_guidance"], "Review constraints / review RTL")
         # All 4 directive rows are "Not OK" → unavailable.

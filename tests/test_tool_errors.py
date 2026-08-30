@@ -171,12 +171,13 @@ class ClassifierBehaviorTests(unittest.TestCase):
             )
 
     def test_missing_artifact_with_error_tag_still_classifies(self):
-        """The tightened pattern must still catch real errors.
+        """Verifies that missing non-DCP artifacts with error tags remain
+        classified as errors.
 
-        Note: any mention of `dcp missing` is owned by INVALID_DCP
-        (alternation match, fires earlier in the classifier), so we
-        use non-`dcp` paths here.  Missing-DCP-specific cases are
-        covered by test_invalid_dcp."""
+        The `dcp missing` pattern is claimed earlier by `INVALID_DCP`, so these
+        cases use other artifact paths. Missing-DCP behavior is covered by the
+        invalid-DCP tests.
+        """
         for hit in (
             "ERROR: [Common 17-69] expected file out.json does not exist",
             "WARNING: [Vivado 12-1234] file mirror.edf is missing on disk",

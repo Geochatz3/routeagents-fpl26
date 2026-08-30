@@ -1,34 +1,17 @@
-"""Loop-side API-resilience tests — R-D2-2 / R-D2-3 (Plan 02-02).
+"""Test loop behavior around retryable and permanent API failures.
 
-Plan 02-01 absorbs API-error storms INSIDE _create_completion_with_fallback
-(backoff-retry, same model).  This file pins the residual LOOP-side hygiene
-in optimize() for the PERMANENT case (episode cap exhausted -> exception
-propagates once per episode):
+API retries remain inside the completion layer and retain the selected model.
+If an exhausted retry episode reaches the optimization loop:
+- failed LLM calls do not consume optimization iterations;
+- failures do not append one conversation message per attempt;
+- a resolved episode adds at most one compact summary;
+- non-API exceptions retain ordinary exception handling;
+- disabling the kill switch restores ordinary handling;
+- consecutive permanent episodes trigger a bounded termination condition;
+- final statistics report episode count and total backoff time.
 
-Part 1 (except-handler unit tests, scripted get_completion):
-  - a failed LLM call consumes NO iteration count (R-D2-2);
-  - NO per-failure "An error occurred" conversation append; at most ONE
-    compact summary per resolved episode, never duplicated (R-D2-3);
-  - non-API exceptions keep the legacy behavior (append + iteration burn);
-  - kill switch OFF restores the legacy behavior wholesale;
-  - a bounded consecutive-permanent-episode break (api_dead) guarantees
-    termination even with an infinite wall;
-  - the final stats block prints api_error_episodes / total_backoff_s
-    (R-D2-4 forensics).
-
-Part 2 (integration replays, scripted _chat_create — added in Task 2):
-  both repro shapes end-to-end offline.
-
-Evidence (02-CONTEXT.md, two live reproductions of the same defect):
-  - official eval mini-isp 2026-07-14 18:09:02 — 401 storm, recovered
-    minutes later (the RECOVERY shape);
-  - local boom_debugwall_run1 2026-07-19 18:53:02 — expired key, never
-    recovered, baseline death in 9 min (the PERMANENT shape).
-  In both logs optimize() burned 8+ iterations in <1s and appended one
-  junk "An error occurred" user-message per failure.
-
-NO network, NO Vivado, NO real sleeps — get_completion / _chat_create are
-scripted and _backoff_sleep is a recorder.
+Integration replays use scripted completion calls and recorded backoff
+requests, with no network access, FPGA tools, or real sleeps.
 """
 from __future__ import annotations
 
@@ -54,9 +37,8 @@ def _async(coro):
     return asyncio.run(coro)
 
 
-# The exact eval-log SDK error body (mini-isp 18:09:02).  The classifier
-# works on f"{type(e).__name__}: {e}" so the message text alone carries
-# the key_auth signature; no real openai exception object is needed.
+# The classifier receives a formatted exception type and message, so the
+# serialized 401 body carries the authentication signature without an SDK exception.
 _AUTH_401 = ("Error code: 401 - {'error': {'message': 'User not found.', "
              "'code': 401}}")
 
@@ -156,10 +138,9 @@ class ExceptHandlerHygieneTests(unittest.TestCase):
         self.assertEqual(opt._api_error_episodes, 0)
 
     def test_multi_failure_episode_appends_at_most_one_summary(self):
-        # Two propagated failures (each simulating a cap-exhausted episode
-        # like the real call path produces), then recovery.  At most ONE
-        # compact [api-status] summary lands in the conversation, covering
-        # both episodes; iteration counts only the successful call.
+        # Two cap-exhausted failures precede recovery. Failure episodes add at
+        # most one compact status summary, and only successful calls increment
+        # the iteration count.
         opt = _make_loop_optimizer(self.tmp_path)
 
         calls = {"n": 0}
@@ -233,11 +214,10 @@ class ExceptHandlerHygieneTests(unittest.TestCase):
         self.assertEqual(opt.iteration, 2)
 
     def test_permanent_death_breaks_loop_after_bound(self):
-        # Every call fails permanently.  With iteration compensation the
-        # `while iteration < max_iterations` guard can never expire, and
-        # with an infinite wall the budget guards never fire — the
-        # bounded consecutive-permanent-episode break MUST terminate the
-        # loop (loop_exit_reason=api_dead) into the finalize tail.
+        # Permanent failures do not increment the iteration count, so neither
+        # the iteration guard nor an absent wall-time limit terminates this
+        # scenario. The consecutive-failure bound exits as `api_dead` and
+        # continues into finalization.
         opt = _make_loop_optimizer(self.tmp_path, max_wall=None)
 
         calls = {"n": 0}
@@ -281,13 +261,9 @@ class ExceptHandlerHygieneTests(unittest.TestCase):
         self.assertIn("105s", out)
 
 
-# ---------------------------------------------------------------------------
-# Part 2 (Task 2): integration replays of BOTH repro shapes, end-to-end
-# through the REAL get_completion -> _create_completion_with_fallback ->
-# backoff path.  Only _chat_create is scripted (the SDK boundary), the
-# sleep is a recorder, and Vivado/MCP is a benign AsyncMock — NO network,
-# NO real sessions, NO real sleeps.
-# ---------------------------------------------------------------------------
+# Integration tests exercise the complete completion and backoff path.
+# Only the API boundary is scripted; sleeps and the FPGA-tool session are
+# inert stubs, so no network access, real sessions, or real delays occur.
 
 
 class _FakeMessage:
@@ -379,10 +355,12 @@ def _run_optimize_real_call_path(opt: DCPOptimizer, tmp_path: Path,
 
 
 class RecoveryMidStormReplayTests(unittest.TestCase):
-    """Eval repro shape (mini-isp 2026-07-14 18:09:02): a key-level 401
-    storm that RECOVERS mid-episode.  The run must continue on the SAME
-    primary model, the storm must cost wall-clock (backoff) only, and the
-    conversation must carry at most one compact summary."""
+    """Replay a transient authentication-error episode that recovers.
+
+    The retry sequence remains on the primary model and consumes backoff time
+    without consuming optimization iterations. Processing continues after
+    recovery, with at most one compact conversation summary for the episode.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

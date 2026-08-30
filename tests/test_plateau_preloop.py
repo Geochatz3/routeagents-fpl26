@@ -1,22 +1,10 @@
-"""FPL26_PLATEAU_PRELOOP_FIX — arm the plateau exit when the best was banked pre-loop.
+"""Test plateau detection when the best result is banked before the optimization
+loop.
 
-The plateau exit is armed by `last_improvement_iter > 0`, a sentinel that conflates
-two states needing opposite decisions:
-
-  (a) nothing achieved yet, LLM still ramping  -> must NOT exit. v0.2 cut spam and
-      digit off at iteration 3 for exactly this and both shipped +0.00. This is
-      what the `> 0` gate protects and the fix must preserve it.
-  (b) best already banked BEFORE iteration 1   -> the loop has produced nothing,
-      which is the plateau the guard exists to catch. Here
-      `last_improvement_iter` is 0 forever, so the guard is unreachable and only
-      the empty-spin backstop (iter >= 8 AND 5 empty iters) can stop the loop.
-
-State (b) is now the DEFAULT path (FPL26_DEEP_REPLACE_FIRST ships ON and banks
-pre-loop). Measured cost on mini-ISP: 11 iterations / 23 LLM calls banking nothing
-vs 4 / 9 for identical alpha.
-
-These tests pin the arming logic, which is the whole fix — the exit itself is
-pre-existing and already covered.
+The iteration-zero sentinel can mean either that nothing has succeeded yet or
+that a result was banked before iteration one. The former must not trigger an
+early exit, while the latter must arm plateau detection when the loop makes no
+progress.
 """
 from __future__ import annotations
 
@@ -80,9 +68,12 @@ class ArmingTests(unittest.TestCase):
 
 class ExitBehaviourTests(unittest.TestCase):
     def test_regression_state_a_never_exits_early(self):
-        """THE PROTECTION: nothing achieved, LLM ramping. This is the spam/digit
-        +0.00 failure the `> 0` gate was added for — it must not exit at any
-        iteration, with the fix armed or not."""
+        """Verify that an empty initial state never triggers the plateau exit.
+
+        When no result has been banked, iteration zero indicates that the agent
+        is still ramping up; pre-loop plateau handling must preserve this
+        protection.
+        """
         for iteration in range(1, 8):
             for armed in (False, True):
                 self.assertFalse(

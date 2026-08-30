@@ -1,15 +1,8 @@
-"""Runtime provenance: every run records the config it actually used.
+"""Verify that each run records its effective runtime configuration.
 
-Static pinning (`tests/test_ship_config.py`) says what SHOULD ship. This is the
-other half — what a given run DID use — because twice in three days our belief
-about the effective config was wrong in opposite directions, and the review's
-verdict was that *"'proven' attaches to a configuration that may never have
-shipped"*. A banked alpha with no config provenance cannot be audited later.
-
-The manifest must satisfy three properties, each tested here:
-  1. it records RESOLVED state, not merely which names were present;
-  2. it captures FPL26_* vars we have not thought to enumerate;
-  3. it can never break a run.
+The manifest stores resolved values rather than only present names and captures
+every FPL26_* variable, including unrecognized ones. Manifest generation fails
+open so provenance errors never interrupt a run.
 """
 from __future__ import annotations
 
@@ -69,7 +62,7 @@ class ManifestTests(unittest.TestCase):
         return json.loads(p.read_text())
 
     def test_records_resolved_on_off_not_just_presence(self):
-        """The jul30 bug in miniature: a name being present says nothing about
+        """The bug in miniature: a name being present says nothing about
         whether the mechanism is active."""
         m = self._run({"FPL26_DEEP_REPLACE_UNBANDED": "1",
                        "FPL26_ILS_LADDER_ORDER_BY_WNS": "0"})
@@ -107,14 +100,31 @@ class ManifestTests(unittest.TestCase):
         self.assertNotIn("sk-should-not-appear", blob,
                          "manifest leaked a non-FPL26 environment value")
 
-    def test_records_both_code_md5s(self):
-        """code_md5 in the banked rows covers only dcp_optimizer.py, and
-        ils_polish.py drifted independently during the jul29 build confusion."""
+    def test_code_md5_covers_the_whole_implementation(self):
+        """code_md5 must fingerprint the orchestrator AND every optimizer/
+        module.
+
+        A two-file literal here stopped covering half the implementation the
+        moment the split moved the ship path into optimizer/: two trees
+        differing only in finalization.py emitted identical fingerprints.
+        The stage mixins are asserted by name because they carry the ship
+        path; the rest is asserted by count against the directory."""
         m = self._run({})
         self.assertIsNotNone(m["code_md5"]["dcp_optimizer.py"])
         self.assertIsNotNone(m["code_md5"]["optimizer/ils_polish.py"])
         self.assertNotEqual(m["code_md5"]["dcp_optimizer.py"],
                             m["code_md5"]["optimizer/ils_polish.py"])
+        for mod in ("polish_ladder", "finalization",
+                    "tool_dispatch", "recipe_passes"):
+            self.assertIn(f"optimizer/{mod}.py", m["code_md5"],
+                          f"{mod} carries ship-path code and must be "
+                          f"fingerprinted")
+        on_disk = sorted(
+            p.name for p in (REPO / "optimizer").glob("*.py"))
+        recorded = sorted(
+            k.split("/", 1)[1] for k in m["code_md5"] if k.startswith("optimizer/"))
+        self.assertEqual(recorded, on_disk,
+                         "every optimizer/ module must be fingerprinted")
 
     def test_load_bearing_flags_are_all_enumerated(self):
         """Guard against the enumeration rotting: the flags this repo actually

@@ -1,47 +1,12 @@
-"""Intra-attempt wall economics — stop paying gamma for zero gain.
+"""Stops an attempt when additional wall time is unlikely to offset its score
+penalty.
 
-WHY THIS EXISTS (measured, chain12 jul25, boom_soc through `make run_optimizer`):
-the recipe banked wns=-10.256 (84.5666 MHz, alpha +36.33) at 18:09:25 and the
-attempt then ran until 18:37 -- 1730 s during which BOTH non-recipe MUX
-candidates measured the untouched baseline (-19.162). Zero gain, 1730 s of
-gamma:
-
-    stop point       wall      gamma penalty   score at alpha 36.33
-    actual         3380 s          9.4%              32.92
-    at the bank    ~1650 s         4.6%              34.66
-
-1.74 points paid for 29 minutes of nothing. The same pathology on mini-ISP costs
-7.8 points (alpha 97.07 -> score 89.316).
-
-WHAT THE WRAPPER ALREADY DOES, AND WHY IT CANNOT HELP HERE:
-scripts/multi_restart_optimize.py stops BETWEEN attempts (should_skip_truncated,
-the cost gates, should_stop_early). Those cannot see inside a running attempt,
-which is exactly where the 1730 s was spent. Note also PITFALL 5 in
-ab_wall_economics.py: gamma is the WHOLE wrapper's wall, so an intra-attempt
-stop only converts into score if the wrapper then declines to start another
-attempt -- which its existing floor/truncation gates handle.
-
-THE RULE IS DERIVED, NOT FITTED. From the published scoring function
-    score = alpha * (1 - 0.1*(beta + gamma)),    gamma = wall_hours
-continuing for dt seconds is worth it only when the marginal alpha beats the
-marginal penalty:
-    d(score)/dt > 0
-    alpha'(t) * P  >  alpha(t) * 0.1/3600          (P = current penalty factor)
-    alpha'(t)      >  alpha(t) * 0.1 / (3600 * P)
-Both constants come from the contest's own formula. There is NO tuned threshold
-here, which matters: the methodology invariant forbids fitting decision
-boundaries to outcomes, and three panels have flagged it.
-
-THE ONE JUDGEMENT CALL is estimating alpha'(t). We use the run's OWN realized
-history: if a full heavy move's worth of wall has passed with no gain, the
-maximum-likelihood forward rate is 0, which loses to any positive hurdle. The
-observation window is itself a MEASURED quantity (the cheapest completed heavy
-move this run), not a tuned constant -- so the design stays free of fitted
-parameters.
-
-Fails SAFE in every unmeasurable case: unknown alpha, unknown window, or no
-elapsed evidence all return "keep going". Stopping early on bad data would
-forfeit real gain; continuing merely costs gamma we were already spending.
+The break-even test follows score = alpha * (1 - 0.1 * (beta + gamma)), where
+gamma is wall time in hours; the 0.1 factor is fixed by the scoring formula
+rather than fitted. The improvement rate is estimated from the attempt's
+realized history over the cheapest completed heavy move. Unknown gain, an
+unknown observation window, or insufficient elapsed evidence always keeps the
+attempt running, preventing missing data from discarding a possible gain.
 """
 from __future__ import annotations
 
@@ -60,9 +25,10 @@ MIN_PENALTY_FACTOR = 0.5
 
 def marginal_hurdle_mhz(alpha_mhz: float, horizon_s: float,
                         penalty_factor: float = 0.9) -> float:
-    """Alpha that must be gained over ``horizon_s`` to break even on gamma.
+    """Return the minimum Fmax gain required to offset a wall-time horizon.
 
-    Pure arithmetic from score = alpha*(1 - 0.1*(beta+gamma)).
+    The result is in MHz, and the horizon is converted from seconds to gamma
+    hours using score = alpha * (1 - 0.1 * (beta + gamma)).
     """
     if alpha_mhz <= 0 or horizon_s <= 0:
         return 0.0

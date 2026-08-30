@@ -1,17 +1,8 @@
-"""R-D1-1 auto-bank-after-heavy-op tests (2026-07-19).
+"""Tests automatic banking after successful heavy mutations.
 
-The boom_soc_2025.1_v2 eval run (2026-07-14, budget 3499s) completed a
-1387.79s vivado_phys_opt_design that was NEVER measured and NEVER banked —
-the LLM skipped the measurement call, ran `route_design -unroute`, the
-re-route was budget-killed, and finalize shipped baseline (alpha=0,
-rank 20/21).  The auto-bank hook in call_tool closes that hole: after ANY
-heavy mutating op returns OK, the harness itself measures contest-clock WNS
-(cheap SLACK query) and, if improved AND routed, mirrors best_valid — no
-LLM measurement call required.
-
-We never spawn Vivado/RapidWright/MCP — sessions are mocked, and the
-measurement / routedness / mirror primitives are stubbed per test so each
-gate of the hook is exercised in isolation.
+The hook measures the contest-clock slack and mirrors the result only when it
+is improved and routed. External tool sessions and measurement, routedness, and
+mirroring operations are mocked so each gate is exercised independently.
 """
 from __future__ import annotations
 
@@ -144,11 +135,9 @@ class AutoBankTests(unittest.TestCase):
     # ---- budget guard ---------------------------------------------
 
     def test_measurement_skipped_when_budget_tight(self):
-        # Remaining wall below the cheap-measurement floor AT HOOK TIME →
-        # the hook must skip the measurement ENTIRELY (no get_wns call),
-        # no mirror, no crash.  The boom shape: pre-flight passes with
-        # ample budget, then the heavy op itself consumes almost all of
-        # it — simulated by the session shrinking the deadline mid-call.
+        # The heavy operation consumes the remaining budget after preflight.
+        # If the measurement floor is no longer available at hook time, the
+        # hook skips measurement and mirroring without failing.
         opt = self.opt
 
         class _BudgetBurningSession(_FakeSession):
@@ -166,10 +155,9 @@ class AutoBankTests(unittest.TestCase):
     # ---- no double-measurement ------------------------------------
 
     def test_no_double_measure_on_measurement_tools(self):
-        # The existing WNS side-channel already handles these two tool
-        # names — the hook must not re-measure after them.
-        # target_clock stays None so the side-channel itself never calls
-        # get_wns_for_target_clock either.
+        # Timing-report tools already update the timing side channel and must
+        # not trigger a duplicate measurement. An unset target clock also
+        # prevents a targeted timing query from that side channel.
         self.opt.target_clock = None
         for tool in ("vivado_report_timing_summary", "vivado_get_wns"):
             self._call_heavy(tool_name=tool)
@@ -264,7 +252,7 @@ class AutoBankTests(unittest.TestCase):
         for tool in ("vivado_place_design", "vivado_route_design",
                      "vivado_phys_opt_design"):
             self.measure_calls.clear()
-            # S2 fix (jul20): double-blind gate now refuses with no cell
+            # S2 fix: double-blind gate now refuses with no cell
             # data — provide a small count so place_design stays feasible
             # (this test's subject is the hook, not the gate).
             self.opt._input_cell_count = 10_000

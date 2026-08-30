@@ -71,10 +71,11 @@ CONTEST_CLOCK = "clk_fpl26contest"
 
 
 def _get_fmax(vivado_module) -> tuple[Optional[float], Optional[float], Optional[float]]:
-    """Return (wns, period, fmax_mhz) for the contest clock.
+    """Read timing metrics for the target clock.
 
-    Vivado returns 0.0 (sentinel) if no path on the contest clock — we
-    convert to None.  Same logic as docs/optimization_example.md."""
+    Returns WNS and period in nanoseconds and Fmax in MHz. A tool-reported 0.0
+    sentinel indicating that no path exists on the clock is normalized to None.
+    """
     result = vivado_module.run_tcl_command(
         f"set p [get_timing_paths -max_paths 1 -group {CONTEST_CLOCK}]; "
         "if {[llength $p] > 0} {get_property SLACK $p} else {puts 0.0}",
@@ -195,12 +196,11 @@ def apply(
             result["status"] = "no_candidates"
             return result
 
-        # Try cells one at a time so a single bad candidate (e.g. RapidWright
-        # NPE on certain cell types) doesn't kill the whole recipe.  Stop at
-        # the first cell that successfully moves.  This was the failure mode
-        # of the first live AWS run on vexriscv_re-place — one bad register
-        # cell threw NPE inside DesignTools.fullyUnplaceCell, returned empty
-        # results, and the recipe never recovered.
+        # Try cells one at a time so that a single bad candidate — some cell
+        # types make the placer library throw — does not kill the whole recipe.
+        # Stop at the first cell that successfully moves.  Handled as a batch,
+        # one bad register cell throws inside the unplace call, the whole batch
+        # returns empty, and the recipe never recovers.
         cells_to_try = target_cells[:max_cells_to_try]
         logger.info(
             f"  {len(target_cells)} unique candidate cells in worst-{target_max_path} paths; "
@@ -245,16 +245,15 @@ def apply(
                 logger.info(f"    ✗ {cell_name}: empty result list (silent failure)")
 
             if cell_moved_this_attempt:
-                # We have a successful move.  Stop trying more cells —
+                # A successful move.  Stop trying more cells —
                 # additional moves compound risk of breaking the design.
                 logger.info(f"  stopping after first successful move (attempt {attempt_idx+1})")
                 break
 
-        # GATE: if no cells actually moved, the design state may be partially
-        # mutated (some cells unplaced but not re-placed by the failed call).
-        # Bail out cleanly without writing — write_checkpoint at this point
-        # would persist a corrupt state and route_design would emit routing
-        # errors (exact failure mode of the first live AWS run).
+        # Gate: if no cells actually moved, the design state may be partially
+        # mutated — some cells unplaced but not re-placed by the failed call.
+        # Bail out without writing: a checkpoint written here would persist a
+        # corrupt state, and the following route would emit routing errors.
         if not result["cells_moved"]:
             logger.info(
                 f"  optimize_cell_placement moved 0 cells "

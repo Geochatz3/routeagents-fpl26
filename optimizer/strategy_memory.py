@@ -1,34 +1,12 @@
-"""Strategy memory — RAG seed for the optimizer's iter-1 user prompt.
+"""Provide fingerprint-based strategy memory for the optimizer's initial prompt.
 
-At iter 1 the LLM otherwise has zero history.  This module loads past-run
-records (from prior portfolio campaigns and ongoing runs) and surfaces
-the highest-ΔFmax record for the current design — or, when the design is
-unknown, the closest fingerprint-matched record.
-
-Sources, in priority order:
-  1. STRATEGY_MEMORY_PATH env var → JSONL file written by past runs
-  2. ./strategy_memory.jsonl (repo-local, if present)
-  3. /mnt/d/fpl26_optimization_contest/analysis/all_10_designs.jsonl
-     (the canonical 10-design portfolio campaign data — see
-     reference_run_artifacts_path memory)
-
-Record schema (subset of portfolio_results.jsonl, all optional):
-  {
-    "design": "amd_mini-isp",
-    "candidate": "anchor"|"v0_3"|"v0_3_seedN",
-    "delta_fmax_mhz": 87.35,
-    "initial_fmax_mhz": 295.40,
-    "final_fmax_mhz": 382.75,
-    "iterations": 5,
-    "tool_calls": 41,
-    "force_continues": 1,
-    "total_cost_usd": 0.11,
-    "wall_time_s": 615.0,
-    "completed": true
-  }
-
-Why JSONL: append-only, line-atomic — concurrent runs from the
-scheduler can append without locking.
+Records are matched by structural features such as LUT count and critical-path
+spread, never by design name. When no close fingerprint exists, retrieval falls
+back to an aggregate of available records. Sources are checked in priority
+order: the path configured by `STRATEGY_MEMORY_PATH`, a repository-local JSONL
+file, and an optional external seed file. Record fields are optional to support
+partial histories. JSONL provides append-only, line-atomic storage so
+concurrent workers can append without locking.
 """
 from __future__ import annotations
 
@@ -42,45 +20,16 @@ from typing import Iterable, List, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEMORY_BASENAME = "strategy_memory.jsonl"
-# In-repo bundled seed memory (ships with the submission).  Loaded at
-# eval-time so the LLM has prior-campaign context even on a clean machine
-# with no access to dev-side /mnt/d/ artefacts.
+# In-repo bundled seed memory (optional; absent in the public release).
+# Loaded at eval-time so the LLM has prior-campaign context even on a
+# clean machine.
 SEED_PORTFOLIO_BUNDLED = Path(__file__).parent / "data" / "seed_memory.jsonl"
-# Dev-side full path (contains the same data plus possibly newer campaigns).
-# Used only when bundled file is missing or shorter — never overrides eval.
-SEED_PORTFOLIO_DEV = Path("/mnt/d/fpl26_optimization_contest/analysis/all_10_designs.jsonl")
+# Optional external seed portfolio (e.g. an archive of past campaigns).
+# Used only when the bundled file is missing — never overrides eval.
+SEED_PORTFOLIO_DEV = Path(
+    os.environ.get("FPL26_SEED_PORTFOLIO", "") or "seed_portfolio.jsonl")
 # Back-compat alias for tests / CLI; first existing path among candidates.
 SEED_PORTFOLIO_PATH = SEED_PORTFOLIO_BUNDLED if SEED_PORTFOLIO_BUNDLED.exists() else SEED_PORTFOLIO_DEV
-
-
-# Per-design curated notes — explicit guidance for designs where the
-# campaign-derived hints aren't enough.  Loss / tight-margin designs need
-# strategy classes our portfolio didn't explore.  Source: BASELINE_COMPARISON.md.
-DESIGN_NOTES = {
-    "corescore_500_mod": (
-        "LOSS vs published BL by ~25 MHz.  Strategy ceiling at +53 MHz across "
-        "anchor + v0_3 + 2 seeds — pblock + LLM-driven phys_opt cannot close the "
-        "gap.  Try a NEW class: vivado_phys_opt_design with directive="
-        "'AlternateFlowWithRetiming' or 'AddRetime' (register retiming), "
-        "or split into multi-PBLOCK floor-plan aligned to critical-path clusters."
-    ),
-    "finn_radioml": (
-        "TIE vs published BL.  Repeated v0_3 seeds gained +8 MHz over single "
-        "v0_3 — this design rewards seed variance.  Don't refine one chain; "
-        "try multiple distinct strategy classes within the budget."
-    ),
-    "rosetta_3d-rendering": (
-        "TIE vs published BL with narrow gap (publ.+v0_3_seed3 ≈ +7 MHz).  "
-        "Don't regress — small wins matter here."
-    ),
-    "vexriscv_re-place_v2": (
-        "Initial Fmax 397.5 MHz — very tight slack, near device ceiling.  "
-        "Standard pblock + place + route can't extract more.  Try "
-        "vivado_phys_opt_design directive='AggressiveExplore' chains, "
-        "register retiming (AlternateFlowWithRetiming), or BRAM/DSP "
-        "relocation if critical path crosses a die boundary."
-    ),
-}
 
 
 @dataclass
@@ -108,7 +57,7 @@ class RunRecord:
 
     @classmethod
     def from_dict(cls, d: dict) -> "RunRecord":
-        # Only keep fields we know about; ignore extras (forward-compat)
+        # Keep only known fields; ignore extras (forward-compat)
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in d.items() if k in known})
 
@@ -128,7 +77,7 @@ def _candidate_paths() -> List[Path]:
       1. STRATEGY_MEMORY_PATH env var (user override)
       2. ./strategy_memory.jsonl in cwd (per-project memory growing from runs)
       3. optimizer/data/seed_memory.jsonl (bundled with submission)
-      4. /mnt/d/.../all_10_designs.jsonl (dev-side; only if bundled missing,
+      4. FPL26_SEED_PORTFOLIO (external seed; only if bundled missing,
          to avoid loading duplicate records of the same campaign)
     """
     paths: List[Path] = []
@@ -171,11 +120,10 @@ def _load_jsonl(path: Path) -> List[RunRecord]:
 
 
 def load_memory(extra_paths: Optional[Iterable[Path]] = None) -> List[RunRecord]:
-    """Load all past runs from default + optional extra sources.
+    """Load and return strategy-memory records from default and optional sources.
 
-    Records are returned in the order encountered (first source first),
-    deduplication is *not* performed — callers can choose to use the
-    most-recent or highest-ΔFmax record per design.
+    Records retain source and file order, with earlier sources appearing first.
+    Duplicates are preserved so callers can choose their own recency or quality policy.
     """
     paths = _candidate_paths()
     if extra_paths:
@@ -186,66 +134,14 @@ def load_memory(extra_paths: Optional[Iterable[Path]] = None) -> List[RunRecord]
     return out
 
 
-# ---------------------------------------------------------------------------
 # Query
-# ---------------------------------------------------------------------------
-
-def all_for_design(
-    memory: List[RunRecord],
-    design_name: Optional[str],
-) -> List[RunRecord]:
-    """All completed records for this design, sorted by delta_fmax descending."""
-    if not design_name:
-        return []
-    matches = [
-        r for r in memory
-        if r.design == design_name
-        and r.delta_fmax_mhz is not None
-        and r.completed is not False
-    ]
-    matches.sort(key=lambda r: -(r.delta_fmax_mhz or 0))
-    return matches
-
-
-def best_for_design(
-    memory: List[RunRecord],
-    design_name: Optional[str],
-) -> Optional[RunRecord]:
-    """Highest delta_fmax_mhz record matching this design name.  Returns
-    None if no completed record exists for the design."""
-    matches = all_for_design(memory, design_name)
-    return matches[0] if matches else None
-
-
-def top_n_for_design(
-    memory: List[RunRecord],
-    design_name: Optional[str],
-    n: int = 3,
-) -> List[RunRecord]:
-    """Top N records for this design, dedup by candidate (so e.g. v0_3
-    seed1/seed2/seed3 don't all crowd the list with similar shape)."""
-    matches = all_for_design(memory, design_name)
-    seen_candidates = set()
-    out: List[RunRecord] = []
-    for r in matches:
-        # Strip _seedN suffix so different seeds collapse to one candidate class
-        cand = (r.candidate or "?").split("_seed")[0]
-        if cand in seen_candidates:
-            continue
-        seen_candidates.add(cand)
-        out.append(r)
-        if len(out) >= n:
-            break
-    return out
-
 
 def global_aggregate(memory: List[RunRecord]) -> str:
-    """When no per-design or fingerprint match exists, summarize what
-    candidates won across all designs in memory.  Gives the LLM a baseline
-    prior even on a totally unknown benchmark (e.g. a new hidden benchmark).
+    """Summarize candidate performance across all stored designs.
 
-    Returns a one-line summary like:
-        "Across 10 prior campaigns: v0_3 won 6×, anchor won 4× (global mean ΔFmax +52.5 MHz)"
+    Used as a baseline prior when neither a per-design nor fingerprint match
+    exists. Returns a one-line summary of win counts and the global mean
+    frequency change in MHz.
     """
     if not memory:
         return ""
@@ -284,10 +180,11 @@ def fingerprint_match(
     lut_count: Optional[int],
     spread: Optional[float],
 ) -> Optional[RunRecord]:
-    """Fallback: pick the closest fingerprint match when design name is
-    unknown.  Distance = relative-LUT + abs-spread (cheap heuristic).
+    """Find the strongest record associated with the closest fingerprint.
 
-    Returns the highest-ΔFmax record from the closest design's runs.
+    Distance is the sum of relative LUT difference and absolute spread
+    difference. Returns the record with the highest frequency improvement among
+    runs for the closest matching design.
     """
     if lut_count is None or spread is None:
         return None
@@ -310,61 +207,13 @@ def fingerprint_match(
     return min(candidates, key=lambda r: (dist(r), -(r.delta_fmax_mhz or 0)))
 
 
-# ---------------------------------------------------------------------------
 # Format for prompt
-# ---------------------------------------------------------------------------
-
-def format_top_n_for_prompt(
-    records: List[RunRecord],
-    design_name: Optional[str],
-) -> str:
-    """Multi-record variant: emit a small comparison table so the LLM
-    sees the spread between candidates.  Falls back to single-record
-    format when only one match exists.
-
-    Empty string when no records.
-    """
-    if not records:
-        return ""
-    if len(records) == 1:
-        return format_for_prompt(records[0], design_name)
-
-    header = "PRIOR-CAMPAIGN HISTORY (top candidates for this design):"
-    if records[0].design and design_name and records[0].design != design_name:
-        header = (
-            f"PRIOR-CAMPAIGN HISTORY (closest fingerprint match: "
-            f"'{records[0].design}'):"
-        )
-    lines = [header]
-    for r in records:
-        bits = []
-        if r.candidate:
-            bits.append(r.candidate)
-        if r.delta_fmax_mhz is not None:
-            bits.append(f"ΔFmax={r.delta_fmax_mhz:+.2f} MHz")
-        if r.iterations is not None:
-            bits.append(f"iters={r.iterations}")
-        if r.force_continues:
-            bits.append(f"force_continues={r.force_continues}")
-        if r.total_cost_usd is not None:
-            bits.append(f"cost=${r.total_cost_usd:.3f}")
-        if r.wall_time_s is not None:
-            bits.append(f"wall={r.wall_time_s:.0f}s")
-        lines.append("  - " + ", ".join(bits))
-    # Hints from the best record
-    hints = _hints_from_record(records[0])
-    if hints:
-        lines.append("  - HINTS (from best run):")
-        for h in hints:
-            lines.append(f"    * {h}")
-    return "\n".join(lines)
-
 
 def format_for_prompt(record: Optional[RunRecord], design_name: Optional[str]) -> str:
-    """Produce a short, prompt-ready snippet from a memory record.
+    """Format a memory record as a compact prompt snippet.
 
-    Empty string when no record (caller can omit the section entirely).
-    Kept terse — every prompt token costs against β.
+    Returns an empty string when no record is available, allowing the caller to
+    omit the section. The representation stays terse to limit prompt cost.
     """
     if record is None:
         return ""
@@ -488,20 +337,14 @@ def winning_tools_from_call_details(
     return out
 
 
-# ---------------------------------------------------------------------------
 # Append (producer side — called at end of every run)
-# ---------------------------------------------------------------------------
 
 def append_run(record: RunRecord, path: Optional[Path] = None) -> Optional[Path]:
-    """Append one record to the memory JSONL.  Caller passes a fully-
-    populated RunRecord; this function only handles the IO.
+    """Append a populated run record to the strategy-memory JSONL file.
 
-    Path resolution:
-      1. explicit `path` arg
-      2. STRATEGY_MEMORY_PATH env var
-      3. ./strategy_memory.jsonl in cwd
-
-    Returns the path written to, or None if writing failed.
+    The output path is resolved from the explicit path, then
+    `STRATEGY_MEMORY_PATH`, then `strategy_memory.jsonl` in the current
+    directory. Returns the written path, or `None` if writing fails.
     """
     if path is None:
         env = os.environ.get("STRATEGY_MEMORY_PATH")
@@ -516,124 +359,78 @@ def append_run(record: RunRecord, path: Optional[Path] = None) -> Optional[Path]
         return None
 
 
-# ---------------------------------------------------------------------------
 # Top-level convenience: one-shot lookup + format
-# ---------------------------------------------------------------------------
-
-def design_note_for(design_name: Optional[str]) -> str:
-    """Curated per-design note for known-LOSS / known-tight designs.
-
-    Returns a formatted snippet suitable for appending to the iter-1 user
-    message.  Empty string when no curated note exists.
-    """
-    if not design_name or design_name not in DESIGN_NOTES:
-        return ""
-    return f"DESIGN-SPECIFIC NOTE: {DESIGN_NOTES[design_name]}"
-
 
 def seed_prompt_for(
-    design_name: Optional[str],
+    design_name: Optional[str] = None,
     lut_count: Optional[int] = None,
     critical_path_spread: Optional[float] = None,
     top_n: int = 3,
     *,
     contest_mode: bool = False,
 ) -> str:
-    """Top-level: load memory, pick best matches, return formatted snippet.
+    """Top-level: load memory, pick the closest fingerprint match, return
+    a formatted snippet.
 
-    By default returns the top-3 candidates' summary so the LLM sees the
-    spread between strategies (e.g. anchor +46 vs v0_3 +53 vs another
-    seed +46).  Set top_n=1 for the single-record format.
+    Retrieval is fingerprint-only (LUT count + critical-path spread);
+    when no fingerprint match exists the global aggregate of past
+    campaigns is used as the fallback.  `design_name`, `top_n` and
+    `contest_mode` are accepted for call-site compatibility but no
+    longer affect retrieval — every mode gets the same feature-first
+    behavior the contest ship path used.
 
     Empty string when there's nothing useful to inject — caller can drop
     the entire section without conditional logic in the prompt template.
-
-    `contest_mode=True` enforces hidden-design hygiene per the two
-    open hard-rule violations:
-      - DESIGN_NOTES (benchmark-specific narratives) is NOT injected
-      - exact-name retrieval (`all_for_design` / `best_for_design` /
-        `top_n_for_design`) is NOT used as the primary lookup
-      - feature-first retrieval (LUT count + critical-path spread)
-        is preferred, with global aggregate as the final fallback
-    Use this on hidden contest designs the LLM has never seen.
     """
+    del design_name, top_n, contest_mode  # retrieval never keys on these
     memory = load_memory()
     if not memory:
         return ""
-    # In contest mode the curated note is forbidden — it leaks design
-    # name to the LLM and contains benchmark-specific policy hints.
-    note = "" if contest_mode else design_note_for(design_name)
-
-    # ---- Contest mode: feature-first only ----
-    if contest_mode:
-        fp = fingerprint_match(memory, lut_count, critical_path_spread)
-        if fp:
-            # Re-format without leaking design name as a key.  The
-            # `format_for_prompt` helper does NOT echo the design field
-            # by default — but the caller can pass design_name=None to
-            # suppress the optional header line.
-            return format_for_prompt(fp, design_name=None)
-        agg = global_aggregate(memory)
-        if agg:
-            return f"PRIOR-CAMPAIGN HISTORY: {agg}"
-        return ""
-
-    # ---- Normal (non-contest) mode: exact-name first ----
-    if top_n <= 1:
-        record = best_for_design(memory, design_name)
-        if record is None:
-            record = fingerprint_match(memory, lut_count, critical_path_spread)
-        single = format_for_prompt(record, design_name)
-        if single:
-            return _join_with_note(single, note)
-        agg = global_aggregate(memory)
-        if agg:
-            return _join_with_note(f"PRIOR-CAMPAIGN HISTORY: {agg}", note)
-        return note
-
-    records = top_n_for_design(memory, design_name, n=top_n)
-    if records:
-        return _join_with_note(format_top_n_for_prompt(records, design_name), note)
-
     fp = fingerprint_match(memory, lut_count, critical_path_spread)
     if fp:
-        return _join_with_note(format_for_prompt(fp, design_name), note)
-
-    # Truly unknown — fall back to global aggregate so the LLM still sees
-    # *some* historical prior rather than starting from scratch.
+        # Format without echoing the matched record's design name as a
+        # header key (design_name=None suppresses the optional header).
+        return format_for_prompt(fp, design_name=None)
     agg = global_aggregate(memory)
     if agg:
-        return _join_with_note(f"PRIOR-CAMPAIGN HISTORY: {agg}", note)
-    return note
+        return f"PRIOR-CAMPAIGN HISTORY: {agg}"
+    return ""
+
+
+def _is_negative(r: RunRecord) -> bool:
+    """A run counts as negative evidence: it did not complete, it did not
+    gain, or its note says it regressed.
+
+    One definition, deliberately: this was inlined twice with identical
+    bodies and a comment asserting they matched, which is the shape a
+    silent divergence hides in."""
+    if r.completed is False:
+        return True
+    if r.delta_fmax_mhz is not None and r.delta_fmax_mhz <= 0:
+        return True
+    if r.note and "regress" in str(r.note).lower():
+        return True
+    return False
 
 
 def retrieval_metadata_for(
-    design_name: Optional[str],
+    design_name: Optional[str] = None,
     lut_count: Optional[int] = None,
     critical_path_spread: Optional[float] = None,
     *,
     contest_mode: bool = False,
 ) -> dict:
-    """Return a compact dict describing what retrieval would inject,
-    without rendering the actual prompt text.  Used by the decision
-    tracer to record retrieval episodes per-run.
+    """Describe a retrieval episode without rendering prompt text.
 
-    Schema:
-      {
-        "rag_mode": "off" | "normal" | "contest_mode",
-        "retrieval_mode": "exact_name" | "feature_first"
-                          | "global_aggregate" | "none",
-        "design_notes_injected": bool,
-        "exact_name_used": bool,
-        "retrieved_episode_ids": list[str],
-        "negative_memory_count": int,
-        "memory_records_considered": int,
-      }
+    The returned mapping contains the RAG and retrieval modes, compatibility
+    flags, retrieved episode IDs, negative-memory count, and number of records
+    considered. Retrieval is fingerprint-only, so `design_notes_injected` and
+    `exact_name_used` are always false.
 
-    `retrieved_episode_ids` are deterministic per-record hashes
-    (8-char hex of design+candidate+delta_fmax+wall_time_s) so the
-    same physical run record always gets the same id across calls.
+    Episode IDs are deterministic eight-character hexadecimal hashes of the
+    record's design, candidate, frequency delta, and wall time.
     """
+    del design_name  # retrieval never keys on the design name
     out = {
         "rag_mode": "contest_mode" if contest_mode else "normal",
         "retrieval_mode": "none",
@@ -648,39 +445,15 @@ def retrieval_metadata_for(
     if not memory:
         return out
 
-    if contest_mode:
-        # No design_note, no exact-name retrieval.
-        fp = fingerprint_match(memory, lut_count, critical_path_spread)
-        if fp is not None:
-            out["retrieval_mode"] = "feature_first"
-            out["retrieved_episode_ids"].append(_episode_id(fp))
-        elif global_aggregate(memory):
-            out["retrieval_mode"] = "global_aggregate"
-    else:
-        out["design_notes_injected"] = bool(design_note_for(design_name))
-        records = top_n_for_design(memory, design_name, n=3)
-        if records:
-            out["retrieval_mode"] = "exact_name"
-            out["exact_name_used"] = True
-            out["retrieved_episode_ids"].extend(_episode_id(r) for r in records)
-        else:
-            fp = fingerprint_match(memory, lut_count, critical_path_spread)
-            if fp is not None:
-                out["retrieval_mode"] = "feature_first"
-                out["retrieved_episode_ids"].append(_episode_id(fp))
-            elif global_aggregate(memory):
-                out["retrieval_mode"] = "global_aggregate"
+    fp = fingerprint_match(memory, lut_count, critical_path_spread)
+    if fp is not None:
+        out["retrieval_mode"] = "feature_first"
+        out["retrieved_episode_ids"].append(_episode_id(fp))
+    elif global_aggregate(memory):
+        out["retrieval_mode"] = "global_aggregate"
 
-    # Negative memory count (same definition as negative_memory_block)
-    def is_negative(r: RunRecord) -> bool:
-        if r.completed is False:
-            return True
-        if r.delta_fmax_mhz is not None and r.delta_fmax_mhz <= 0:
-            return True
-        if r.note and "regress" in str(r.note).lower():
-            return True
-        return False
-    out["negative_memory_count"] = sum(1 for r in memory if is_negative(r))
+    # Negative memory count.
+    out["negative_memory_count"] = sum(1 for r in memory if _is_negative(r))
     return out
 
 
@@ -704,38 +477,23 @@ def negative_memory_block(
     critical_path_spread: Optional[float] = None,
     max_items: int = 3,
 ) -> str:
-    """Build an advisory block listing prior episodes that REGRESSED
-    or wasted budget on feature-similar designs.
+    """Build an advisory prompt block from unsuccessful feature-similar episodes.
 
-    Contest-mode adjunct: gives the LLM a "what to avoid" hint
-    without name-keying.  ADVISORY ONLY — does NOT directly gate
-    any tool call.  Empty string when no usable negative records
-    exist.
-
-    A record qualifies as negative-memory when any of:
-      - completed=False (run did not produce a measurable delta)
-      - delta_fmax_mhz is not None AND ≤ 0
-      - note explicitly mentions regression/regressed
+    The block does not gate tool calls and is empty when no usable records
+    qualify. A record qualifies if it is incomplete, has a nonpositive
+    frequency delta, or explicitly notes a regression.
     """
     if memory is None:
         memory = load_memory()
     if not memory:
         return ""
 
-    def is_negative(r: RunRecord) -> bool:
-        if r.completed is False:
-            return True
-        if r.delta_fmax_mhz is not None and r.delta_fmax_mhz <= 0:
-            return True
-        if r.note and "regress" in str(r.note).lower():
-            return True
-        return False
 
-    negative = [r for r in memory if is_negative(r)]
+    negative = [r for r in memory if _is_negative(r)]
     if not negative:
         return ""
 
-    # Prefer fingerprint-similar negatives if we know our features.
+    # Prefer fingerprint-similar negatives when the features are known.
     def similarity(r: RunRecord) -> float:
         if (lut_count is None or critical_path_spread is None
                 or r.lut_count is None or r.critical_path_spread is None):
@@ -776,26 +534,21 @@ def negative_memory_block(
     return header + "\n" + "\n".join(bullets)
 
 
-def _join_with_note(snippet: str, note: str) -> str:
-    """Glue a prior-campaign snippet and a curated design note with a blank
-    line separator.  Either side may be empty."""
-    parts = [s for s in (snippet, note) if s]
-    return "\n\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
 # CLI: inspect what the optimizer will see for a given design
-# ---------------------------------------------------------------------------
 
 def _cli(argv: Optional[List[str]] = None) -> int:
-    """`python -m optimizer.strategy_memory --query <design>` → print the
-    snippet the optimizer would inject for that design.  Useful for
-    debugging RAG output without running an MCP-bearing optimizer."""
+    """`python -m optimizer.strategy_memory --query --lut-count N --spread S`
+    → print the snippet the optimizer would inject for that fingerprint.
+    Useful for debugging RAG output without running an MCP-bearing
+    optimizer.  Retrieval is fingerprint-only; the query is the
+    (lut_count, spread) pair, never a design name."""
     import argparse
     parser = argparse.ArgumentParser(description=_cli.__doc__)
-    parser.add_argument("--query", help="Design name to inspect (e.g. amd_mini-isp).")
+    parser.add_argument("--query", action="store_true",
+                        help="Print the snippet retrieval would inject for "
+                             "the fingerprint given by --lut-count/--spread.")
     parser.add_argument("--lut-count", type=int, default=None,
-                        help="Fingerprint LUT count for unknown-design fallback.")
+                        help="Fingerprint LUT count.")
     parser.add_argument("--spread", type=float, default=None,
                         help="Fingerprint average critical-path spread (tiles).")
     parser.add_argument("--list", action="store_true",
@@ -866,12 +619,11 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         return 0
 
     snippet = seed_prompt_for(
-        design_name=args.query,
         lut_count=args.lut_count,
         critical_path_spread=args.spread,
     )
     if not snippet:
-        print(f"(no record found for '{args.query}'; "
+        print(f"(no record found for fingerprint "
               f"lut_count={args.lut_count}, spread={args.spread})")
         return 1
     print(snippet)

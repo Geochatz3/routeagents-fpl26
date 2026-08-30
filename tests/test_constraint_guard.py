@@ -1,4 +1,4 @@
-"""Tests for the XDC / timing-constraint integrity guard (jul25 panel, 5/5).
+"""Tests for the XDC / timing-constraint integrity guard.
 
 Editing timing constraints is DISQUALIFYING. Two properties matter most:
   * read-only timing analysis must NEVER be blocked (a false positive here
@@ -153,12 +153,8 @@ def test_empty_reports_parse_to_empty():
     assert parse_exception_report(None) == []
 
 
-# ------------------------------------ partial capture (aug06 regression)
-# Live incident, ispd16: report_clocks hit its 120s budget timeout while
-# report_exceptions succeeded. build_fingerprint used `and`, so the partial
-# snapshot was marked captured=True with clock_count=0 (the missing report
-# parses to []), and the guard announced "clock count 1 -> 0" on a design
-# whose constraints were never touched. That false alarm cost the benchmark.
+# Partial captures are unverified: if either clocks or exceptions is missing,
+# the fingerprint must not infer a change from an empty parsed report.
 
 def test_partial_capture_missing_clocks_is_unverified_not_changed():
     """The exact production shape: clocks timed out, exceptions returned."""

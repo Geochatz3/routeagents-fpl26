@@ -1,0 +1,42 @@
+name: offline tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # README.md states Python >= 3.10 as a requirement. Testing one version
+      # made that an unchecked claim, which is the one thing this repository
+      # is not supposed to ship. The floor and the current release both run;
+      # tests/test_supported_python.py keeps this list and the README in step.
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    name: tests (py${{ matrix.python-version }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run offline suite (no Vivado / LLM / network)
+        run: make test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Separate job and separate requirements file: the offline suite must
+      # stay runnable without a linter installed.
+      - name: Install ruff
+        run: pip install -r requirements-lint.txt
+      - name: Lint (narrow gate; see ruff.toml)
+        run: make lint

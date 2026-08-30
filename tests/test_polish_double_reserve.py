@@ -1,11 +1,9 @@
-"""FPL26_POLISH_NO_DOUBLE_RESERVE — the deep-replace double-reserve defect
-(2acb427) found by the same corpus method in the two post-ILS polish gates.
+"""Test that post-search polish gates do not reserve finalization time twice.
 
-Every budget number below is a REAL row mined from the jul30 decline census
-(124 agent.logs, both Dev Cloud boxes) — see
-final_round/POLISH_DOUBLE_RESERVE_jul30.md.  Pinning the corpus rows means a
-change to the 1.3 margin, the 300s reserve, or the predicate shape fails in the
-corpus's own terms rather than against a hand-picked example.
+The budget deadline already excludes the 300-second finalization reserve, so
+later polish checks must operate within that protected window without
+subtracting it again. The cases also preserve the 1.3 runtime margin and
+predicate boundaries.
 """
 import os
 import types
@@ -76,9 +74,7 @@ def _need(remaining_unused, logged_need, reserve):
     return (logged_need - 300.0) + reserve
 
 
-# --------------------------------------------------------------------------
 # DEFAULT OFF = byte-identical behaviour
-# --------------------------------------------------------------------------
 
 def test_default_off_keeps_the_full_reserve():
     rsv, tag = _Stub()._polish_gate_reserve_s(_cfg())
@@ -100,9 +96,7 @@ def test_only_truthy_values_arm_it(monkeypatch, value):
     assert _Stub()._polish_gate_reserve_s(_cfg())[0] == 300.0
 
 
-# --------------------------------------------------------------------------
 # ARMED — the correction, priced on the corpus
-# --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("value", ["1", "true", "on", "yes", "TRUE", " On "])
 def test_armed_drops_the_double_counted_term(monkeypatch, value):
@@ -140,9 +134,7 @@ def test_correction_is_discriminating_not_permissive(monkeypatch, name,
         f"{name}: cannot finish even corrected — must stay declined")
 
 
-# --------------------------------------------------------------------------
 # The honesty condition and the monotonicity property
-# --------------------------------------------------------------------------
 
 def test_no_wall_cap_keeps_the_reserve_even_when_armed(monkeypatch):
     """`_ils_polish_body` falls back to `time.time() + 1200` when there is no
@@ -179,7 +171,7 @@ def test_reserve_is_read_from_cfg_not_hardcoded(monkeypatch):
 
 
 def test_module_level_function_is_the_patch_target():
-    """Refactor policy jul26: keep patch targets module-global."""
+    """Refactor policy: keep patch targets module-global."""
     assert callable(dcp_optimizer.polish_gate_reserve_s)
     assert dcp_optimizer.polish_gate_reserve_s(_cfg(), None)[0] == 300.0
 
@@ -194,11 +186,9 @@ def test_stub_without_budget_deadline_fails_safe(monkeypatch):
     assert tag == "reserve 300s"
 
 
-# --------------------------------------------------------------------------
 # INTEGRATION — the real _fanout_polish_after_ils call site, replaying a mined
 # corpus row.  The pure-function tests above cannot catch a call site that
 # forgets to consult the helper; this one can.
-# --------------------------------------------------------------------------
 
 def _fanout_stage_probe(remaining_s, fan_anchor, budget_deadline_set=True):
     """Drive the REAL stage up to (at most) its first Vivado call.  Returns the
@@ -231,19 +221,19 @@ def _fanout_stage_probe(remaining_s, fan_anchor, budget_deadline_set=True):
 
 # fir_systolic__shipdef, mined: remaining 455s, logged need 470s
 # => est*1.3 = 170s, so the fanout anchor that produced it is ~131s.
-_FIR_REMAINING_S = 455.0
-_FIR_ANCHOR_S = 170.0 / 1.3
+_SHALLOW_REMAINING_S = 455.0
+_SHALLOW_ANCHOR_S = 170.0 / 1.3
 
 
 def test_integration_shipped_default_still_declines_the_mined_row():
-    assert _fanout_stage_probe(_FIR_REMAINING_S, _FIR_ANCHOR_S) == 0
+    assert _fanout_stage_probe(_SHALLOW_REMAINING_S, _SHALLOW_ANCHOR_S) == 0
 
 
 def test_integration_armed_flag_arms_the_mined_row(monkeypatch):
     """455s in hand for a 170s job — refused by the shipped gate for want of a
     reserve the deadline had already taken."""
     monkeypatch.setenv("FPL26_POLISH_NO_DOUBLE_RESERVE", "1")
-    assert _fanout_stage_probe(_FIR_REMAINING_S, _FIR_ANCHOR_S) > 0
+    assert _fanout_stage_probe(_SHALLOW_REMAINING_S, _SHALLOW_ANCHOR_S) > 0
 
 
 def test_integration_armed_still_declines_the_genuinely_infeasible(monkeypatch):
@@ -257,5 +247,5 @@ def test_integration_no_wall_cap_keeps_the_reserve(monkeypatch):
     """No `_budget_deadline` attribute => fail-safe: the shipped reserve
     stands even armed, so the mined row stays declined."""
     monkeypatch.setenv("FPL26_POLISH_NO_DOUBLE_RESERVE", "1")
-    assert _fanout_stage_probe(_FIR_REMAINING_S, _FIR_ANCHOR_S,
+    assert _fanout_stage_probe(_SHALLOW_REMAINING_S, _SHALLOW_ANCHOR_S,
                                budget_deadline_set=False) == 0

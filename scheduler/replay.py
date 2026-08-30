@@ -1,29 +1,11 @@
-"""
-Offline scheduler replay simulator.
+"""Replay scheduler decisions from previously recorded JSONL results.
 
-Reads our existing portfolio JSONL data (from `portfolio_runner.sh` runs)
-and simulates the scheduler.run_scheduled() flow without launching any
-new dcp_optimizer.py subprocesses.  Verifies that the scheduler's
-selection matches our human-curated portfolio winners on the campaign
-data — which is the goal-backward acceptance criterion in
-`.planning/beta/FINAL_DEV_ROADMAP.md` P0 subtask 4.
-
-Usage:
-    python3 -m scheduler.replay /mnt/d/.../portfolio_results.jsonl
-
-Each line of the JSONL is a row produced by portfolio_runner.sh's emit_row
-(design, candidate, exit_code, wall_time_s, final_fmax_mhz, …).  We group
-rows by design, simulate the scheduler making selections in candidate
-order honouring a 60-min total budget cap, and report:
-
-  - For each design: which candidate the scheduler picks, and whether it
-    matches the highest-final_Fmax-among-valid winner from the raw data.
-  - A roll-up of agreement vs disagreement.
-
-The replay does NOT introduce randomness; given the same JSONL it
-produces the same selection.  Differences from the human-portfolio
-selection are exactly the cases where the scheduler's budget heuristic
-disagrees with "best wins regardless of cost/time".
+Rows are grouped by design and evaluated in candidate order under the
+scheduler's 60-minute total budget without launching optimizer subprocesses.
+The replay reports each selected candidate, compares it with the highest valid
+final Fmax in the input, and summarizes agreement. Results are deterministic
+for identical input; differences identify cases where budget-aware selection
+differs from unconstrained best-result selection.
 """
 from __future__ import annotations
 
@@ -38,7 +20,7 @@ from .runner import CandidateResult, SchedulerConfig, select_best
 
 
 def _row_to_result(row: dict) -> CandidateResult:
-    """Map a portfolio_runner.sh JSONL row to a CandidateResult."""
+    """Map a portfolio-runner JSONL row to a CandidateResult."""
     dcp = row.get("optimized_dcp")
     return CandidateResult(
         candidate_name=row["candidate"],
@@ -271,9 +253,7 @@ def format_table(replay: dict) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Offline scheduler replay simulator")
@@ -290,7 +270,7 @@ def main(argv=None) -> int:
     parser.add_argument("--repeated-seeds", type=int, default=0,
                         help="After configured candidates, append up to N v0_3_seedN "
                              "rows from the JSONL to simulate the repeated-seed "
-                             "feature.  P2 from FINAL_DEV_ROADMAP.")
+                             "feature.")
     parser.add_argument("--budget", type=int, default=3600)
     parser.add_argument("--json", action="store_true", help="Output JSON instead of a table")
     args = parser.parse_args(argv)

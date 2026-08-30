@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Session-14 offline harness: join JSON QoR captures into episode_store.
+"""Offline harness: join JSON QoR captures into episode_store.
 
 Walks one or more run directories, finds ``*.qor.json`` files inside, and
 calls ``optimizer.episode_qor_join.join_qor_features`` to attach the

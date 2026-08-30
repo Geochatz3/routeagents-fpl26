@@ -1,11 +1,12 @@
-"""Unit tests for the insured terminal RE-PLACE GAMBLE stage (jul22
-placement flagship, P3+P2 merged) — no Vivado.
+"""Test the insured terminal replacement-placement stage without invoking the FPGA
+tool.
 
-Covers the panel-mandated discipline: default OFF (kill switch = no-op,
-zero diff), fail-closed budget (no anchor / no reserve -> skip), the
-+0.15ns adopt gate over chain-best, hold gate, never-bank-on-Tcl-error,
-banked-best-never-written insurance, ratcheting bar across draws, and the
-completion-to-valid kill-criterion instrumentation."""
+The stage is disabled by default and skips when no anchor or reserve is
+available. Adoption requires the configured 0.15 ns margin over chain-best and
+a passing hold check. Tool errors never bank results, banked-best artifacts
+remain protected, thresholds ratchet across draws, and termination depends on
+whether completed draws produce valid results.
+"""
 import asyncio
 import time as _time
 
@@ -21,9 +22,7 @@ from optimizer.replace_gamble import (
 )
 
 
-# ---------------------------------------------------------------------------
 # Config defaults (RC ships OFF; panel constants)
-# ---------------------------------------------------------------------------
 
 def test_default_off():
     # The RC must ship with the gamble OFF; the all-in window flips it on.
@@ -56,9 +55,7 @@ def test_variants_axes():
     assert ppo_idx == [len(REPLACE_GAMBLE_VARIANTS) - 1]
 
 
-# ---------------------------------------------------------------------------
 # Cost basis (fail closed on unknown)
-# ---------------------------------------------------------------------------
 
 def test_cost_basis_prefers_observed_explore_cycle():
     cfg = ILSPolishConfig(expected_heavy_cycle_s=1500.0)
@@ -78,9 +75,7 @@ def test_cost_basis_unknown_is_zero():
     assert replace_gamble_cost_basis(ILSPolishConfig(), {}) == 0.0
 
 
-# ---------------------------------------------------------------------------
 # Firing gate (pure)
-# ---------------------------------------------------------------------------
 
 def _should_run(**kw):
     base = dict(cfg=ILSPolishConfig(replace_gamble_enabled=True),
@@ -123,9 +118,7 @@ def test_gate_route_delay_frac():
     assert _should_run()[0] is True
 
 
-# ---------------------------------------------------------------------------
 # Adopt gate (pure)
-# ---------------------------------------------------------------------------
 
 def _accept(**kw):
     base = dict(new_wns=-0.5, best_wns=-0.8, unrouted=0, whs=0.02,
@@ -153,16 +146,14 @@ def test_adopt_rejects_missing_wns():
 
 
 def test_adopt_hold_gate_official_floor():
-    # official scorecard gate passes whs=0.0 (jul02 preview evidence)
+    # official scorecard gate passes whs=0.0
     assert _accept(whs=0.0)[0] is True
     assert _accept(whs=-0.0005)[0] is True   # cfg floor -0.001
     assert _accept(whs=-0.01)[0] is False
     assert _accept(whs=None)[0] is False
 
 
-# ---------------------------------------------------------------------------
 # Runner (fake call_tool; instant, so all timings are ~0)
-# ---------------------------------------------------------------------------
 
 def _cfg_run(**kw):
     base = dict(replace_gamble_enabled=True, expected_heavy_cycle_s=100.0)
@@ -288,7 +279,7 @@ def test_runner_two_errors_stop():
 
 def test_runner_never_banks_on_write_tcl_error():
     # accept-worthy wns but the bank write itself errors -> NOT adopted
-    # (jun12 phantom-accept lesson: never bank on a Tcl error).
+    # (phantom-accept lesson: never bank on a Tcl error).
     fake, _ = _fake_vivado([-0.4], write_resp="TCL ERROR: disk full")
     res, _ = _run(fake, _cfg_run(replace_gamble_max_draws=1))
     assert res.draws[0].verdict == "ERROR"
@@ -399,11 +390,9 @@ def test_runner_mid_stage_unaffordable(monkeypatch):
     assert any("verdict=UNAFFORDABLE" in m for m in logs)
 
 
-# ---------------------------------------------------------------------------
-# jul23 MUX wiring: the best VERIFIED draw is surfaced (best_draw_*)
+# MUX wiring: the best VERIFIED draw is surfaced (best_draw_*)
 # REGARDLESS of the +0.15 adopt gate, persisted to a _cand_d file
 # (banked best on disk still never touched).
-# ---------------------------------------------------------------------------
 
 def test_runner_surfaces_below_margin_verified_draw():
     # +0.05 draw: real, routed, hold-clean, but below the +0.15 adopt bar.
@@ -461,7 +450,7 @@ def test_runner_best_draw_prefers_higher_wns_verified_draw():
 
 def test_runner_cand_write_error_leaves_draw_unsurfaced():
     # A below-margin verified draw whose _cand write errors is NOT surfaced
-    # (never point the MUX at a stale/partial file — jun12 phantom lesson).
+    # (never point the MUX at a stale/partial file — phantom lesson).
     fake, _ = _fake_vivado([-0.75], write_resp="TCL ERROR: disk full")
     res, logs = _run(fake, _cfg_run(replace_gamble_max_draws=1))
     assert res.draws[0].completed_valid is True
@@ -478,9 +467,7 @@ def test_result_summary_lines():
                "adopted=1" in m for m in logs)
 
 
-# ---------------------------------------------------------------------------
 # DCPOptimizer stage wrapper (stub, _fanout_gate_probe idiom)
-# ---------------------------------------------------------------------------
 
 def _stage_probe(cfg, best_wns=-0.8, wns_seq=("-0.5",)):
     import dcp_optimizer as do

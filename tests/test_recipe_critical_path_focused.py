@@ -200,13 +200,9 @@ class CriticalPathFocusedBehaviourTests(unittest.TestCase):
         self.assertEqual(r["revert_status"], "reopened_best_valid")
 
 
-# Vivado-Tcl-shape lint rules.  Each rule is (predicate, message).
-# A predicate returns True when the Tcl text contains a forbidden
-# combination.  These exist because pure mock-based unit tests pass
-# any string back to the recipe — only a live Vivado round-trip
-# catches the syntax error.  The 2026-05-14 boom_soc scoped run
-# surfaced exactly such a bug (`-setup -delay_type max` together,
-# Vivado 12-608).  These rules pin the bug shape so it cannot recur.
+# These predicates flag forbidden Vivado Tcl combinations that mocked tool
+# calls cannot validate. In particular, `-setup` and `-delay_type max`
+# must not appear together in `get_timing_paths` commands.
 TCL_LINT_RULES = [
     (
         lambda s: "get_timing_paths" in s
@@ -228,11 +224,10 @@ def _lint_tcl(cmd: str) -> list[str]:
 
 
 class CriticalPathFocusedTclShapeTests(unittest.TestCase):
-    """Pin the actual Tcl strings the recipe issues to Vivado.
+    """Verify the exact Tcl commands issued by the critical-path recipe.
 
-    These tests would have caught the 2026-05-14 boom_soc scoped-run
-    Tcl bug (`-setup -delay_type max` together) before it consumed a
-    50-min capped run.  The keyword-matching tests above did not.
+    Exact string assertions protect command scoping and option compatibility
+    that keyword-only checks cannot detect.
     """
 
     def setUp(self):
@@ -294,11 +289,9 @@ class CriticalPathFocusedTclShapeTests(unittest.TestCase):
                          "must NOT use -delay_type with -setup (Vivado 12-608)")
 
     def test_extract_tcl_pins_full_command_shape(self):
-        # Snapshot of the exact Tcl the recipe emits.  If anyone
-        # changes the shape, this test fails loudly so the change is
-        # deliberate.  The shape was: 1) get_timing_paths -max_paths N
-        # -setup -sort_by slack, 2) extract ENDPOINT_PIN per path,
-        # 3) print ENDPOINTS:<count> + per-line EP:<pin>.
+        # This snapshot pins the Tcl protocol consumed by the parser:
+        # sorted setup paths, one endpoint pin per path, and stable
+        # `ENDPOINTS:<count>` and `EP:<pin>` output markers.
         self._run_recipe()
         extract = next((c for c in self.tcl_calls
                         if "get_timing_paths" in c and "ENDPOINTS:" in c), None)

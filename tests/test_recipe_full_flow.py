@@ -1,11 +1,8 @@
-"""Integration tests for the recipe-as-tool full flow.
+"""Exercise the complete recipe-as-tool flow with mocked tool responses.
 
-Mocks each call_tool response so we exercise the recipe's branching
-logic (no_candidates, no_cells_moved, route_errors, success) without
-running Vivado.  Catches issues like:
-  - the error-envelope detector accepting/rejecting the right shapes
-  - the route-error parser matching real Vivado output
-  - the candidate-filter dropping the right pins
+The tests cover no-candidate, no-move, routing-error, and success branches
+without invoking Vivado. They also validate error-envelope handling,
+routing-error parsing, and candidate-pin filtering.
 """
 from __future__ import annotations
 
@@ -25,11 +22,10 @@ _retime_recipe = DCPOptimizer._recipe_register_retiming
 
 
 class _MockOptimizer:
-    """Lookup-driven mock.  Configure `responses` to return canned strings
-    keyed by tool name.  All tools we don't configure return '{}' so the
-    error detector classifies them as success.
+    """Provide lookup-driven canned responses for optimizer tests.
 
-    Each instance gets a fresh tempdir to keep tests isolated.
+    Unconfigured tools return '{}' and each instance uses a fresh temporary
+    directory for isolation.
     """
     def __init__(self, design_name="amd_mini-isp", responses=None, temp_dir=None):
         import tempfile

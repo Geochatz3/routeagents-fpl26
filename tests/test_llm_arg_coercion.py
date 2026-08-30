@@ -1,27 +1,8 @@
-"""An LLM-emitted "20.0" cost corescore 63 MHz. Pin the coercion. (jul30)
+"""Tests coercion of LLM arguments declared as integers.
 
-THE INCIDENT, from the corpus. corescore_500_mod, jul27, run2 arm C1, env='' —
-the SHIPPED configuration:
-
-    recipe_high_fanout_timing_replication({"num_paths": "20.0"})
-    ERROR - Error in get_completion: invalid literal for int() with base 10: '20.0'
-
-`int("20.0")` raises ValueError. The model re-emitted the identical call and the
-error repeated SIX times at the same timestamp, each round burning LLM-loop
-budget. When the loop finally gave up, ~3 minutes of wall remained: the ILS ran
-one cycle and the run shipped
-
-    alpha +17.56   against +75.05 .. +86.80 over the eight other corescore runs
-                   (identical initial_fmax 344.23 in all nine)
-
-a 63 MHz loss to a string format. It is not a hard abort — the optimizer catches
-the error and asks the model to retry — which is precisely why it hid: the row
-banks as VALID_OPTIMIZED with a plausible alpha, and only shows up against the
-design's own distribution.
-
-The schema declares these fields as integers. A model is free to violate its own
-schema, and on a HIDDEN suite we get one run per design with no second chance, so
-the parser must absorb it rather than argue about it.
+Integer-valued decimal strings such as `"20.0"` are accepted because model
+output may not honor the schema exactly. Coercion prevents recoverable parse
+errors from consuming optimization-loop time.
 """
 from __future__ import annotations
 
@@ -32,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dcp_optimizer import _arg_float, _arg_int  # noqa: E402
+from tests.source_corpus import dcp_source_lines, dcp_source_text
 
 
 class ArgIntTests(unittest.TestCase):
@@ -83,11 +65,11 @@ class CallSiteTests(unittest.TestCase):
     def test_no_raw_coercion_of_llm_args_remains(self):
         """Every LLM-supplied numeric arg must go through the safe helpers.
 
-        A helper that exists but is not used at the call sites is the jul30
+        A helper that exists but is not used at the call sites is the
         half-deploy lesson applied to a function.
         """
         import re
-        src = (Path(__file__).resolve().parents[1] / "dcp_optimizer.py").read_text()
+        src = dcp_source_text()
         bad = re.findall(r"(?:int|float)\(args\.get\([^)]*\)\)", src)
         self.assertEqual(bad, [], f"raw coercions still present: {bad}")
 

@@ -1,18 +1,11 @@
-"""Tests for the v5.4 B3-FLOOR-EXIT chain.
+"""Tests the floor-saturation exit chain.
 
-Three pieces: (1) the NO_EDIF-aware convergence stop (defect fix — the
-exact-match status filter gave zero confirmations on bit-identical NO_EDIF
-attempts, burning a third identical attempt on the v5.3 gate's mini-ISP);
-(2) the wrapper honoring the b3_floor_saturated.token sentinel — stop the
-attempt loop after the attesting attempt and skip winner-polish; (3) the
-optimizer-side token writer condition. The B3 unmeasured-hold adopt guard
-lives in test_deep_replace_b3_smallfloor.py.
-
-The loop tests drive the REAL run() with only the process/IO seams stubbed
-(_run_attempt_process is the sanctioned seam — session lesson aug08), so the
-sentinel break, the cost accounting, and the convergence stop all execute
-their real arithmetic.
+The suite covers NO_EDIF-aware convergence, attempt-loop termination through
+the saturation sentinel, winner-polish suppression, and the sentinel writer
+condition. Loop tests execute the real control flow and arithmetic while
+stubbing only process and I/O seams.
 """
+import json
 import os
 import sys
 import unittest
@@ -63,10 +56,11 @@ class _LoopHarness:
     """
 
     def __init__(self, tmp: Path, token: bool = False, fmax_seq=None,
-                 token_attempts=()):
+                 token_attempts=(), spread=None, spread_aware=False):
         self.tmp = tmp
         self.fmax_seq = fmax_seq
         self.token_attempts = set(token_attempts)
+        self.spread_aware = spread_aware
         self.rds = []
         for i in range(1, (len(fmax_seq) if fmax_seq else 1) + 1):
             rd = tmp / f"rd{i}"
@@ -74,6 +68,9 @@ class _LoopHarness:
             if (fmax_seq is None and token) or (i in self.token_attempts):
                 (rd / "b3_floor_saturated.token").write_text(
                     "b3_floor_wns=-0.85 final_best_wns=-0.847\n")
+            if spread is not None:
+                (rd / "decisions.jsonl").write_text(
+                    json.dumps({"critical_path_spread": spread}) + "\n")
             self.rds.append(rd)
         self.rd = self.rds[0]
         self.attempts = 0
@@ -133,7 +130,8 @@ class _LoopHarness:
     def run(self):
         return mr.run(self.tmp / "in.dcp", self.tmp / "out.dcp",
                       total_wall=3500.0, attempt_floor=1200.0,
-                      max_attempts=4, repo=self.tmp, polish=True)
+                      max_attempts=4, repo=self.tmp, polish=True,
+                      spread_aware=self.spread_aware)
 
 
 def _with_env(key, val):
@@ -190,10 +188,8 @@ class B3FloorExitLoopTests(unittest.TestCase):
         self.assertEqual(h.polish_calls, 1)
 
     def test_token_on_a_non_best_attempt_does_not_break(self):
-        # review-1 (v5.4) finding 1: attempt 1 beats the floor (no token);
-        # attempt 2 lands on the floor and carries the token. The break must
-        # NOT fire — the design has demonstrated stochastic upside beyond
-        # the floor, so restarts and polish keep their value.
+        # A later floor-token attempt does not cover an earlier artifact that
+        # exceeded the floor; the loop continues and polishes the winner.
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             h = _LoopHarness(Path(td), fmax_seq=[500.0, 413.736, 413.736],
@@ -209,19 +205,15 @@ class B3FloorExitLoopTests(unittest.TestCase):
                         p.unlink()
                     except OSError:
                         pass
-            # no B3 break on attempts 2+ (their fmax is 86 MHz below the
-            # best); the loop runs on and the convergence stop needs two
-            # attempts within eps of the BEST (500), which never happens ->
-            # the full max_attempts=4 run, then polish.
+            # Later floor-token attempts are outside the convergence epsilon
+            # around the best result, so neither early-stop condition applies.
             self.assertEqual(h.attempts, 4)
             self.assertEqual(h.polish_calls, 1)
 
     def test_eps_tie_token_attempt_defers_to_the_convergence_stop(self):
-        # review-2 (v5.4.1) F1 repro: attempt 2 carries the token and sits
-        # 0.76 MHz BELOW attempt 1 — inside should_stop_early's eps, so the
-        # loop still stops at 2 via CONVERGENCE, but the polish must NOT be
-        # skipped: the winner is attempt 1's artifact, and the floor
-        # attestation does not cover it.
+        # The token-bearing second attempt is within convergence epsilon but
+        # below the first attempt. Convergence stops the loop, while polish
+        # still runs because the floor attestation does not cover the winner.
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             h = _LoopHarness(Path(td), fmax_seq=[414.5, 413.736],
@@ -287,3 +279,59 @@ class TokenWriterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class B3FloorExitHighSpreadTests(unittest.TestCase):
+    """The high-spread guard on the B3 exit must hold on the SHIP path.
+
+    The guard reads `high_spread`, which used to be populated only under
+    --spread-aware -- a flag no Makefile target passes. So on every scored
+    run it read None, `not bool(None)` was True, and the comment's promise
+    ("High-spread designs never break here: they need their draws") never
+    held. Measuring the spread is now unconditional; --spread-aware still
+    gates the only BEHAVIOUR the number drives, the early-stop floor.
+    """
+
+    def _drive(self, spread, spread_aware=False):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            h = _LoopHarness(Path(td), token=True, spread=spread,
+                             spread_aware=spread_aware)
+            h.install()
+            try:
+                with _with_env("FPL26_B3_FLOOR_EXIT", "1"):
+                    summary = h.run()
+            finally:
+                h.restore()
+                for p in h.made:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            return h, summary
+
+    def test_high_spread_blocks_the_exit_without_spread_aware(self):
+        # Ship path: no --spread-aware anywhere, so this is the real case.
+        h, summary = self._drive(spread=mr.HIGH_SPREAD_TILES + 1)
+        self.assertEqual(h.attempts, 2)      # not stopped at 1 by the token
+        self.assertEqual(h.polish_calls, 1)  # polish not skipped
+
+    def test_low_spread_still_takes_the_exit(self):
+        h, summary = self._drive(spread=mr.HIGH_SPREAD_TILES - 1)
+        self.assertEqual(h.attempts, 1)
+        self.assertEqual(h.polish_calls, 0)
+
+    def test_unreadable_spread_still_takes_the_exit(self):
+        # No decisions.jsonl -> spread unknown -> prior behaviour preserved.
+        h, summary = self._drive(spread=None)
+        self.assertEqual(h.attempts, 1)
+        self.assertEqual(h.polish_calls, 0)
+
+    def test_early_stop_floor_stays_opt_in(self):
+        # --spread-aware is what raises the convergence floor to 3 attempts;
+        # measuring the spread unconditionally must not do that on its own.
+        h_off, _ = self._drive(spread=mr.HIGH_SPREAD_TILES + 1)
+        h_on, _ = self._drive(spread=mr.HIGH_SPREAD_TILES + 1,
+                              spread_aware=True)
+        self.assertEqual(h_off.attempts, 2)
+        self.assertEqual(h_on.attempts, mr.HIGH_SPREAD_MIN_ATTEMPTS)

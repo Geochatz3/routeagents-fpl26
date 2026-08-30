@@ -1,31 +1,12 @@
-"""Bare re-route polish tests (drill jul21 D1-null).
+"""Tests a preserving bare reroute as an exit-tail polish step.
 
-Evidence: drill jul21 D1-null: +0.094 boom_v2 deterministic; meta:
-undirected beats directed.  On boom_v2's banked route-first state, ONE
-bare `route_design` (no directive, no -unroute) gains +0.094 ns
-hold-neutral, deterministically — and every DIRECTED variant tried the
-same day lost to it.
+The step runs only when local search did not arm, a routed banked best exists,
+and the estimated reroute cost fits the remaining wall time. The estimate uses
+half the route sample plus 30 seconds for banking and 60 seconds of margin,
+reflecting the lower cost of preserving reroutes.
 
-THE GAP: ILS's __ROUTE_ONLY__ combo already harvests this on designs
-where ILS runs, but boom-class designs are ILS-SIZE-GATED (379,380
-cells > max_cells 300k) so they never capture it.  The lever fires in
-the exit tail exactly when (a) ILS never armed, (b) a routed banked
-best exists (+ auto-bank machinery on), (c) the re-route fits the
-remaining wall per the PRESERVING cost basis
-(optimizer.route_gate.assess_preserving_reroute: this run's observed
-route_design sample × 0.5 + 30s banking + 60s margin — NOT the
-destructive K=2 basis, which refused at DEBUG-WALL (7200s vs 2375s)
-and on the leg-2 eval trace (3240s vs ~1300s), making the lever dead
-code.  Factor 0.5 ≈ 1.6× the MEASURED preserving ratio 0.31 from the
-drill1 log: bare route 1199s vs full AE route 3871s).
-
-Never-worse: measurement + banking ride the normal call_tool auto-bank
-path; the re-route mutates in-memory state only and the banked disk
-mirror is untouched.  C1-T3: the step counts as a POLISH stage — its
-completion releases the polish reserve.
-
-Stub-driven (tests/test_polish_reserve.py fixture style): no Vivado /
-RapidWright / MCP — we mock the call surface.
+Measurement and banking use the normal auto-bank path, so a worse result cannot
+overwrite the disk mirror. External tool calls are mocked.
 """
 from __future__ import annotations
 
@@ -78,7 +59,7 @@ class _FakeSession:
 
 
 BOOM_CELLS = 379_380          # the official-beta ILS-size-gated shape
-BOOM_BANKED_WNS = -10.676     # drill jul21 banked route-first state
+BOOM_BANKED_WNS = -10.676     # measured banked route-first state
 LEG2_ROUTE_SAMPLE_S = 1620.0  # leg-2 eval trace: recipe AE route sample
 LEG2_REMAINING_S = 1300.0     # leg-2 eval trace: remaining post-bank
 
@@ -87,11 +68,9 @@ def _make_optimizer(tmp_path: Path) -> DCPOptimizer:
     opt = DCPOptimizer(api_key="test", run_dir=tmp_path)
     opt.vivado_session = _FakeSession()
     opt.rapidwright_session = _FakeSession()
-    # These tests pin the PLAIN M1 loop invariants (still load-bearing:
-    # it is the shallow-state path, the kill-switch path AND the
-    # controller's fail-closed fallback).  The jul22 adaptive tail
-    # controller (default ON) would otherwise claim the deep-WNS
-    # fixtures — its own coverage lives in test_tail_controller.py.
+    # These fixtures exercise the plain reroute loop used for shallow states,
+    # the controller kill switch, and the fail-closed fallback.
+    # The adaptive tail controller is disabled so it does not claim them.
     opt._tail_controller_enabled = False
     return opt
 
@@ -262,9 +241,11 @@ class FiringGateTests(unittest.TestCase):
 
 
 class KeepBestTests(unittest.TestCase):
-    """Never-worse semantics ride the normal auto-bank path: a worse
-    re-route is measured but NOT banked (mirror untouched); an improved
-    AND routed re-route banks via the eager-mirror path."""
+    """Verifies that reroute polishing preserves the best banked result.
+
+    A worse reroute is measured but leaves the mirror unchanged; an improved,
+    routed result is banked through the eager-mirror path.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -289,7 +270,7 @@ class KeepBestTests(unittest.TestCase):
         mirror.assert_not_awaited()
 
     def test_improved_routed_reroute_banked(self):
-        # Drill shape: banked −10.676 -> bare re-route −10.582 (+0.094).
+        # Measured shape: banked −10.676 -> bare re-route −10.582 (+0.094).
         improved = BOOM_BANKED_WNS + 0.094
         mirror = mock.AsyncMock()
         with mock.patch.object(
@@ -329,7 +310,7 @@ class KeepBestTests(unittest.TestCase):
 
 
 class ReserveReleaseTests(unittest.TestCase):
-    """C1-T3 composition: the step counts as a POLISH stage — it may
+    """Composition: the step counts as a POLISH stage — it may
     spend the armed reserve (a bare route on a routed design is
     state-preserving, so neither reserve gate nor fence cap applies)
     and its completion releases it."""
@@ -389,10 +370,8 @@ class PreservingCostBasisTests(unittest.TestCase):
                          float("inf"))
 
     def test_factor_is_headroom_over_measured_ratio(self):
-        # Posture pin: measured preserving ratio 0.31 (drill1 log —
-        # bare route 1199s vs full AE route 3871s); shipped factor 0.5
-        # keeps ≥1.5x headroom over it.  If this constant moves, the
-        # leg-2 replay below must be re-derived.
+        # The preserving-route factor retains conservative cost headroom.
+        # Changing it requires re-deriving the leg-2 replay expectation.
         from optimizer.route_gate import PRESERVING_ROUTE_FACTOR
         measured_ratio = 1199.0 / 3871.0
         self.assertAlmostEqual(measured_ratio, 0.31, places=2)
@@ -406,7 +385,7 @@ class PreservingCostBasisTests(unittest.TestCase):
 class EvalShapeReplayTests(unittest.TestCase):
     """Replay the two real traces the gate was judged against.
 
-    Leg-2 eval trace (coordinator, jul21): route sample 1620s, ~1300s
+    Leg-2 eval trace (coordinator,): route sample 1620s, ~1300s
     remaining post-bank.  DEBUG-WALL local trace: predicted 7200s under
     the old K=2 destructive basis vs 2375s remaining (route sample
     3600s, open 68s).  The destructive basis refused BOTH; the shipped
@@ -587,14 +566,14 @@ class LoopKnobResolverTests(unittest.TestCase):
         self.assertEqual(resolve_bare_reroute_max_iters(1), 1)
 
 
-PROBE_START_WNS = -11.392     # plateau probe jul21: pre-loop boom state
+PROBE_START_WNS = -11.392     # plateau probe: pre-loop boom state
 PROBE_WNS_SEQ = (-11.177,     # pass 1: +0.215
                  -10.773,     # pass 2: +0.404 (the re-bite)
                  -10.769)     # pass 3: +0.004 (plateau decay < 0.020)
 
 
 class IterationLoopTests(unittest.TestCase):
-    """Plateau probe jul21: the rip-up re-roll COMPOUNDS while WNS is
+    """Plateau probe: the rip-up re-roll COMPOUNDS while WNS is
     deep (boom 2nd pass +0.404, cumulative +0.62 over two passes from
     −11.392) and decays near plateaus (fir +0.004).  The loop continues
     while gain >= min-gain AND the next pass wall-fits AND iters < max;
@@ -654,10 +633,9 @@ class IterationLoopTests(unittest.TestCase):
         names = [n for n, _ in self.opt.vivado_session.calls]
         # The POLISH itself is still EXACTLY one re-open + one bare route.
         self.assertEqual(names[:2], ["open_checkpoint", "run_tcl"])
-        # jul23 INSURED-COMPARE: the completed tail then enrolls its
-        # harvested best_valid into the finalize MUX — a belt-and-suspenders
-        # candidate appended AFTER the polish + reserve release (verify=True
-        # re-open + routed/hold/cell probes). It adds NO extra bare route.
+        # A completed tail contributes its best valid state to final selection
+        # after polish and reserve release. Verification reopens and probes
+        # the candidate without adding another bare route.
         self.assertEqual(names[2], "open_checkpoint")
         self.assertEqual(len(self._route_calls()), 1)
         self.assertEqual(self.opt.best_wns, PROBE_START_WNS)
@@ -724,19 +702,17 @@ class IterationLoopTests(unittest.TestCase):
         self.assertIsNone(self.opt._polish_reserve_release_reason)
 
     def test_observed_cost_refreshes_next_prediction(self):
-        # The iteration-2 wall-fit must be sized off the OBSERVED cost
-        # of iteration 1 (better predictor than the stale full-route
-        # sample) at preserve_factor 1.0 — an observed bare pass IS the
-        # sample; no full->bare discount re-applied.
+        # The second iteration uses the first iteration's observed bare-route
+        # cost for wall-fit sizing. Because it is already a bare-route sample,
+        # no full-to-bare discount is applied.
         import optimizer.route_gate as rg
         real_assess = rg.assess_preserving_reroute
         spy = mock.Mock(side_effect=real_assess)
 
         def _improve_and_stamp_cost(*_a, **_k):
-            # Simulate call_tool's recorded elapsed for the bare route
-            # (the fake session runs in ~0s): append a route_design
-            # record AFTER the real one so the observed-cost scan (max
-            # over the post-mark slice) picks 1234s.
+            # The fake session has negligible runtime, so append a synthetic
+            # route record after the real call. The observed-cost scan uses
+            # the maximum elapsed time in this post-mark slice.
             self.opt.tool_call_details.append({
                 "tool_name": "vivado_run_tcl",
                 "iteration": 99,

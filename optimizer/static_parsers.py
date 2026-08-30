@@ -1,6 +1,6 @@
 """Static, stateless parsers for Vivado report text.
 
-Extracted from dcp_optimizer.py (jul26) as sol-5.6's Step 2 — the ONLY production
+Extracted from dcp_optimizer.py — the only production
 extraction sanctioned before the final-round deadline, because this is the one span
 that passes every qualification gate: no free globals, no os.environ, no logger, no
 clock, no randomness, no filesystem, no self-state, no decorators, and it cannot

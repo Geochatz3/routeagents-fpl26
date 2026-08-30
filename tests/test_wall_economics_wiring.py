@@ -1,4 +1,4 @@
-"""Wiring tests for the derived wall-economics stop rule (jul26).
+"""Wiring tests for the derived wall-economics stop rule.
 
 optimizer/wall_economics.py is unit-tested in test_wall_economics.py (the
 arithmetic).  THIS file tests the INTEGRATION into dcp_optimizer:
@@ -8,11 +8,13 @@ arithmetic).  THIS file tests the INTEGRATION into dcp_optimizer:
     fire after seconds instead of after a real move's worth of wall);
   - the rule arms the EXISTING wall-handback signal, inheriting its locked
     guards (never before a banked accept, first-reason-wins);
-  - it is OBSERVE-ONLY by default — the ship path does not pass
-    --wall-handback, so wiring it is zero behavior change.
+  - it is OBSERVE-ONLY only while --wall-handback is off.  The Makefile
+    ship targets pass --wall-handback by default (WALL_HANDBACK=0 disables),
+    so on the ship path the signal is acted on; with the flag off, wiring
+    it is zero behavior change.
 
-The last point is the one that matters for shipping: these tests are the
-evidence that adding a fourth arming site did not alter default behavior.
+These tests are the evidence that adding a fourth arming site did not alter
+flag-off behavior.
 """
 from __future__ import annotations
 

@@ -1,29 +1,13 @@
-"""Feature-based recipe routing — generalizes cross-model steering beyond design names.
+"""Routes optimization recipes from measurable design features.
 
-Background: `optimizer/cross_model_steering.py` keys hints on `design_name`,
-so it works perfectly on the 4 calibrated designs (ispd16, boom_soc, finn,
-corescore) but contributes nothing to unseen contest benchmarks at
-submission time. The pathology classifier in `optimizer/pathology.py`
-gives a label (CELL_SPREAD, RETIMING_CANDIDATE, ...) but on the 4 known
-designs the label is the same (CELL_SPREAD) for four different winning
-recipes — so labels alone don't route.
-
-This module adds a second, finer-grained routing layer on top of the
-pathology classifier. Inputs are Phase-1 measurables only (|WNS|,
-target Fmax from clock period, failing endpoint count, critical-path
-average spread, remaining wall budget). Output is a structured
-RecipePlan with rule_id + ordered actions + blocks + evidence pointers.
-
-Design contract:
-  - PURE function. No Vivado/RapidWright/file IO. No mutation.
-  - Graceful degradation: missing features → rule doesn't fire (not a crash).
-  - Conservative: when no rule fires, returns a FALLBACK plan that tells
-    the LLM to follow the existing pathology-label recipe list.
-  - Auditable: every returned plan includes rule_id + evidence_designs so
-    a post-run audit can ask "did rule R1 fire on the right designs?".
-
-Rules are derived from .planning/beta/grok43_recovery_report.md §12.4
-and validated against the §12.6 known-design fingerprint table.
+Uses Phase-1 features only: WNS in ns, target Fmax, failing-endpoint count,
+critical-path spread, and remaining wall time. Returns a `RecipePlan`
+containing a rule identifier, ordered actions, blocked actions, and evidence
+references. Routing is pure and performs no tool, file, or mutation operations.
+Missing features prevent dependent rules from firing rather than raising
+errors. When no rule matches, the fallback plan delegates to the
+pathology-label recipe list. Every plan retains its rule and evidence metadata
+for auditing.
 """
 from __future__ import annotations
 
@@ -35,9 +19,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Inputs
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class PhaseOneFeatures:
@@ -66,11 +48,8 @@ class PhaseOneFeatures:
     critical_path_avg_spread_tiles: Optional[float] = None
     remaining_wall_budget_s: Optional[float] = None
     class_g_attempted: bool = False
-    # --- jul25 (B4) size + resource features -------------------------
-    # All OPTIONAL, like every field above: missing => a rule keyed on
-    # them simply cannot fire. Sourced from the Phase-1 probes
-    # (cell_count was already measured; the rest come from the
-    # report_utilization step that replaced report_qor_assessment).
+    # Optional size and utilization features populated by phase-one probes.
+    # A rule requiring a missing feature does not fire.
     cell_count: Optional[int] = None
     lut_util_pct: Optional[float] = None
     bram_util_pct: Optional[float] = None
@@ -83,7 +62,7 @@ class PhaseOneFeatures:
     def wns_magnitude_ns(self) -> Optional[float]:
         """FAILING depth in ns — 0.0 when timing is already met.
 
-        jul22 OOD stress fix (ood_router_stress_jul22 finding 3): the old
+        Out-of-distribution stress fix: the old
         abs(wns_ns) was SIGN-BLIND — a timing-MET design (wns > 0) read as
         deep-failing and could route into R1/R2/R3's destructive moves.
         All 13 real benchmarks enter with wns < 0, where max(0, -wns) ==
@@ -105,10 +84,8 @@ class PhaseOneFeatures:
     def achievable_fmax_mhz(self) -> Optional[float]:
         if self.wns_ns is None or self.clock_period_ns is None:
             return None
-        # Sign-correct achievable period (jul22 OOD stress fix, finding 3):
-        # period - wns  ==  period + |wns| when failing (wns < 0, all real
-        # vectors — unchanged) and  period - slack  when met (wns > 0; the
-        # OLD abs() UNDERestimated achievable fmax on met designs).
+        # The achievable period is clock period minus WNS for both failing and
+        # timing-met designs. A nonpositive result is treated as unavailable.
         denom = self.clock_period_ns - self.wns_ns
         if denom <= 0:
             return None
@@ -123,9 +100,7 @@ class PhaseOneFeatures:
         return a / t
 
 
-# ---------------------------------------------------------------------------
 # Outputs
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class RecipeAction:
@@ -140,7 +115,7 @@ class RecipePlan:
 
     rule_id: stable identifier ("R1".."R4" for positive recommendations,
       "FALLBACK" when no rule fires confidently).
-    confidence: "high" / "medium" / "low". Mirrors the §12.4 table.
+    confidence: "high" / "medium" / "low".
     summary: one-sentence label ("Full-scope global retiming").
     actions: ordered iter-1 sequence the LLM should prefer.
     blocks: recipes the LLM must NOT pick as iter-1 (from R5/R6).
@@ -157,20 +132,13 @@ class RecipePlan:
     evidence_designs: tuple[str, ...] = ()
 
     def format_for_prompt(self) -> str:
-        """Render the plan as injectable LLM prompt text.
+        """Render the recipe plan as prompt text for the language model.
 
-        Mirrors the cross_model_steering hint style so the LLM sees a
-        consistent format whether the steering came from a per-design
-        registry hit or from this feature-based router.
-
-        Empirical observation 2026-05-18 (uncovered-campaign):
-          - R3 (Class G) followed by LLM in 1/1 runs → +91.92 MHz win.
-          - R4 (safety path) NOT followed by LLM in 2/3 runs → 0 MHz.
-        The R4 prose was treated as advisory ("preferred"); the LLM did
-        direct phys_opt_design calls instead of step 1
-        (recipe_register_retiming). Language tightened below to make
-        step 1 the explicit FIRST move and direct phys_opt calls a
-        violation absent evidence.
+        The layout matches other steering hints so registry-based and
+        feature-based guidance use a consistent format. For the retiming safety
+        path, the text makes `recipe_register_retiming` the required first
+        action and disallows direct `phys_opt_design` calls unless supporting
+        evidence is available.
         """
         lines: list[str] = []
         lines.append(
@@ -209,7 +177,7 @@ class RecipePlan:
             lines.append(
                 f"  Evidence: rule validated on "
                 f"{', '.join(self.evidence_designs)} (forensic data, "
-                f".planning/beta/grok43_recovery_report.md §12)."
+                f"prior-model forensic log comparison)."
             )
         lines.append(
             "  Override policy: if step 1 of the sequence completes "
@@ -221,115 +189,36 @@ class RecipePlan:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Rules
-# ---------------------------------------------------------------------------
-# Each `_rule_RX` returns RecipePlan|None. Returns None when the rule's
-# guards aren't satisfied OR required features are missing. Caller
-# (decide_recipe_path) tries rules in priority order.
+# Each rule returns a plan only when all guards and required features match.
+# The router evaluates rules in priority order.
 
-# Thresholds — pulled from §12.4. Kept as module constants so tests can
+# Thresholds. Kept as module constants so tests can
 # import them and verify rule boundaries.
 
-# R1 = the HUGE-failing-set + WNS-bound family whose only viable move is
-# full-scope retiming (scoped recipes touch ~0.01% of the failing set).
-# Calibrated to cover BOTH huge designs (2026-06-02 live measurement):
-#   boom_soc : failing 217,988 / |WNS| 19.16 ns / fmax_ratio  8%
-#   ispd16   : failing 242,906 / |WNS|  7.75 ns / fmax_ratio 17% / spread 660
-# ispd16 was MISATTRIBUTED to R2 (fixture said 30k failing); the real design
-# has MORE failing endpoints than boom and routed to FALLBACK → 0 (it never
-# reached the retiming move that won it +16.95 on 2026-05-12, F3). The
-# failing≥100k guard restricts R1 to ONLY these two designs (no other
-# benchmark has ≥100k failing endpoints), so widening the WNS/fmax bounds to
-# include ispd16 cannot pull in any R3/R4-class design.
-R1_FAILING_ENDPOINTS_MIN = 100_000     # boom_soc 217k, ispd16 243k; gates to huge designs only
-R1_WNS_ABS_MIN_NS = 7.0                # boom 19.16, ispd16 7.75 (was 10.0)
-R1_FMAX_RATIO_MAX = 0.20               # boom 8%, ispd16 17% (was 0.15)
-# R1 ROUTE-FIRST split (jul05 probe): on the DEEP-extreme sub-class the
-# re-route alone carries most of the gain and retiming is the slow step —
-# boom (|WNS| 19.16): retiming 46 min local vs ispd16 (7.75): 17 min; the
-# jul05 probe recovered +4.49 of the +5.33 ns (84%) from the PRISTINE
-# netlist via unroute+AggressiveExplore alone (whs +0.001, ~57 min local,
-# fits the eval hour). Retime-first on this sub-class is a 50/50 wall race
-# (worst case ships the retime-only mirror ~ +2.9); route-first makes the
-# big chunk the SAFE floor and retiming the budget-gated bonus round.
-# Threshold history: 12.0 split 19.16 from 7.75 "with wide margin" — but the
-# (7.75, 12.0) band was uncalibrated, and the beta eval (2026-07-14) landed
-# boom_soc_v2 EXACTLY there (|WNS| 11.392, 220k failing, 379k cells): it
-# took retime-first, the 23-min retime pass + >=2888s re-route could not fit
-# the 3199s eval window, and the design scored alpha=0 (rank 20/21). The
-# jul19 AWS leg confirmed the shape at eval speed (retime 1444s measured;
-# predicted re-route 2888s refused by the D1 gate; banked-retime alpha only
-# +2.76 vs route-first's probe-proven +13.3-class floor). Lowered 12.0 ->
-# 10.0 (jul20): boom_v2 (11.392) now takes the SAFE route-first floor with
-# 1.39 ns margin; ispd16 (7.75) keeps its +39.6 retime-first path with 2.25
-# ns margin. For unknown hidden designs in the old dead band, route-first is
-# the conservative pick (retime-first is the 50/50 wall race).
+# R1 handles very large failing sets with deep negative slack and low achieved
+# frequency. Scoped changes affect too little of the failing set, so this
+# profile requires full-scope retiming.
+R1_FAILING_ENDPOINTS_MIN = 100_000     # measured 217k and 243k; gates to huge designs only
+R1_WNS_ABS_MIN_NS = 7.0                # measured 19.16 and 7.75
+R1_FMAX_RATIO_MAX = 0.20               # measured 8% and 17%
+# R1 routes first when negative slack is at least 10 ns, banking a usable
+# checkpoint before the slower retiming step. Retiming then runs only when
+# the remaining wall-clock budget permits.
 R1_ROUTE_FIRST_WNS_NS = 10.0
-# B2 (jul22 stress-test rec #5): the coverage hole where a design with a
-# HUGE failing set and DEEP WNS misses R1 only because its target clock is
-# slower, pushing fmax_ratio just over 0.20 -> no rule fires. That is the
-# exact shape of the historical ispd16 misattribution bug (FALLBACK on an
-# R1-shaped design -> phys_opt budget-skipped -> 0 MHz).
-# A >=100k failing set at |WNS| >= 7 ns IS a timing crisis regardless of
-# the ratio; the ratio gate exists only to exclude near-met designs.
-# 0.35 ~= 2x the worst CALIBRATED ratio (ispd16 17%; boom 8%) and stays
-# strictly below R3's 0.35 floor, so R1 cannot steal from R3/R4/R7. It
-# cannot steal from R2 either: R2 requires failing < 100k, R1 requires
-# >= 100k -- the two are disjoint on that feature.
+# A very large failing set with at least 7 ns of negative slack remains an R1
+# timing crisis even when a slower target clock raises the frequency ratio.
+# The 0.35 cap ends at R3's moderate-headroom boundary; the endpoint-count
+# guards keep R1 disjoint from R2.
 R1_FMAX_RATIO_MAX_HUGE_FAILING = 0.35
 
-# ---------------------------------------------------------------------------
-# T2/C5 ambiguity tie-break (jul20 plan-review consensus, diff-list #5)
-# ---------------------------------------------------------------------------
-# When features land WITHIN A NARROW BAND of a rule boundary AND the two
-# branches straddling that boundary differ in risk profile, resolve the
-# ambiguity toward the branch with the PROVEN BANKABLE FLOOR (route-first /
-# R1-class: unroute + AggressiveExplore banks a measured route) instead of
-# the gamble branch. This is a TIE-BREAK at existing boundaries only — no
-# threshold is re-tuned, and the check can only flip a decision TOWARD the
-# safer branch inside the band (never away from it, never outside it).
-#
-# Boundary-by-boundary risk audit (which boundaries get the tie-break):
-#
-#   TIE-BREAK — R1_ROUTE_FIRST_WNS_NS (10.0, internal R1 split):
-#     Below = retime-first, the 50/50 wall race that scored alpha=0 on
-#     boom_soc_v2 at eval (|WNS| 11.392 in the old dead band; 23-min retime
-#     + >=2888s re-route missed the 3199s window). Above = route-first, the
-#     probe-proven bankable floor (+4.49 of +5.33 ns from the pristine
-#     netlist; +13.3-class at eval). This is the ONLY boundary where both
-#     sides serve the SAME design profile (all R1 gates already passed) and
-#     exactly one side is the proven safe floor. Band = 1.5 ns below the
-#     split: [8.5, 10.0). ispd16 (7.75, the proven +39.6 retime-first
-#     winner) stays outside with 0.75 ns margin.
-#
-#   TIE-BREAK — R1_FAILING_ENDPOINTS_MIN (100k, count-scale), ONLY when the
-#     design is otherwise unambiguously deep-extreme (|WNS| >= 10.0 strict,
-#     no band-on-band compounding, ratio < R1_FMAX_RATIO_MAX): a design
-#     measured just below 100k failing endpoints currently gets R2's
-#     placement-preserving sweep (evidence +6.08 MHz on a 27k/14.5ns
-#     design — cannot move a 10+ ns miss) or FALLBACK (LLM freelancing,
-#     historically 0 on this class). Route-first is the proven floor for
-#     the deep-extreme shape and failing-endpoint counts are the noisiest
-#     Phase-1 measurable. Equivalent count distance derived from the WNS
-#     band ratio: 1.5/10.0 = 15% of the 100k threshold = 15,000 → band
-#     [85k, 100k), empty of measured designs (finn 46k ... boom 217k).
-#
-#   LEFT ALONE (documented so nobody adds generic fuzz later):
-#     - R1_WNS_ABS_MIN (7.0): both sides are gambles (below → FALLBACK,
-#       above → retime-first). Route-first below 8.5 ns has no probe
-#       evidence, and retime-first at 7.75 is the proven +39.6 winner —
-#       there is no bankable-floor side to prefer.
-#     - R1_FMAX_RATIO_MAX (0.20): ratio is DERIVED from wns + clock period,
-#       so a ratio band would double-count the WNS band's noise model.
-#     - R2/R3 meeting at 5.0 ns, R3/R4 at fmax 0.55, R4 band [0.5, 2.0],
-#       R4/R7 at 0.5 ns: neither side is route-first/R1-class; "safer" is
-#       ambiguous (sweep vs Class-G re-place vs placement-protecting
-#       ladder) and downside there is already bounded by the keep-best
-#       mirror. Fuzzing these would be threshold re-tuning by stealth.
-#     - R3_REMAINING_WALL_MIN_S: a feasibility gate, not a risk-profile
-#       choice — flipping near it would either launch Class G without the
-#       budget to finish or neuter R3.
+# Boundary tie-breaks absorb feature noise without changing rule thresholds.
+# They may only select R1's route-first plan and only within these bands.
+# The WNS band [8.5, 10.0) ns favors the checkpoint that can be banked first.
+# The endpoint band [85k, 100k) applies only when |WNS| is at least 10 ns
+# and the frequency ratio is below 0.20, preventing compounded ambiguity.
+# Its 15% width matches the WNS band's relative width.
+# Do not add bands to derived-ratio, cross-profile, or feasibility boundaries;
+# those lack a uniquely safer branch or could launch work without enough time.
 TIEBREAK_WNS_BAND_NS = 1.5
 # Count-scale equivalent distance: same relative width as the WNS band
 # (1.5 / 10.0 = 15%) applied to the failing-endpoint threshold → 15,000.
@@ -337,63 +226,30 @@ TIEBREAK_FAILING_BAND = round(
     R1_FAILING_ENDPOINTS_MIN * TIEBREAK_WNS_BAND_NS / R1_ROUTE_FIRST_WNS_NS
 )
 
-# R2 real design (measured 2026-06-03): vtr_mcml — |WNS| 14.5, fmax 9.6%,
-# spread 184, failing 27,003 (< 100k so it misses R1). Replication sweep
-# yielded +6.08 MHz. (ispd16, the former R2 fixture, is actually R1 — 243k
-# failing.)
-R2_WNS_ABS_MIN_NS = 5.0                # vtr |WNS|=14.5
-R2_FMAX_RATIO_MAX = 0.25               # vtr 9.6%
-R2_SPREAD_MIN_TILES = 70.0             # vtr spread 184 (high)
-R2_FAILING_ENDPOINTS_MAX = 100_000     # vtr 27k (< R1's 100k floor)
+# R2 handles medium failing sets with large negative slack and high spatial
+# spread, using a placement-preserving replication sweep.
+R2_WNS_ABS_MIN_NS = 5.0                # calibration design: |WNS|=14.5
+R2_FMAX_RATIO_MAX = 0.25               # calibration design: 9.6%
+R2_SPREAD_MIN_TILES = 70.0             # calibration design: spread 184 (high)
+R2_FAILING_ENDPOINTS_MAX = 100_000     # calibration design: 27k (< R1's 100k floor)
 
-R3_WNS_ABS_MIN_NS = 1.0                # finn |WNS|=1.91
-# Max raised 3.0 → 5.0 (2026-06-04) to close the realistic FALLBACK gap at
-# |WNS| 3–5 ns.  The feature-space sweep found a band BETWEEN R3 (was |WNS|≤3)
-# and R2 (|WNS|≥5) where a moderate-headroom, placement-limited design would
-# fall through to the generic FALLBACK recipe instead of the proven Class-G
-# Explore lever.  Measured full-13 |WNS| set is {0.95,0.98,1.03,1.24,1.65,1.69,
-# 1.91,2.15,7.75,14.53,19.16} (+2 timing-met) — NONE sit in (3,5), so widening
-# the band cannot re-route any validated design.  R2 (min 5.0) is tried BEFORE
-# R3 in _POSITIVE_RULES, so the bands meet at 5.0 with R2 taking precedence; a
-# |WNS|≥5 design still hits R2 first.  R3's fmax gate [0.35,0.55) is deliberately
-# left unchanged so only the same moderate-headroom profile is admitted — a
-# (3,5)-WNS design far from target (fmax<0.35) still falls through, as intended.
-# Generalization-only: unvalidated on a real gap-design; shipped test-gated.
+R3_WNS_ABS_MIN_NS = 1.0                # calibration design: |WNS|=1.91
+# R3 covers moderate-headroom, placement-limited failures through 5 ns.
+# R2 is evaluated first, so exactly 5 ns belongs to R2 when its other guards match.
+# The frequency-ratio bounds keep lower-headroom designs out of this path.
+# The 25-minute wall gate covers an approximately 16-minute pass plus margin.
 R3_WNS_ABS_MAX_NS = 5.0
-R3_FMAX_RATIO_MIN = 0.35               # finn 46%
-R3_FMAX_RATIO_MAX = 0.55               # < corescore 57%
+R3_FMAX_RATIO_MIN = 0.35               # calibration design: 46%
+R3_FMAX_RATIO_MAX = 0.55               # below the next design's 57%
 R3_REMAINING_WALL_MIN_S = 25 * 60      # 25 min — Class G ≈ 16 min + safety margin
-# R3's Class-G default is `place_design Explore`. The spread→Explore audit
-# that gated R4 shows Explore HURTS placement-OK (low-spread) designs but WINS
-# on placement-limited (high-spread) ones.  Full-13 real-spread measurement
-# (2026-06-03) brackets the boundary tightly:
-#   Explore WINS  : vexriscv 53.5 (+113), amd 56.9 (+100.7), 3d 65.8, finn 255 (+52)
-#   Explore HURTS : optical 15.2 (Auto_1 +27 vs Explore 14-23), spam 8.4
-# i.e. the crossover lies in the EMPTY gap (15.2, 53.5].  The floor 30 sits in
-# that gap — below every measured Explore-winner (lowest 53.5) and above every
-# Auto_1 design (highest 15.2).  Set well below R4's 100 because R3 designs have
-# more placement headroom (fmax 35-55% vs R4's 57%+) so Explore pays off at
-# lower spread.  KNOWN spread < floor → safe Auto_1; UNKNOWN keeps Explore
-# (R3's validated default; spread analysis is optional/often skipped, so
-# defaulting unknown→safe would neuter R3).
+# High critical-path spread indicates placement limitation and selects Explore;
+# known low spread selects the placement-preserving Auto_1 strategy.
+# Missing spread fails open to Explore because spread analysis is optional.
 R3_EXPLORE_SPREAD_MIN_TILES = 30.0
 
-# Post-placement REROUTE CHAIN — OFF by default (FPL26_R3_REROUTE_CHAIN=1 to arm).
-#
-# Evidence: rosetta_3d-rendering's artifact-verified +19.09 (jul04; the DCP was
-# opened jul27 — 11197 fully routed nets, 0 routing errors, WNS -1.910 matching
-# the headline). Its gain splits:
-#     re-place    -2.153 -> -2.068   0.085 ns
-#     REROUTE     -2.068 -> -1.910   0.158 ns   <- ~2x the placement work
-# route Explore -> critical_pin_opt -> route AggressiveExplore. No recipe
-# prescribes it; the jul26 run reached the retime step, stopped, and shipped
-# +7.39. This is the jun15 AggressiveExplore lever, never promoted into R3.
-#
-# DEFAULT OFF because R3 also routes finn_radioml, whose +61.96 parity record
-# does NOT use this chain. A 5th step changes what finn is told, and the
-# existing 4-step contract is asserted by
-# test_recipe_router.test_finn_triggers_r3_class_g. Arming it is an A/B, not a
-# default: the flag exists so 3d can be tested without altering finn.
+# Optional R3 post-placement chain: route Explore, critical_pin_opt, then route
+# AggressiveExplore. It is disabled by default because the extra step changes
+# the established four-step plan and can perturb otherwise suitable placement.
 def _r3_reroute_chain() -> tuple:
     """Optional 5th R3 step. Empty tuple unless explicitly armed."""
     if os.environ.get("FPL26_R3_REROUTE_CHAIN", "0") != "1":
@@ -408,30 +264,24 @@ def _r3_reroute_chain() -> tuple:
                   "regression. Worth 0.158 ns on 3d-rendering — twice the "
                   "re-place above it. Skip entirely if budget is tight: this "
                   "must never displace the placement work. Sizing is MEASURED "
-                  "from 3d's jul04 run: route Explore 375s + critical_pin_opt "
+                  "from the evidence run: route Explore 375s + critical_pin_opt "
                   "46s + route AggressiveExplore 882s = 1303s, so a 15-min gate "
                   "would start a 22-min chain and be killed mid-reroute."),
         ),
     )
 
-R4_WNS_ABS_MIN_NS = 0.5                # corescore |WNS|=1.24
+R4_WNS_ABS_MIN_NS = 0.5                # calibration design: |WNS|=1.24
 R4_WNS_ABS_MAX_NS = 2.0
-R4_FMAX_RATIO_MIN = 0.55               # corescore 57%
-# Within the R4 band, place_design Explore wins big on PLACEMENT-LIMITED
-# designs (high critical-path spread) but HURTS placement-OK designs (low
-# spread).  Probe 2026-06-02: corescore (spread 232) Explore +82-83 MHz 2/2
-# vs Auto_1 +6; optical-flow (spread 15) Explore 14-23 vs Auto_1 ~26 (worse +
-# high variance).  Threshold 100 separates them with margin; unknown spread
-# falls back to the safe Auto_1 path.
+R4_FMAX_RATIO_MIN = 0.55               # calibration design: 57%
+# Within R4, high critical-path spread selects Explore for placement-limited
+# designs; low spread selects Auto_1 to preserve suitable placement.
+# The 100-tile threshold separates these regimes, and missing spread fails
+# closed to the safer Auto_1 path.
 R4_EXPLORE_SPREAD_MIN_TILES = 100.0
 
-# R7 — closure class (hidden-benchmark gap found live 2026-06-11): NEAR-MET
-# designs (|WNS| below R4's 0.5ns floor, high fmax ratio) fell through every
-# positive rule to FALLBACK — none of the 13 benchmarks have this profile, but
-# the organizer's demo_corundum does (wns=-0.099, ratio 95%, failing=42) and
-# the hidden benchmark may too. The winning live moves were targeted phys_opt
-# iteration (group_path focus + critical_cell_opt: +0.041ns in one pass), NOT
-# re-placement — a near-met placement is an asset; unplace would gamble it.
+# R7 handles near-met designs with a high achieved-frequency ratio.
+# Preserve their placement and apply targeted physical optimization; broad
+# replacement would discard an asset while closing only a small timing gap.
 R7_WNS_ABS_MAX_NS = 0.5                # strictly below R4's floor — no overlap
 R7_FMAX_RATIO_MIN = 0.85               # demo_corundum 95%
 
@@ -445,16 +295,11 @@ R6_SCOPE_MULTIPLIER = 50                    # spec: 50× scope → block as prim
 
 
 def explore_runtime_estimate_s(cell_count: Optional[int]) -> Optional[float]:
-    """Estimated `place_design -directive Explore` wall for a design this size.
+    """Estimates Explore placement wall time from cell count.
 
-    Replaces the hardcoded "~9-15 min" prose, which was calibrated on corescore
-    (252,741 cells, measured 582 s) alone and applied across a 158x cell-count
-    range: on vexriscv (3,373 cells) Explore genuinely costs ~60 s, so the old
-    constant was ~10x too pessimistic; extrapolated to an ispd16-sized 532k-cell
-    design it is ~1,225 s, which is far beyond it in the other direction.
-
-    Returns None when cell_count is unknown — callers must then fall back to the
-    old static gate rather than guess.
+    Returns seconds from a cell-count scaling model fitted to timed placement
+    runs. Returns `None` when cell count is unavailable; callers must then use
+    the existing static gate rather than guess.
     """
     if cell_count is None or cell_count <= 0:
         return None
@@ -469,10 +314,9 @@ def fmt_est_s(seconds: Optional[float]) -> Optional[str]:
 
 
 def place_est_note(f: "PhaseOneFeatures", static_text: str) -> str:
-    """Size-derived Explore/place estimate, or the original static text.
+    """Formats a size-derived Explore placement estimate when available.
 
-    Returns the measured-model estimate when cell_count is known; otherwise the
-    caller's hardcoded string is preserved verbatim (no guessing without size).
+    Preserves the caller-provided static text verbatim when cell count is unknown.
     """
     est = fmt_est_s(explore_runtime_estimate_s(f.cell_count))
     if est is None:
@@ -497,10 +341,10 @@ def route_est_note(f: "PhaseOneFeatures", static_text: str,
 
 
 def classg_runtime_estimate_s(cell_count: Optional[int]) -> Optional[float]:
-    """Modelled wall for the WHOLE Class-G sequence (Explore + route + bank).
+    """Estimates wall-clock seconds for the complete Class G sequence.
 
-    Both terms are measured, not assumed: Explore from 39 timed calls across 12
-    designs, route from 163 timed calls at the Default directive Class G uses.
+    The estimate combines fitted timing models for Explore placement and
+    default-directive routing, including the banking step.
     """
     e = explore_runtime_estimate_s(cell_count)
     if e is None:
@@ -509,15 +353,12 @@ def classg_runtime_estimate_s(cell_count: Optional[int]) -> Optional[float]:
 
 
 def explore_infeasible_reason(f: PhaseOneFeatures) -> Optional[str]:
-    """Non-None iff a size-aware estimate says Class G cannot complete.
+    """Returns a reason when the estimated Class G sequence cannot finish in time.
 
-    SAFETY-ONLY, BY DESIGN: this can make Explore-recommending rules STRICTER,
-    never looser. The measured model also shows the old 25-minute floor is far
-    too pessimistic for small designs (a 3.4k-cell design needs ~60 s, not 25
-    min) — but LOOSENING a gate on a model rather than a live A/B is exactly the
-    kind of projection this project has been burned by, so the loosening side is
-    deliberately NOT implemented here. It is logged as an opportunity in
-    EXPLORE_RUNTIME_MODEL_jul25.md pending a live trial.
+    This guard may only tighten Explore eligibility; it never admits a run that
+    the static budget gate rejects. Model-based estimates are used
+    conservatively because underestimating runtime can consume the remaining
+    optimization budget.
     """
     est = classg_runtime_estimate_s(f.cell_count)
     if est is None or f.remaining_wall_budget_s is None:
@@ -535,7 +376,7 @@ def explore_infeasible_reason(f: PhaseOneFeatures) -> Optional[str]:
 
 
 def high_congestion_risk(f: PhaseOneFeatures) -> bool:
-    """True when utilization alone puts us in the panel's band-2 risk region."""
+    """True when utilization alone puts us in the high-utilization risk band."""
     return (f.lut_util_pct is not None
             and f.lut_util_pct >= R8_HIGH_UTIL_PCT)
 
@@ -586,16 +427,12 @@ def _r1_route_first_plan(rationale: str) -> RecipePlan:
 
 
 def _rule_r1(f: PhaseOneFeatures) -> Optional[RecipePlan]:
-    """R1 — huge-failing-set + WNS-bound family (boom_soc, ispd16).
+    """Routes very large failing sets with deep negative slack to global retiming.
 
-    Single full-scope phys_opt with global retiming. Scoped recipes
-    address ~0.01% of the failing set and are demonstrably 35× under
-    baseline (boom_soc scoped: +0.082 MHz vs +2.87 baseline). ispd16
-    (failing 242,906) joined this family 2026-06-02: its proven win is
-    the same AlternateFlowWithRetiming move (F3, +16.95 MHz), and routing
-    it here makes that the FIRST action so the ~33-min pass runs before
-    the LLM exhausts the budget exploring (the FALLBACK baseline did
-    exactly that → phys_opt budget-skipped → 0).
+    Schedules a single full-scope `phys_opt` pass with global retiming as the
+    first action. Scoped optimization is avoided because it reaches too little
+    of the failing set, and the full pass must begin before the wall budget is
+    depleted.
     """
     if f.failing_endpoint_count is None:
         return None
@@ -612,17 +449,14 @@ def _rule_r1(f: PhaseOneFeatures) -> Optional[RecipePlan]:
             "[router-r1-valve] fmax_ratio %.0f%% exceeds the calibrated "
             "%.0f%% bound but failing=%d (>= %d) at |WNS|=%.2f ns is an "
             "R1-class crisis — claiming it here rather than letting a "
-            "slower target clock drop it out of the band (B2/jul22 rec #5).",
+            "slower target clock drop it out of the band.",
             f.achievable_fmax_ratio * 100, R1_FMAX_RATIO_MAX * 100,
             f.failing_endpoint_count, R1_FAILING_ENDPOINTS_MIN,
             f.wns_magnitude_ns,
         )
     if f.wns_magnitude_ns >= R1_ROUTE_FIRST_WNS_NS:
-        # DEEP-extreme sub-class (see R1_ROUTE_FIRST_WNS_NS): re-route first
-        # (the cheap 84% chunk becomes the safe floor), retiming second as a
-        # budget-gated bonus round. jul05 probe: baseline netlist unroute +
-        # AggressiveExplore = -19.162 -> -14.675 (whs +0.001) on the class
-        # evidence design.
+        # For deep negative slack, reroute first to bank a usable checkpoint.
+        # Retiming follows only when the remaining budget can support it.
         return _r1_route_first_plan(
             rationale=(
                 f"failing_endpoints={f.failing_endpoint_count:,} (≥ {R1_FAILING_ENDPOINTS_MIN:,}), "
@@ -643,14 +477,10 @@ def _rule_r1(f: PhaseOneFeatures) -> Optional[RecipePlan]:
                 note=("directive=AlternateFlowWithRetiming, full-design scope, "
                       "single ~40 min call (UG835: 'aggressive replication + retiming')"),
             ),
-            # DRILL H (jun15, integrated jul02): this family's input routing
-            # is Default-quality; re-routing the SAME placement with
-            # AggressiveExplore gained +2.53 ns GT on ispd16's scored clock on
-            # top of the retiming result. Routing an already-routed design is
-            # only incremental cleanup, so a full unroute must precede it.
-            # Hold: the official scorecard gate passes whs=0.0 (jul02 preview
-            # evidence), and the agent's keep-best mirror preserves the
-            # retiming result if the re-route lands worse.
+            # AggressiveExplore must follow a full unroute; routing an already-routed
+            # placement performs only incremental cleanup.
+            # The keep-best mirror preserves the retimed checkpoint if rerouting
+            # degrades timing. Zero hold slack passes the scorecard gate.
             RecipeAction(
                 name="vivado_run_tcl",
                 note=("command='route_design -unroute' — REQUIRED before the "
@@ -701,29 +531,15 @@ def _r2_sweep_plan(rationale: str) -> RecipePlan:
         ),
         blocks=("recipe_cell_replacement",),  # detour analysis would stall
         rationale=rationale,
-        # B3 (jul22 rec #4): R2 is the LARGEST region of the router's
-        # feature space (~50% of Monte-Carlo draws) yet carried an EMPTY
-        # evidence tuple, which reads as "no rule ever validated this".
-        # vtr_mcml is R2's real, live-confirmed design (2026-05-18,
-        # +6.08 MHz) and every R2 threshold in this file is commented
-        # against it (|WNS|=14.5, spread 184, failing 27k). Backfilled so
-        # the audit trail matches the calibration. ispd16 stays out —
-        # reattributed to R1 (2026-06-02).
         evidence_designs=("vtr_mcml",),
     )
 
 
 def _rule_r2(f: PhaseOneFeatures) -> Optional[RecipePlan]:
-    """R2 — medium failing set, large WNS, high spread (no live evidence design).
+    """Routes medium failing sets with large WNS and high critical-path spread.
 
-    NOTE (2026-06-02): R2's original evidence design was ispd16, but a live
-    measurement showed real ispd16 has 242,906 failing endpoints (not the
-    ~30k once assumed) and is now correctly routed to R1 (huge-failing-set
-    retiming family). R2 therefore has NO current benchmark — it remains as a
-    profile-based rule for a medium-failing (<100k) + high-WNS + high-spread
-    design should one appear in the hidden set. `critical_cell_opt` replicates
-    shared drivers on the worst paths; cell_replacement is blocked (detour
-    analysis would stall).
+    Uses `critical_cell_opt` to replicate shared drivers on the worst paths.
+    Blocks `cell_replacement` because detour analysis can stall on this profile.
     """
     if (f.wns_magnitude_ns is None
             or f.achievable_fmax_ratio is None
@@ -747,52 +563,30 @@ def _rule_r2(f: PhaseOneFeatures) -> Optional[RecipePlan]:
 
 
 def _rule_r3(f: PhaseOneFeatures) -> Optional[RecipePlan]:
-    """R3 — finn-like: moderate WNS, mid fmax ratio, sufficient wall budget.
+    """Routes moderate WNS and mid-range Fmax ratios through a one-shot Class G
+    sequence.
 
-    Class G: place_design -unplace + {Explore|Auto_1} + route +
-    AlternateFlowWithRetiming. One-shot — Vivado place_design Explore is
-    nondeterministic (no -seed knob in 2024+), and re-rolls can land worse
-    than the first attempt.
-
-    The placement directive is spread-gated (mirrors R4, 2026-06-02 audit):
-      - spread ≥ R3_EXPLORE_SPREAD_MIN_TILES (or UNKNOWN) → `Explore`
-        (placement-limited; finn spread 60 → +54 MHz). This is R3's
-        validated default; unknown spread keeps it because spread analysis
-        is optional and defaulting unknown→safe would neuter R3.
-      - KNOWN spread below the floor → `Auto_1` (placement already good;
-        Explore would add variance/loss, as it did on optical-flow under R4).
+    Orders unplacement and placement before routing and
+    `AlternateFlowWithRetiming`. Selects `Explore` when spread is unknown or at
+    least `R3_EXPLORE_SPREAD_MIN_TILES`; otherwise selects `Auto_1`. Unknown
+    spread defaults to `Explore` because spread analysis is optional and the
+    rule targets placement-limited designs. The placement is not retried
+    because `Explore` has no seed control and reruns can regress.
     """
     if (f.wns_magnitude_ns is None
             or f.achievable_fmax_ratio is None):
         return None
     if f.class_g_attempted:
         return None
-    # jul22 OOD stress fix (finding 2): wall_budget=None no longer hard-
-    # kills R3 — that exact hole FALLBACK'd finn_radioml and rosetta_3d
-    # live (2026-05-20/21 archived logs) on otherwise-unambiguous R3
-    # profiles, leaving +54 MHz-class gains uncaptured.  Degraded route:
-    # assume-enough with an audit marker (mirrors the R1/R2 degraded
-    # convention).  Safe because (a) recipes are iter-1 plans where the
-    # true remaining wall ≈ the full hour, and (b) the destructive-op
-    # route_gate still refuses the heavy ops at EXECUTION time if the
-    # real wall cannot rebuild the state.
+    # A missing wall budget does not reject R3; the plan is marked as degraded
+    # because first-iteration planning normally has most of the wall budget.
+    # Execution remains fail-closed: the route gate rejects destructive
+    # operations when the available wall time cannot rebuild the state.
     budget_degraded = f.remaining_wall_budget_s is None
-    # jul25 constants audit: the wall gate is size-AWARE when we know the size.
-    # R3_REMAINING_WALL_MIN_S (25 min) was calibrated on finn/corescore and
-    # applied across a 158x cell-count range; it refused Class G on vexriscv
-    # attempt 3 (3,373 cells, sequence models at ~125 s) by ~95 s — and that
-    # attempt produced our single biggest alpha. The static floor is kept ONLY
-    # for the unknown-size case, where guessing is not allowed.
-    # jul25 audit: R8 blocks `place_design -unplace` at high utilization and on
-    # memory-dominated designs. That op is Class G's FIRST STEP, so firing R3
-    # there would emit a self-contradictory plan ("do Class G" + "do not unplace").
-    # Decline instead and let the OOB floor take it with the never-worse sweep.
-    #
-    # This IS a downgrade of a calibrated rule on an uncalibrated feature, which
-    # we refused to do for R1 — the difference is that R1's route-first sequence
-    # (unroute -> route) is untouched by R8's blocks, so R1 stays coherent, while
-    # R3's core move is precisely the blocked one. Coherence forces the choice;
-    # the panel (4/5) also puts this exact case behind the safety floor.
+    # Wall feasibility uses the size model when cell count is known and the
+    # static floor otherwise. Class G begins by unplacing, which resource-risk
+    # policy forbids under high congestion risk or memory dominance.
+    # Declining here avoids emitting a plan whose first operation is blocked.
     if high_congestion_risk(f) or f.memory_dominated:
         logger.info(
             "[router-r3-resource] declining Class G: lut_util=%s%% "
@@ -810,12 +604,9 @@ def _rule_r3(f: PhaseOneFeatures) -> Optional[RecipePlan]:
             and (budget_degraded
                  or f.remaining_wall_budget_s >= _wall_min)):
         return None
-    # jul25 (B4): size-aware Explore feasibility. R3 recommends Class G, whose
-    # FIRST step is a full re-place; the static 25-min floor was calibrated on
-    # finn/corescore and is size-blind across a 158x cell-count range. If the
-    # measured size model says the placement alone cannot leave room to route
-    # and bank, decline R3 and let the OOB floor take it. SAFETY-ONLY: this can
-    # only make R3 stricter, never looser.
+    # Class G must leave enough time after full placement for routing and
+    # banking. Decline when the size-based model cannot fit the whole sequence;
+    # this feasibility check can only make R3 stricter.
     _infeasible = explore_infeasible_reason(f)
     if _infeasible is not None:
         logger.info("[router-r3-size] declining Class G: %s", _infeasible)
@@ -892,17 +683,13 @@ def _rule_r3(f: PhaseOneFeatures) -> Optional[RecipePlan]:
 
 
 def _rule_r4(f: PhaseOneFeatures) -> Optional[RecipePlan]:
-    """R4 — corescore-like: near-target Fmax, small WNS, retime-eligible.
+    """Routes near-target, retiming-eligible designs through placement refinement.
 
-    retime → unplace + place → retime → critical_pin_opt. The placement
-    directive is chosen by critical-path spread (2026-06-02 probe):
-      - HIGH spread (≥ R4_EXPLORE_SPREAD_MIN_TILES) → placement-limited →
-        `place_design Explore` (corescore, spread 232: +82-83 MHz 2/2 vs the
-        old safe Auto_1 +6.15).
-      - LOW spread / unknown → placement already good → `place_design Auto_1`
-        (optical-flow, spread 15: Explore gave 14-23 < Auto_1 ~26, worse +
-        high variance → keep the safe ML-selected directive).
-    The agent's best_valid mirror bounds downside if a placement collapses.
+    Orders retiming, unplacement and placement, a second retiming pass, then
+    `critical_pin_opt`. Selects `Explore` when spread reaches
+    `R4_EXPLORE_SPREAD_MIN_TILES`; low or unknown spread selects `Auto_1` to
+    limit placement variance. The `best_valid` checkpoint bounds the downside
+    of a degraded placement.
     """
     if f.wns_magnitude_ns is None or f.achievable_fmax_ratio is None:
         return None
@@ -968,24 +755,19 @@ def _rule_r4(f: PhaseOneFeatures) -> Optional[RecipePlan]:
 
 
 def _rule_r7(f: PhaseOneFeatures) -> Optional[RecipePlan]:
-    """R7 — closure class: near-met timing (|WNS| < 0.5 ns, fmax ratio ≥ 85%).
+    """Routes near-met timing to a placement-preserving physical-optimization
+    ladder.
 
-    Found live 2026-06-11 on the organizer's demo_corundum (wns −0.099,
-    ratio 95%, failing 42): below R4's WNS floor NO positive rule fires and
-    the design fell to FALLBACK. The right move on a near-met design is a
-    targeted phys_opt LADDER — group the worst endpoints, iterate granular
-    phys_opt passes while they keep improving — and to PROTECT the placement
-    (it is 95% of the way there; unplace/re-place gambles a near-win on
-    placer variance). Live evidence: critical_cell_opt with a path group
-    gained +0.041 ns in one pass on demo_corundum.
+    Applies when absolute WNS is below 0.5 ns and the Fmax ratio is at least
+    85%. Groups the worst endpoints and runs granular `phys_opt` passes while
+    they continue to improve. Preserves the existing placement because
+    unplacement exposes a near-closed design to unnecessary placer variance.
     """
     if f.wns_magnitude_ns is None or f.achievable_fmax_ratio is None:
         return None
-    # jul22 OOD stress fix (finding 3 follow-through): magnitude 0.0 =
-    # timing MET (sign-aware wns_magnitude_ns) — include it: a met hidden
-    # design belongs exactly here (protect the placement, push slack with
-    # granular phys_opt), not in FALLBACK freelancing.  No real benchmark
-    # enters met, so real-vector routing is unchanged.
+    # Zero sign-aware WNS magnitude means timing is met and remains eligible.
+    # Such designs keep their placement and use granular physical optimization
+    # to improve slack rather than falling back to unconstrained planning.
     if not (0.0 <= f.wns_magnitude_ns < R7_WNS_ABS_MAX_NS
             and f.achievable_fmax_ratio >= R7_FMAX_RATIO_MIN):
         return None
@@ -1053,78 +835,48 @@ def _check_r6_block(f: PhaseOneFeatures, current_blocks: set[str]) -> Optional[s
     return None
 
 
-# ---------------------------------------------------------------------------
-# C1-T4b feature-None degradation (jul20 phase-1 red-team audit)
-# ---------------------------------------------------------------------------
-# Phase-1 optional steps can be skipped (timeout, RapidWright OOM, and now
-# the T4a cumulative wall cap), nulling exactly the features some rules
-# hard-require: R1 needs failing_endpoint_count, R2 needs spread.  Before
-# this layer, a design whose profile was otherwise unambiguous fell through
-# to FALLBACK — LLM freelancing, the known rank-20 boom pattern (beta eval
-# 2026-07-14: FALLBACK on an R1-shaped design scored alpha=0).
-#
-# This layer runs ONLY when no positive rule fired (the plan would be
-# FALLBACK), so it can never re-route a design that routes today — every
-# existing fixture is unchanged by construction.  Each degraded path fires
-# only when its ONE feature is None and the remaining features make the
-# profile unambiguous; the plan carries an explicit rationale marker so
-# post-run audits can count degraded routings.
+# Optional phase-one extraction may leave a rule-required feature unavailable.
+# Degraded routing runs only after all positive rules decline, and only when
+# exactly one feature is missing while the remaining profile is unambiguous.
+# Each degraded plan carries a marker for post-run auditing.
 
 # Rationale markers (tests import these — keep the literals stable).
 OOB_ROUTE_FIRST_WNS_NS = R1_ROUTE_FIRST_WNS_NS
 
-# --- R8 (jul25 uncovered-bands panel) --------------------------------
-# The panel was 4/5 that the OOB safety floor is the right POLICY for the
-# four uncovered bands, and unanimous in direction: less aggression, not
-# more. Blocking needs far weaker evidence than recommending, so these are
-# expressed as BLOCKS, never as new recipes.
-# NOTE ON HONESTY: the panel's band is "util > 75% WITH CONGESTION". We
-# cannot measure congestion at iter-1 (it is only reliable from a
-# post-route QoR JSON; --capture-qor is default-OFF and post-finalize), so
-# this fires on UTILIZATION ALONE. That is a deliberate over-trigger: it
-# may block a gamble on a dense-but-uncongested design. Accepted because
-# the blocked moves are all unproven on this band anyway.
+# Resource-risk handling adds blocks rather than recommending new recipes.
+# Iteration-one congestion is unavailable without optional post-route data,
+# so high utilization acts as a conservative proxy and may over-block dense
+# but uncongested designs. This protection intentionally fails closed.
 R8_HIGH_UTIL_PCT = 75.0
 
-# --- Explore runtime model (jul25, 39 measured calls / 12 designs) -----
-# explore_s ~= 55 + 0.0021*cells. Predicts 62 s at 3,373 cells (measured
-# 60) and 581 s at 252,741 (measured 582). Mid-range is over-predicted by
-# ~20-30%, i.e. the model errs SAFE. See EXPLORE_RUNTIME_MODEL_jul25.md.
+# Explore runtime coefficients use seconds and seconds per cell.
+# The linear estimate is intentionally conservative for mid-sized designs.
 EXPLORE_BASE_S = 55.0
 EXPLORE_S_PER_CELL = 0.0021
-# Explore is only ONE step of Class G — a route and a bank must still fit
-# afterwards, so feasibility is judged on the WHOLE sequence rather than on a
-# guessed fraction of the remaining wall. The route term is measured the same
-# way Explore was (163 timed route_design calls): at the Default directive
-# Class G actually uses, large designs route at ~0.70-1.06 s per 1k cells
-# (252,741 cells -> 176 s; 157,166 -> 166 s). AggressiveExplore routing is ~4x
-# that (379k -> ~1,680 s) but Class G does not use it. Bank/write measured at
-# ~20 s on the largest design (PHASE1_AUDIT_jul25.md); 60 s is a safe reserve.
+# Class G feasibility budgets Explore, default routing, and bank/write as one
+# sequence. The routing coefficient is seconds per cell; the 60-second bank
+# reserve and safety factor cover fixed overhead and runtime-model error.
 CLASSG_ROUTE_S_PER_CELL = 0.0010
 CLASSG_BANK_RESERVE_S = 60.0
 CLASSG_SAFETY_FACTOR = 1.25
 OOB_MARKER = "out-of-band: no calibrated rule"
 R1_DEGRADED_MARKER = "degraded: failing=None"
 R2_DEGRADED_MARKER = "degraded: spread=None"
-# jul22 OOD stress fix (finding 2): R3 fires with an audit marker when
-# ONLY the wall-budget feature is missing (in-rule, not in
-# _degraded_feature_route — R3's plan construction is spread-gated and
-# must stay single-sited).
+# R3 handles a missing wall budget in-rule because its plan construction is
+# spread-gated and must remain single-sited. The plan records the degradation.
 R3_DEGRADED_MARKER = "degraded: wall_budget=None"
 
 
 def _check_r8_blocks(f: PhaseOneFeatures,
                      current_blocks: set) -> "tuple[str, ...]":
-    """R8 — resource-risk blocks (jul25 uncovered-bands panel).
+    """Identify resource-risk conditions that should block disruptive routing
+    actions.
 
-    High utilization: a full re-place or a full unroute+re-route on a design
-    that is already dense risks not converging at all, and the ONE datapoint we
-    own anywhere near this regime went the wrong way (pblock compaction to raise
-    utilization: local 2-CPU +17 MHz -> eval-parity 8-vCPU **-63 MHz**).
-
-    Memory-dominated (BRAM/URAM >> LUT): the panel's band 4, "entirely
-    untested" at 5/5. Memory macros are large, often location-constrained, and
-    re-placing them is the refuted cell-replacement lever in another costume.
+    Dense designs block full re-placement and full unroute-and-reroute because
+    either operation may fail to converge. Memory-dominated designs receive the
+    same protection because large, location-constrained memory macros make
+    re-placement especially disruptive. The resulting blocks protect otherwise
+    uncovered feature bands.
     """
     out: list[str] = []
 
@@ -1141,29 +893,16 @@ def _check_r8_blocks(f: PhaseOneFeatures,
 
 
 def _degraded_feature_route(f: PhaseOneFeatures) -> Optional[RecipePlan]:
-    """Map a single-feature-None profile to the nearest safe positive rule.
+    """Select a safe routing plan when a required feature is unavailable.
 
-    Degraded R1 (failing_endpoint_count=None): fires only when |WNS| is
-    DEEP-extreme (>= R1_ROUTE_FIRST_WNS_NS) and R1's ratio gate passes.
-    Emits the ROUTE-FIRST plan only — the proven bankable floor.  Never
-    the retime-first gamble: without the failing count we cannot confirm
-    the huge failing set that justifies a 20-40 min retime-first bet, and
-    route-first banks a measured route on any deep-extreme design.
-
-    Degraded R2 (spread=None): fires only when the REST of R2's profile
-    matches with the failing count KNOWN and medium (< 100k) — the sweep
-    is placement-preserving, so running it without spread evidence risks
-    little; skipping it (FALLBACK) risks the freelancing pattern.  If the
-    failing count is ALSO None the profile is ambiguous (could be an
-    R1-class monster where a sweep is refuted) — only the deep-extreme
-    degraded-R1 branch may claim that shape; otherwise stay FALLBACK.
-
-    The returned plans compose with T2's _apply_boundary_tiebreak
-    downstream: degraded R1 requires |WNS| >= the route-first split so it
-    can never sit in the WNS band, and its failing=None cannot enter the
-    count-scale band (the tie-break already guards None — kept that way).
-    Degraded R2 carries a real failing count and participates in the
-    count-scale tie-break exactly like a normally-routed R2.
+        With no failing-endpoint count, the route-first branch requires |WNS| at least R1_ROUTE_FIRST_WNS_NS and a passing ratio gate; it never selects retiming without evidence of a large failing set.
+    With no spread value, the sweep branch requires the remaining profile to
+    match and a known failing count below 100,000, the medium-set cutoff. If
+    both values are unavailable, only the deep-slack route-first branch may
+    match; otherwise the result remains `FALLBACK`. Returned plans pass through
+    `_apply_boundary_tiebreak` downstream. The route-first branch lies outside
+    the WNS ambiguity band and cannot enter the count-scale band, while the
+    sweep branch participates normally with its known count.
     """
     wns = f.wns_magnitude_ns
     ratio = f.achievable_fmax_ratio
@@ -1223,53 +962,27 @@ def _degraded_feature_route(f: PhaseOneFeatures) -> Optional[RecipePlan]:
 
 
 def _oob_safe_plan(f: PhaseOneFeatures) -> Optional[RecipePlan]:
-    """Out-of-band net — a design whose features match NO calibrated rule.
+    """Choose a conservative plan for a feature profile that matches no calibrated
+    rule.
 
-    Why this exists (jul22 OOD stress test + jul24 all-16 panel): plain
-    FALLBACK is `RecipePlan(actions=(), blocks=())`, and its only consumer
-    (`_build_recipe_router_block`) suppresses an action-less FALLBACK
-    entirely — so the LLM receives NO routing guidance and freelances.
-    That is fail-OPEN to the most expensive branch, and it is the documented
-    mechanism that zeroed the boom class. The fuzz sweep put FALLBACK at
-    23.7-39.7% of the reachable feature space, and the final round scores
-    HIDDEN designs, which land out-of-band by definition.
-
-    Contract — this net introduces NO new technique. It routes an uncovered
-    design to the nearest ALREADY-PROVEN shared plan builder:
-
-      |WNS| >= OOB_ROUTE_FIRST_WNS_NS AND ratio known AND
-      ratio < R1_FMAX_RATIO_MAX -> _r1_route_first_plan
-          The proven bankable floor. Route-first ONLY, never the retime-first
-          gamble: the same reasoning _degraded_feature_route documents — a
-          20-40 min retime-first wall race is justified only by a CONFIRMED
-          huge failing set, and out-of-band means nothing is confirmed.
-      otherwise -> _r2_sweep_plan
-          Placement-preserving, therefore never-worse. It may gain little on
-          a deep design, but "small gain, banked" strictly dominates "wall
-          burned on an uncalibrated gamble" under mean-rank scoring.
-
-    Both branches additionally BLOCK `place_design -unplace`: Explore's
-    ~9-15 min estimate is calibrated on finn/corescore only, and the router
-    has no design-size feature (jul22 risk #6), so a full re-place on an
-    unknown-size design is exactly the wall-blowout that scored alpha=0.
-
-    Returns None when |WNS| is unknown — with no WNS there is no region to
-    reason about, and true FALLBACK remains the honest answer.
+    An actionless fallback is suppressed before prompt construction, so this
+    function selects an existing shared plan rather than leaving the model
+    unguided.
+        When |WNS| reaches OOB_ROUTE_FIRST_WNS_NS and the known ratio is below R1_FMAX_RATIO_MAX, it returns `_r1_route_first_plan` without speculative retiming.
+    All other known-WNS profiles use `_r2_sweep_plan`, which preserves
+    placement. Both branches block `place_design -unplace` because no size
+    feature is available to bound the cost of full re-placement. Returns `None`
+    when WNS is unknown, since no routing region can then be selected safely.
     """
     wns = f.wns_magnitude_ns
     if wns is None:
         return None
     ratio = f.achievable_fmax_ratio
 
-    # Route-first demands BOTH a deep-extreme |WNS| AND a KNOWN ratio that
-    # confirms the design is far from target. Absolute |WNS| alone is not
-    # evidence of a crisis: at a 200 ns period, WNS -12 ns is 94% of target
-    # (nearly met) and unroute + AggressiveExplore would wreck a near-win.
-    # Panel guard (jul25): at high utilization, and on memory-dominated
-    # designs, a full unroute -> AggressiveExplore is exactly the move the
-    # panel asked us to FORBID. Route-first is our proven floor on DEEP
-    # designs, but "proven" was measured on boom/ispd16 — neither dense nor
-    # memory-dominated. Out-of-band we do not get to assume it transfers.
+    # Route-first requires both deep negative slack and a known frequency ratio
+    # confirming that the design is far from target; absolute WNS alone can
+    # describe near-met timing at a long clock period. High utilization or
+    # memory dominance also blocks the destructive full-reroute sequence.
     _aggressive_reroute_unsafe = high_congestion_risk(f) or bool(f.memory_dominated)
     if (wns >= OOB_ROUTE_FIRST_WNS_NS
             and ratio is not None
@@ -1291,7 +1004,7 @@ def _oob_safe_plan(f: PhaseOneFeatures) -> Optional[RecipePlan]:
             _guard_note = (
                 " Route-first was WITHHELD despite the DEEP-extreme profile: "
                 f"lut_util={f.lut_util_pct}% / memory_dominated="
-                f"{f.memory_dominated} puts this design in the panel's "
+                f"{f.memory_dominated} puts this design in the "
                 "high-risk band, where a full unroute+re-route is forbidden.")
         why = (
             f"|WNS|={wns:.2f} ns, ratio="
@@ -1316,15 +1029,9 @@ def _oob_safe_plan(f: PhaseOneFeatures) -> Optional[RecipePlan]:
         wns, ratio_txt, fec_txt, spread_txt, base.rule_id,
     )
 
-    # jul25 constants audit: this block is CONDITIONAL, not unconditional.
-    # Its original justification was jul22 risk #6 — "Explore's ~9-15 min
-    # estimate is uncalibrated because the router has no design-size feature".
-    # B4 added that feature, so where the measured Class-G model says the
-    # sequence comfortably fits, forbidding a re-place is no longer justified:
-    # on vexriscv attempt 3 the router FALLBACK'd and the LLM's own full
-    # re-place produced our biggest alpha (+157.99). Blocking still applies when
-    # size is UNKNOWN (no basis to permit), when the sequence does not fit, or
-    # when the panel's high-util / memory-dominated guards fire.
+    # Full replacement is permitted only when a known-size runtime estimate
+    # comfortably fits and resource guards are clear. Unknown size, insufficient
+    # time, high utilization, or memory dominance keeps the block fail-closed.
     blocks = tuple(base.blocks)
     _classg = classg_runtime_estimate_s(f.cell_count)
     _replace_affordable = (
@@ -1357,25 +1064,20 @@ def _oob_safe_plan(f: PhaseOneFeatures) -> Optional[RecipePlan]:
 
 
 def _apply_boundary_tiebreak(f: PhaseOneFeatures, plan: RecipePlan) -> RecipePlan:
-    """T2/C5 ambiguity tie-break — runs AFTER normal rule evaluation.
+    """Resolve narrow boundary ambiguities after normal rule evaluation.
 
-    Can only FLIP a decision toward the proven bankable floor (R1's
-    route-first plan: unroute + AggressiveExplore banks a measured route)
-    when features sit inside a narrow band at a risk-asymmetric boundary
-    (see the audit above TIEBREAK_WNS_BAND_NS for which boundaries qualify
-    and why the rest were deliberately left alone). Never fires when the
-    features it needs are None; never widens, narrows, or re-tunes any
-    threshold; never flips AWAY from the safe branch.
+    This function must run after the primary routing rules. It may change a
+    decision only toward the safer route-first plan when available features
+    fall within a configured ambiguity band. Missing required features disable
+    the tie-break, and the operation never changes thresholds or flips away
+    from the safe branch.
     """
     wns = f.wns_magnitude_ns
     if wns is None:
         return plan
 
-    # Boundary 1 — R1 internal route-first split (WNS-scale band).
-    # plan.rule_id == "R1" with wns < R1_ROUTE_FIRST_WNS_NS is by
-    # construction the retime-first (gamble) variant; inside [split - band,
-    # split) resolve to route-first. ispd16 (7.75) is below the band and
-    # keeps its proven retime-first path.
+    # Near the R1 WNS split, resolve the tie toward route-first.
+    # Values below the tiebreak band retain the retime-first variant.
     if (plan.rule_id == "R1"
             and R1_ROUTE_FIRST_WNS_NS - TIEBREAK_WNS_BAND_NS <= wns
             < R1_ROUTE_FIRST_WNS_NS):
@@ -1399,11 +1101,9 @@ def _apply_boundary_tiebreak(f: PhaseOneFeatures, plan: RecipePlan) -> RecipePla
             ),
         )
 
-    # Boundary 2 — R1 failing-endpoint floor (count-scale band), only for
-    # designs that are otherwise UNAMBIGUOUSLY deep-extreme (strict
-    # route-first WNS + R1's own ratio gate — no band-on-band compounding).
-    # Without the flip these land in R2's sweep or FALLBACK, neither of
-    # which can move a 10+ ns miss.
+    # Apply the failing-endpoint tiebreak only to profiles already beyond the
+    # strict route-first WNS and ratio gates. This avoids compounding boundary
+    # bands while steering clearly deep misses to the stronger recovery path.
     fec = f.failing_endpoint_count
     ratio = f.achievable_fmax_ratio
     if (plan.rule_id != "R1"
@@ -1438,9 +1138,7 @@ def _apply_boundary_tiebreak(f: PhaseOneFeatures, plan: RecipePlan) -> RecipePla
     return plan
 
 
-# ---------------------------------------------------------------------------
 # Entry point
-# ---------------------------------------------------------------------------
 
 # Positive rules in priority order. R1 is most specific (huge designs);
 # R4 is the most permissive (near-target). Order matters because the
@@ -1506,17 +1204,15 @@ def decide_recipe_path(features: PhaseOneFeatures) -> RecipePlan:
             break
 
     if plan is None:
-        # C1-T4b: before conceding FALLBACK, check whether exactly one
-        # None'd Phase-1 feature is masking an otherwise-unambiguous
-        # profile (see _degraded_feature_route).  Runs only here, so a
-        # design that routes normally can never be re-routed by it.
+        # Before fallback, recover profiles obscured by exactly one unavailable
+        # phase-one feature. This runs only after normal routing declines, so it
+        # cannot replace a plan selected by a positive rule.
         plan = _degraded_feature_route(features)
 
     if plan is None:
-        # jul25 OOB net: before conceding an action-less FALLBACK (which
-        # _build_recipe_router_block suppresses entirely, leaving the LLM
-        # to freelance), route out-of-band designs to the nearest proven
-        # bankable plan. Hidden designs land here by definition.
+        # Before actionless fallback, map out-of-distribution profiles to the
+        # nearest conservative, bankable plan. This limits unconstrained LLM
+        # planning when no calibrated rule applies.
         plan = _oob_safe_plan(features)
 
     if plan is None:
@@ -1540,7 +1236,7 @@ def decide_recipe_path(features: PhaseOneFeatures) -> RecipePlan:
             features.failing_endpoint_count,
         )
 
-    # T2/C5 boundary tie-break: inside a narrow band at a risk-asymmetric
+    # Boundary tie-break: inside a narrow band at a risk-asymmetric
     # boundary, resolve toward the proven bankable floor. Runs before the
     # block-rule merge so R5/R6 apply to the FINAL plan.
     plan = _apply_boundary_tiebreak(features, plan)
@@ -1555,7 +1251,7 @@ def decide_recipe_path(features: PhaseOneFeatures) -> RecipePlan:
         if b is not None:
             additional.append(b)
             current_blocks.add(b)
-    # R8 (jul25) returns 0..n blocks rather than one.
+    # R8 returns 0..n blocks rather than one.
     for b in _check_r8_blocks(features, current_blocks):
         additional.append(b)
         current_blocks.add(b)

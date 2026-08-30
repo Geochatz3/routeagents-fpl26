@@ -16,7 +16,7 @@ This module is INTENTIONALLY OFFLINE-ONLY:
 
 Inputs:
 - ``policy_memory/episode_store.jsonl`` (read).
-- One or more ``*.qor.json`` files produced by Session-12's tolerant probe.
+- One or more ``*.qor.json`` files produced by the tolerant QoR probe.
 
 Outputs:
 - Updated ``policy_memory/episode_store.jsonl`` (optional; only if matches are
@@ -216,7 +216,7 @@ def _episode_matches_json(episode: Dict[str, Any], json_path: Path) -> Tuple[str
     Confidence: 0 = no match, 1 = design_name hint only, 2 = run_dir / run_id,
     3 = output_dcp_path substring.  Larger wins.
 
-    Session-15 added a directory-proximity tiebreaker in the JOIN
+    A directory-proximity tiebreaker lives in the JOIN
     PLANNER (not here) — when multiple episodes tie at confidence 3,
     the planner prefers the one whose output_dcp_path shares a
     discriminator directory with the JSON's parent.
@@ -252,7 +252,7 @@ def _episode_matches_json(episode: Dict[str, Any], json_path: Path) -> Tuple[str
 
 
 def _dir_proximity_score(episode: Dict[str, Any], json_path: Path) -> int:
-    """Return a Session-15 directory-proximity score for a (json, episode) pair.
+    """Return a directory-proximity score for a (json, episode) pair.
 
     Higher is better.  Used to break ties when multiple episodes match
     a JSON at the same confidence tier.
@@ -348,7 +348,7 @@ def join_qor_features(
     # Track which episodes are claimed by which json — for ambiguity detection.
     claims: Dict[str, List[str]] = {}  # episode_id -> [json_path]
     plan: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], int, str]] = {}
-    # plan[episode_id] = (episode, flat_dict, confidence, match_method)
+    # Value tuple: (episode, flat QoR dict, confidence, match method).
 
     for jp in json_paths:
         jp = Path(jp)
@@ -414,7 +414,7 @@ def join_qor_features(
             report.entries.append(entry)
             continue
 
-        # Session-15 tiebreaker: when multiple episodes match at the same
+        # Proximity tiebreaker: when multiple episodes match at the same
         # confidence tier (typically because two runs produced DCPs with
         # the same basename in different directories), prefer the episode
         # whose output_dcp_path is in the same directory as the JSON, or

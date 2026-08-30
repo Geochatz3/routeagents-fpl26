@@ -1,60 +1,16 @@
-"""INSURED TERMINAL RE-PLACE GAMBLE (jul22 placement flagship, P3+P2 merged).
+"""Provide an optional, insured terminal full-re-placement stage.
 
-Panel provenance (build-regardless, 3/3 round-2 flip + 5/5 life-or-death on
--net_delay_weight): late in the wall, from the BANKED best state, gamble on a
-full re-place using the last untried placement-layer knob family —
-`place_design -directive <X> -net_delay_weight {medium,high}` (+ an optional
-`place_design -post_place_opt` variant axis) — then route + measure.
-
-INSURED means:
-  - the on-disk banked best DCP is NEVER touched: every draw re-opens it
-    read-only into the session and banks its own candidate to a dedicated
-    draw-indexed output file, written ONLY on adoption;
-  - a failed/unfinished/rejected draw costs nothing but its reserved wall
-    slice (never-worse by construction, same discipline as the LASTMILE /
-    fanout polish stages and the ILS banked mirror);
-  - adoption requires beating the chain-best by >= replace_gamble_adopt_
-    margin_ns (+0.15 ns, the round-2 panel gate), fully routed, hold clean
-    (whs >= hold_slack_floor_ns — the official scorecard gate passes
-    whs=0.0), and a verified (non-error-envelope) write_checkpoint.
-
-FAIL-CLOSED BUDGET: the stage runs only when the terminal reserve affords a
-full place+route for THIS design's measured cost anchors (observed Explore
-full-ruin ILS cycle cost, else the recipe-phase full-cycle anchor) x1.3
-margin + a finalize reserve. NO optimistic cold start (contrast the ILS
-picker): an unknown anchor SKIPS the stage — a terminal re-place that cannot
-finish has no right tail (terra's condition, adopted by the round-2 panel).
-
-KILL-CRITERION INSTRUMENTATION (measure, don't decide): every draw emits one
-structured line
-
-  REPLACE_GAMBLE attempt=<n> variant=<label> pre_wns=<w> place_s=<s>
-  route_s=<s> post_wns=<w> post_whs=<h> verdict=<ADOPTED|REJECTED|
-  UNAFFORDABLE|ERROR> reason=<...>
-
-plus a stage summary with completed_valid counts. The panel kills the FIRING
-policy (not the build) if completion-to-valid < 80% within the terminal
-reserve across >= 3 states.
-
-KNOB DOC EVIDENCE (2025.1, UG835 place_design + UG904):
-  - -net_delay_weight {low,medium,high} (default low): 2025.1 syntax line +
-    UG904 "Using the -net_delay_weight Option"; UG835 lists it as compatible
-    with -directive. KEPT (the 5/5 panel knob).
-  - -post_place_opt: 2025.1 syntax line; "run optimization after placement
-    ... any placement changes will result in unrouted connections, so
-    route_design will need to be run after". KEPT as a separate post-place
-    step in one variant (it is NOT a per-directive modifier).
-  - -clock_vtree_type {balanced,intraSLR,interSLR}: SLR-skew oriented
-    ("default option for Versal SSIT devices"; intraSLR/interSLR minimize
-    skew within/between SLRs). DROPPED: the contest device is xcvu3p — a
-    single-SLR UltraScale+ part — and 2025.1's -directive compatibility
-    list does not include it.
-
-This module is PURE Vivado Tcl via the agent's call_tool — no LLM. Exception
--safe at the call site (any failure -> agent keeps its existing best).
-Default OFF (`ILSPolishConfig.replace_gamble_enabled = False`): the RC ships
-it off; the all-in window (Aug 5-9) flips it on via CLI --replace-gamble or
-env FPL26_REPLACE_GAMBLE=1.
+The stage is disabled by default. Each variant reopens the banked checkpoint
+read-only, applies a placement directive and net-delay weight with optional
+post-placement optimization, then routes and measures the result. Candidates
+use dedicated draw-indexed files, and only adopted candidates are written as
+outputs. Adoption requires exceeding the configured margin, completing routing,
+passing hold checks, and verifying the checkpoint write. The budget gate
+requires measured placement and routing costs, safety margin, and finalization
+reserve; unknown costs skip the stage. Structured telemetry records each
+variant, timing, duration, and verdict. The implementation uses Tcl through the
+tool interface without model calls, and exceptions leave the existing best
+checkpoint untouched.
 """
 from __future__ import annotations
 
@@ -70,22 +26,10 @@ from optimizer.ils_polish import (
     _tool_ok,
 )
 
-# ---------------------------------------------------------------------------
-# Draw variants
-# ---------------------------------------------------------------------------
-# (label, place_directive, net_delay_weight, post_place_opt_step)
-# Order = draw priority. Rationale:
-#  1. Explore + ndw high — the proven strongest full-ruin place directive in
-#     the ILS rotation (most historical accepts) crossed with the maximum
-#     setting of the untried knob (the 5/5 panel pick: kimi/gemini/grok #1).
-#  2. Explore + ndw medium — the round-2 "{med,high}" second draw: same
-#     directive, softer pessimism (high can over-congest, UG904 warns).
-#  3. ExtraTimingOpt + ndw high — the rotation's second-strongest ruin
-#     directive (3 historical accepts) x the new knob.
-#  4. Explore + ndw high + -post_place_opt — adds the incremental
-#     post-placement optimizer as an extra step before routing (2025.1
-#     UG835: run route_design after). Only reached when max_draws is
-#     raised above the default 2 and the wall keeps affording draws.
+# Variants are ordered by expected timing benefit under the draw budget.
+# High net-delay weighting is tried before medium weighting but may increase
+# congestion. The final variant adds post-placement optimization and must
+# still be followed by routing.
 REPLACE_GAMBLE_VARIANTS: List[Tuple[str, str, str, bool]] = [
     ("Explore+ndw_high", "Explore", "high", False),
     ("Explore+ndw_medium", "Explore", "medium", False),
@@ -110,17 +54,14 @@ VERDICT_ERROR = "ERROR"
 
 def replace_gamble_cost_basis(cfg: ILSPolishConfig,
                               observed_costs: Optional[dict] = None) -> float:
-    """FULL place+route cycle basis (seconds) for the gamble's affordability
-    gate. Preference ladder (measured-on-THIS-design/box first):
+    """Return the full placement-and-routing cost basis in seconds for the
+    affordability gate.
 
-      1. this run's observed ILS Explore full-ruin cycle cost (combo index
-         0 in observed_costs, as recorded by run_ils_polish's combo_cost —
-         already x1.15-margined at record time);
-      2. cfg.expected_heavy_cycle_s — the recipe-phase full place+route(+
-         phys_opt) anchor from derive_cost_anchors();
-      3. 0.0 (unknown) -> the stage FAILS CLOSED (skip). No optimistic
-         cold start: a terminal re-place that cannot finish has no right
-         tail (terra's wall-reserve condition, adopted round-2).
+    Use `observed_costs` entry 0 when available; it is the current
+    environment's observed full-cycle cost and already includes the 1.15
+    overrun allowance. Otherwise use `cfg.expected_heavy_cycle_s`, the derived
+    heavy-cycle estimate. Return `0.0` when neither anchor is known; this
+    sentinel makes the terminal stage fail closed.
     """
     try:
         explore_idx = [c[0] for c in ILS_COMBOS].index("Explore")
@@ -142,11 +83,11 @@ def replace_gamble_accept(*, new_wns: Optional[float],
     """Pure adopt decision for a re-place gamble draw.
 
     Adopt ONLY on: fully routed AND setup beats the chain-best by >=
-    replace_gamble_adopt_margin_ns (+0.15, the round-2 panel gate — NOT the
+    replace_gamble_adopt_margin_ns (+0.15 — NOT the
     polish stages' 0.002 never-worse margin: a full re-place discards the
     chain's accumulated phys_opt polish, so a marginal win is likely noise)
     AND hold clean (whs >= hold_slack_floor_ns; the official scorecard gate
-    passes whs=0.0 — jul02 preview evidence). A reject is free: the banked
+    passes whs=0.0 — preview evidence). A reject is free: the banked
     best on disk was never touched."""
     if unrouted is None or unrouted != 0:
         return False, f"unrouted={unrouted}"
@@ -173,7 +114,7 @@ class ReplaceGambleDraw:
     post_whs: Optional[float] = None
     verdict: str = VERDICT_ERROR
     reason: str = ""
-    # completion-to-valid (the panel kill criterion's numerator): the draw
+    # completion-to-valid (the kill criterion's numerator): the draw
     # produced a MEASURED, fully-routed, hold-clean state within the
     # reserve — independent of whether it beat the adopt margin.
     completed_valid: bool = False
@@ -196,15 +137,10 @@ class ReplaceGambleResult:
     adopted: bool = False
     best_wns: Optional[float] = None      # chain-best, ratcheted on adopt
     best_path: Optional[str] = None       # adopted DCP path (None = no adopt)
-    # jul23 INSURED-COMPARE MUX wiring: the best VERIFIED (fully routed +
-    # hold-clean) draw REGARDLESS of the +0.15 adopt ratchet. A draw that
-    # improved on the chain-best but sat BELOW the re-adopt bar is discarded
-    # by the in-run adopt logic (a full re-place forfeits the chain's
-    # accumulated polish, so a marginal win is likely noise), yet it is
-    # still a legitimate FINAL candidate — the finalize MUX's 0.005 argmax
-    # decides it against the pipeline. Persisted to a draw-indexed
-    # _cand_d{n}.dcp (the banked best on disk is STILL never touched). None
-    # when no draw produced a verified routed+hold-clean state.
+    # Track the best fully routed, hold-clean draw independently of the in-run
+    # adoption threshold. A marginal draw may be unsuitable for continuing the
+    # chain but remain a valid final candidate. Store it in a draw-specific
+    # checkpoint without overwriting the banked best; finalization compares both.
     best_draw_path: Optional[str] = None
     best_draw_wns: Optional[float] = None
     best_draw_whs: Optional[float] = None
@@ -238,10 +174,8 @@ def replace_gamble_should_run(*, cfg: ILSPolishConfig,
         return False, "disabled (kill switch; RC default OFF)"
     if best_wns is None or not best_path:
         return False, f"no banked best (wns={best_wns} path={best_path})"
-    # Class gate (round-2 gate-loosening: route-delay fraction > 0.6,
-    # loosened from 0.7). Phase 1 does not measure this feature yet, so the
-    # plumbed value is normally None -> FAIL-OPEN (build-regardless: the
-    # all-in window judges by the measured completion/adopt log lines).
+    # Apply the route-delay gate only when Phase 1 provides the metric;
+    # a missing value fails open.
     frac = cfg.critical_path_route_delay_frac
     if frac is not None and frac < cfg.replace_gamble_min_route_delay_frac:
         return False, (f"route_delay_frac={frac:.2f} < "
@@ -311,11 +245,9 @@ async def run_replace_gamble(
             raise RuntimeError(
                 f"{cmd.split()[0]} failed: {(_eline or _txt)[:400]}")
 
-    # Fresh Vivado before the first draw (best-effort): (a) the LASTMILE
-    # polish stage may have poisoned the session — after a LastMile place,
-    # full place_design fails outright until restart (jun12 repro); (b) a
-    # fresh session places better AND faster (jun07 A/B/C). On failure we
-    # proceed — a poisoned place surfaces as a caught ERROR draw.
+    # Restart Vivado before the first draw because late-stage placement can
+    # leave the session unable to run full placement. Restart failure is
+    # non-fatal; subsequent draw validation rejects tool failures.
     try:
         _rr = await call_tool("vivado_restart_vivado", {})
         if _tool_ok(_rr):
@@ -366,10 +298,8 @@ async def run_replace_gamble(
             d.route_s = time.time() - _t_route
             w, ur = await _measure(call_tool, wns_tcl, timeout_s=_light_to())
             if ur != 0:
-                # One incremental completion pass (LASTMILE-stage pattern:
-                # fresh routes sometimes leave a few nets; a bare
-                # route_design usually finishes them). Still never-worse —
-                # a second failure just rejects below.
+                # A completion pass can route residual nets left by a fresh route.
+                # Reject the draw if completion or validation still fails.
                 await call_tool("vivado_run_tcl",
                                 {"command": "route_design",
                                  "timeout": _heavy_to()})
@@ -390,9 +320,9 @@ async def run_replace_gamble(
                     {"command": f"write_checkpoint -force {{{out_dcp}}}",
                      "timeout": _heavy_to()})
                 if not _tool_ok(_wr):
-                    # NEVER bank on a Tcl error: the file on disk is stale/
-                    # partial; adopting would ship a WNS the DCP doesn't
-                    # have (jun12 phantom-accept lesson).
+                    # Never bank on a Tcl error: the file on disk is stale or
+                    # partial, and adopting would ship a WNS the DCP does not
+                    # have — the phantom-accept failure mode.
                     d.verdict = VERDICT_ERROR
                     d.reason = (f"write_checkpoint failed "
                                 f"({str(_wr)[:80]}); draw discarded")
@@ -402,11 +332,9 @@ async def run_replace_gamble(
                     r.adopted = True
                     r.best_wns = w
                     r.best_path = out_dcp
-                    # jul23 MUX: an adopted draw is trivially the best
-                    # VERIFIED draw so far (it cleared the ratchet). Track
-                    # it as the finalize-MUX candidate too — ADDITIVE, the
-                    # adopt/mirror-repoint above is unchanged, and no extra
-                    # write (the _d{i} file was just banked).
+                    # An adopted draw is also eligible for final selection. Its
+                    # checkpoint is already banked, so no additional write is
+                    # needed.
                     if r.best_draw_wns is None or w > r.best_draw_wns:
                         r.best_draw_path = out_dcp
                         r.best_draw_wns = w
@@ -414,16 +342,11 @@ async def run_replace_gamble(
             else:
                 d.verdict = VERDICT_REJECTED
                 d.reason = why
-                # jul23 MUX: a VERIFIED (routed + hold-clean) draw that fell
-                # BELOW the +0.15 re-adopt ratchet is still a legitimate
-                # FINAL candidate. Persist the best such draw to a dedicated
-                # _cand_d{n} file (the banked best on disk is STILL never a
-                # write target) so the finalize MUX can ship it via its
-                # 0.005 argmax — the panel's "loosen selection, insure with
-                # the MUX" intent. Written only while it is the running-best
-                # verified draw (one checkpoint per genuine improvement), in
-                # this iteration BEFORE the next draw re-opens the banked
-                # best and clobbers the session.
+                # Routed, hold-clean draws remain final candidates even when
+                # they miss the re-adoption threshold. Store only each
+                # improving candidate in a dedicated checkpoint; never
+                # overwrite the banked best. Write it before the next draw
+                # reopens the banked checkpoint and replaces session state.
                 if (d.completed_valid
                         and (r.best_draw_wns is None or w > r.best_draw_wns)):
                     cand_dcp = f"{out_dcp_base}_cand_d{i}.dcp"

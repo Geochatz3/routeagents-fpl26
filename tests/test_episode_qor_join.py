@@ -201,7 +201,7 @@ class EpisodeQorJoinTests(unittest.TestCase):
 
     def test_ambiguous_when_two_episodes_tie(self):
         # Two episodes share the same design name AND both have matching
-        # output_dcp_paths — confidence ties at 3, so we refuse to join.
+        # output_dcp_paths — confidence ties at 3, so the join is refused.
         e1 = _episode("E1", "finn_radioml",
                       dcp_path="/runs/A/finn_radioml_optimized.dcp")
         e2 = _episode("E2", "finn_radioml",
@@ -315,7 +315,7 @@ class EpisodeQorJoinTests(unittest.TestCase):
                       dcp_path="/runs/X/boom_soc_optimized.dcp")
         self._write_store([ep])
         body = _stub_qor_json("boom_soc")
-        # zero out the congestion strings to simulate boom_soc-style empty signal
+        # Empty congestion fields model a report with no usable congestion signal.
         body["Design QoR Summary"][0]["Long Cong Level N-E-S-W"] = ""
         body["Design QoR Summary"][0]["Global Cong Level N-E-S-W"] = ""
         j = self._write_json("boom_soc", body)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Portions of this file consist of AI-generated content.
-# SPDX-License-Identifier: Apache 2.0
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Simple test script to verify RapidWright MCP server functionality.
@@ -98,8 +98,8 @@ def main():
     print("="*60)
     print("\nThe server is working correctly!")
     print("\nNext steps:")
-    print("1. Configure Cursor/Claude Desktop (see CURSOR_SETUP.md)")
-    print("2. Restart Cursor/Claude Desktop")
+    print("1. Point your MCP client at this server (see README.md)")
+    print("2. Restart the client")
     print("3. Ask your AI assistant: 'Initialize RapidWright and show me devices'")
     
     return 0
@@ -151,7 +151,7 @@ def test_write_checkpoint():
             
             print(f"  ✓ DCP file created successfully ({actual_size} bytes)")
             
-            # Verify we can read the checkpoint back
+            # Verify the checkpoint reads back
             print(f"  Reading checkpoint back to verify...")
             read_result = rw.read_checkpoint(dcp_path)
             

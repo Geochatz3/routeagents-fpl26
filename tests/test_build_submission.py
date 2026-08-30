@@ -1,13 +1,9 @@
-"""Tests for scripts/build_submission.sh — the strict submission packager.
+"""Tests the strict submission archive packager.
 
-The contest scores whatever `make run_optimizer` produces from the uploaded
-archive. A leaked `.env` (VIVADO_EXEC/local JAVA_HOME/our key) or `.venv`
-(local python onto the AWS python) makes the submission fail on their env —
-exactly the alpha-0.0 failure class. These tests pin the strictness guarantees
-so the packager can't silently regress.
-
-Skips cleanly if `tar`/`bash` aren't available (e.g. odd CI), so it never
-breaks the suite on non-POSIX runners.
+The archive must exclude host-specific environment files, virtual environments,
+credentials, and local tool configuration so it remains portable. Tests skip
+when `tar` or `bash` is unavailable, allowing the suite to run on non-POSIX
+systems.
 """
 from __future__ import annotations
 
@@ -60,21 +56,19 @@ class BuildSubmissionTests(unittest.TestCase):
     def test_required_files_present(self):
         names = set(self._names())
         for rel in ["Makefile", "dcp_optimizer.py", "requirements.txt",
-                    "SYSTEM_PROMPT.TXT", "optimizer/recipe_router.py",
+                    "prompts/system_prompt_scored.txt", "optimizer/recipe_router.py",
                     "VivadoMCP/vivado_mcp_server.py",
                     "scripts/multi_restart_optimize.py"]:
             self.assertIn(f"fpl26_optimization_contest/{rel}", names,
                           f"required file missing from submission: {rel}")
 
     def test_archive_root_is_forced_not_derived(self):
-        """Every member sits under fpl26_optimization_contest/, whatever this dir is called.
+        """Verifies that every archive member uses the required fixed root
+        directory.
 
-        The harness extracts the archive and enters `fpl26_optimization_contest/`.
-        build_submission.sh used to store the CHECKOUT dirname as the top-level
-        directory and then verify the archive against that same derived name, so
-        building from the `wt_final_round_dev` worktree produced an unusable
-        archive that still printed "SUBMISSION READY". Assert the contract, and
-        name the directory we built from so a failure says which one it was.
+        All members must reside under `fpl26_optimization_contest/`,
+        independent of the checkout directory name, because the extraction
+        harness enters that exact path.
         """
         names = self._names()
         self.assertTrue(names, "archive is empty")
@@ -91,7 +85,6 @@ class BuildSubmissionTests(unittest.TestCase):
                       "build script did not confirm a clean import of the archive")
 
 
-
 @unittest.skipUnless(shutil.which("bash") and shutil.which("tar")
                      and shutil.which("git"), "needs bash + tar + git")
 class ProvenanceGateTests(unittest.TestCase):
@@ -99,7 +92,7 @@ class ProvenanceGateTests(unittest.TestCase):
 
     The archive-root bug was invisible from the MAIN checkout because that
     directory is named `fpl26_optimization_contest`. The mirror-image hazard is
-    worse and was live on jul29: the main checkout sat on a branch that was a
+    worse and was live: the main checkout sat on a branch that was a
     STRICT ANCESTOR, 140 commits behind final-round-dev. Packaging it would have
     shipped a tree with none of the final round in it — including the fix that
     put the uniform ILS stack on the ship path — and every other check in the
@@ -111,8 +104,10 @@ class ProvenanceGateTests(unittest.TestCase):
         root = os.path.join(tmp, "fpl26_optimization_contest")
         shutil.copytree(str(REPO / "scripts"), os.path.join(root, "scripts"))
         for f in ("Makefile", "dcp_optimizer.py", "requirements.txt",
-                  "SYSTEM_PROMPT.TXT"):
-            open(os.path.join(root, f), "w").write("# stub\n")
+                  "prompts/system_prompt_scored.txt"):
+            path = os.path.join(root, f)
+            os.makedirs(os.path.dirname(path) or root, exist_ok=True)
+            open(path, "w").write("# stub\n")
         for d in ("optimizer", "VivadoMCP"):
             os.makedirs(os.path.join(root, d), exist_ok=True)
         open(os.path.join(root, "optimizer", "recipe_router.py"), "w").write("x=1\n")

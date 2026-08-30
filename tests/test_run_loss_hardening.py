@@ -1,30 +1,10 @@
-"""Three ways a completed, valid run was still losing its result (aug06 hunt).
+"""Test that completed valid runs remain rankable and recoverable when reporting
+or tool queries fail.
 
-Follow-ups to the ispd16 incident (3563c78 / d358f0f). That fix stopped the
-summary printer from RAISING; it did not stop the run from being DISCARDED,
-because the wrapper's usability test is a side-effect file of that same
-printer. Findings, in damage order:
-
-  C1  scripts/multi_restart_optimize.py:215
-        usable = [a for a in attempts if a.get("exists") and a.get("fmax") is not None]
-      and :485  out["fmax"] = s.get("best_fmax_mhz")   <- token_usage.json ONLY.
-      `cost` falls back to cost_ledger.json and `status` to
-      lifecycle_metadata.json, but fmax has NO fallback. token_usage.json is
-      the LAST statement of the summary printer, so anything that stops the
-      printer early leaves the attempt unrankable -> "no usable attempt
-      output" -> degraded fallback -> a good artifact is thrown away, rc=0.
-
-  C3  three copies of the primitive-cell-count query ran `re.search(r"(\\d+)")`
-      on the raw response with NO _looks_like_tool_error guard, while the
-      fourth copy (:7307) has the guard and a comment naming this exact bug.
-      A budget/timeout envelope carries digits — "only_23s_remain..." yields
-      23 — which fails the 0.5x..3.0x band and silently REJECTS a good
-      candidate before the MUX can compare it.
-
-  C4  _looks_like_tool_error / _tool_ok knew two error shapes (JSON envelope,
-      Vivado "TCL ERROR:") but not the MCP SERVER's own: a plain-text
-      "Error: Command timed out. Vivado may be stuck." So a wedged or dead
-      Vivado read as a successful tool result.
+Frequency metadata must have a fallback beyond `token_usage.json` so an
+interrupted summary cannot discard an artifact. Primitive-cell parsing rejects
+tool-error text before extracting digits, and tool-result validation recognizes
+JSON envelopes, Tcl errors, and plain-text server timeouts.
 """
 from __future__ import annotations
 
@@ -38,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dcp_optimizer import DCPOptimizer, _looks_like_tool_error
 from optimizer.ils_polish import _tool_ok
+from tests.source_corpus import dcp_source_lines, dcp_source_text
 
 
 # The MCP dispatcher's three self-reported failure shapes.
@@ -99,11 +80,10 @@ class CellCountEnvelopeTests(unittest.TestCase):
 
     def test_every_cellcount_site_guards_before_parsing(self):
         """All four copies of the query must guard; :7307 is the template."""
-        src = (Path(__file__).resolve().parent.parent
-               / "dcp_optimizer.py").read_text(errors="ignore")
+        src = dcp_source_text(errors="ignore")
         blocks = src.split("IS_PRIMITIVE}]")
-        # blocks[0] is the preamble; each later block opens right after a
-        # query and must reach a guard before its re.search for digits.
+        # Each post-preamble block begins after a query and must contain a guard
+        # before any regular expression attempts to match digits.
         checked = 0
         for blk in blocks[1:]:
             head = blk[:1400]
@@ -151,7 +131,7 @@ class TokenUsageLastResortTests(unittest.TestCase):
         opt.clock_period = 5.0
         opt.start_time = 1000.0
         opt.end_time = 1100.0
-        # A constraint-guard bookkeeping entry, i.e. the aug06 shape.
+        # A constraint-guard bookkeeping entry, i.e. the shape.
         opt.tool_call_details = [
             {"tool_name": "vivado_place_design", "elapsed_time": 3.0},
             {"tool_name": "constraint_guard", "status": "CONSTRAINTS_CHANGED",
@@ -176,7 +156,7 @@ class TokenUsageLastResortTests(unittest.TestCase):
         return opt
 
     def test_report_uses_shipped_wns_when_worse_than_tracked(self):
-        """aug08 (panel B-3): a finalize branch that ships an older mirror
+        """(panel B-3): a finalize branch that ships an older mirror
         records _shipped_wns_ns; the report — select_best's ONLY fmax
         source — must describe the artifact, not the in-memory claim."""
         opt = self._mk_opt()
@@ -198,7 +178,7 @@ class TokenUsageLastResortTests(unittest.TestCase):
         self.assertAlmostEqual(got, opt.calculate_fmax(-1.0, 5.0), places=3)
 
     def test_report_write_is_atomic_no_partial_file_on_crash(self):
-        """aug08: the report is written tmp+os.replace; a crash mid-write
+        """: the report is written tmp+os.replace; a crash mid-write
         must leave either the OLD complete file or none — never truncated
         JSON (which reads as fmax=None and drops a VALID artifact)."""
         opt = self._mk_opt()
@@ -215,8 +195,7 @@ class TokenUsageLastResortTests(unittest.TestCase):
 
     def test_emergency_path_writes_the_report_when_missing(self):
         """The fix must live on the every-exit path, not the print path."""
-        src = (Path(__file__).resolve().parent.parent
-               / "dcp_optimizer.py").read_text(errors="ignore")
+        src = dcp_source_text(errors="ignore")
         i = src.find("def _emergency_baseline_copy")
         self.assertNotEqual(i, -1)
         # Bound the body at the next sibling def rather than a fixed slice —
@@ -231,17 +210,15 @@ class TokenUsageLastResortTests(unittest.TestCase):
         self.assertIn("token_usage.json", body)
 
     def test_emergency_ladder_falls_through_not_out(self):
-        """aug08: the finalize ladder must degrade Path 1 -> 2 -> 3, never
-        Path 1 -> outer HARD_FAIL.
+        """Verify that finalization falls through each recovery path instead of
+        escaping to the outer hard-failure handler.
 
-        The ladder used to sit in ONE flat try, and the finalized-latch is
-        set before any copy — so a raise from the Path-1 mirror copy (e.g.
-        ENOSPC: _atomic_copy re-raises once its own fallback fails) skipped
-        the Path-3 "guarantees a submission-safe DCP" promise forever, and
-        the wrapper reported inflight_never_landed -> alpha 0.
+        The finalized latch is set before copying, so each path must contain
+        its own copy failures. If the preferred mirror copy fails, including
+        from insufficient disk space, later paths must still produce a valid
+        checkpoint.
         """
-        src = (Path(__file__).resolve().parent.parent
-               / "dcp_optimizer.py").read_text(errors="ignore")
+        src = dcp_source_text(errors="ignore")
         i = src.find("def _emergency_baseline_copy")
         self.assertNotEqual(i, -1)
         j = src.find("\n    def ", i + 1)

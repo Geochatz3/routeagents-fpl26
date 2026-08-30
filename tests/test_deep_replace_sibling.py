@@ -1,4 +1,4 @@
-"""Tests for the DEEP-WNS full-replace sibling (jul25 panel, grok-4.5 seat).
+"""Tests for the DEEP-WNS full-replace sibling.
 
 The gate is the safety-critical part: it decides whether to spend a full
 place+route inside the eval hour. Every unmeasurable input must fail CLOSED.
@@ -24,7 +24,7 @@ from optimizer.deep_replace_sibling import (
     run_deep_replace_sibling,
 )
 
-# boom_soc's real Phase-1 physics (rebaseline_jul24/boom_soc_2025.1/run.log)
+# Deep negative slack with a very large failing-endpoint set.
 BOOM = dict(failing_endpoint_count=217_988, wns_magnitude_ns=19.16)
 GATE_DEFAULTS = dict(failing_endpoints_min=100_000, wns_min_ns=10.0,
                      finalize_reserve_s=300.0)
@@ -63,7 +63,7 @@ def test_below_failing_endpoint_floor_does_not_arm():
 
 
 def test_below_wns_floor_does_not_arm():
-    # ispd16-like: huge failing set but |WNS| 7.75 < 10.0
+    # A very large failing set remains gated when |WNS| is below 10 ns.
     run, why = _gate(failing_endpoint_count=242_906, wns_magnitude_ns=7.75)
     assert run is False and "not DEEP-extreme" in why
 
@@ -87,10 +87,10 @@ def test_no_cost_anchor_fails_closed():
 
 
 def _need_b1(basis, reserve=300.0):
-    """The ARM requirement — the place+route leg ONLY.
+    """Compute the budget required for the place-and-route leg.
 
-    The retiming tail is deliberately not sized here; it gets its own gate
-    (deep_replace_physopt_affordable) fed by the MEASURED B1 elapsed time.
+    Retiming is intentionally excluded because its separate affordability gate
+    uses the measured elapsed time of the preceding leg.
     """
     return basis * DEEP_REPLACE_COST_MARGIN + reserve
 
@@ -106,23 +106,11 @@ def test_exactly_sufficient_reserve_arms():
 
 
 def test_boom_soc_real_measured_recipe_can_arm():
-    """REGRESSION — the arithmetic that kept deep_replace=0 on hardware.
+    """Verify that a feasible place-and-route recipe can arm deep replacement.
 
-    Measured on the 8-vCPU eval-parity box, jul25
-    (~/drill/recipe_replay_jul25/boom_soc_replay.log, RPL_STAGE timestamps):
-
-        unplace 33s + place Explore 865s + route 746s = 1644s  (place+route)
-        phys_opt AlternateFlowWithRetiming            = 1106s
-        total                                         = 2750s of a 3500s wall
-
-    The OLD arm gate demanded ``basis x1.7 x1.3 + reserve``, on a basis that is
-    ITSELF x1.15-margined at record time (ils_polish.py combo_cost) -- roughly
-    2.54x the true place+route cost, i.e. ~4176s + reserve. Against a 3500s
-    wall that is unsatisfiable even at t=0 with the entire budget free, which
-    is precisely why the stage never fired on hardware.
-
-    Three margins were each sound in isolation and nonsense composed. Sizing
-    the ARM on place+route alone, the real recipe fits with room to spare.
+    The arm gate sizes only the place-and-route leg. Retiming has a separate
+    measured-cost gate, preventing independently valid margins from compounding
+    into an unsatisfiable estimate.
     """
     run, why = _gate(remaining_s=3500.0, cost_basis_s=1644.0)
     assert run is True, why
@@ -143,7 +131,7 @@ def test_size_model_fails_closed_without_a_size():
 @pytest.mark.parametrize("nets,measured", [(273_573, 1644.0),   # boom_soc
                                            (273_764, 1492.0)])  # boom_soc_v2
 def test_size_model_reproduces_its_calibration_points(nets, measured):
-    """Both jul25 8-vCPU measurements must land within the run-to-run spread
+    """Both 8-vCPU measurements must land within the run-to-run spread
     the two samples themselves exhibit (9% at identical size). The model is
     deliberately the MAX per-net cost, so it may over- but never under-shoot
     the cheaper sample by more than that spread."""
@@ -192,16 +180,10 @@ def test_physopt_gate_fails_closed_without_a_measurement():
 ])
 def test_all_three_wrongly_declined_runs_now_arm(tag, pr, remaining,
                                                  actual_physopt):
-    """REGRESSION, n=3 on hardware. The old predictive gate refused the tail in
-    every run we have data for, and in every one the tail would have COMPLETED:
+    """Verify that feasible retiming tails pass the measured-cost gate.
 
-        run                 old "need"   had      actual   would have fit by
-        chain12 boom_soc      1724 s   1481 s    1106 s        +375 s
-        chain15 att.1         1702 s   1595 s     805 s        +460 s
-        chain15 att.2         1702 s   1148 s     805 s         +13 s
-
-    ~1.5x over-estimate, worth ~6.5 MHz on the SCORED boom_soc_v2 benchmark.
-    Each must now arm AND leave room for the observed cost.
+    Each case must arm while retaining enough wall time for its elapsed cost,
+    without applying unrelated place-and-route margins.
     """
     ok, why = deep_replace_physopt_affordable(
         measured_place_route_s=pr, remaining_s=remaining,
@@ -321,7 +303,7 @@ def test_worse_than_chain_best_is_rejected():
 
 
 def test_better_than_chain_best_is_adopted_and_written():
-    # boom_soc: chain best -10.399 (our +13.32) vs record -10.378 (+35.47)
+    # A marginal WNS improvement over the chain best remains adoptable.
     v = _Vivado(wns=-10.378)
     r = _run(v)
     assert r.verdict == VERDICT_ADOPTED
@@ -361,7 +343,7 @@ def test_incremental_reroute_on_leftover_nets():
 # ------------------------------- self-capped-stage bypass (unroute gate)
 def test_stage_runs_under_the_self_capped_bypass_and_restores_it(tmp_path,
                                                                  monkeypatch):
-    """REGRESSION — the first live E2E run (jul25) died here.
+    """REGRESSION — the first live E2E run died here.
 
     The unroute gate refused the recipe's own route_design:
         unroute_gate_refused: predicted re-route 2274.0s ... exceeds effective
@@ -511,19 +493,11 @@ def _promotion_stub(tmp_path, monkeypatch, *, verdict, post_wns,
 
 
 def test_adopted_result_is_promoted_to_the_pipeline_best(tmp_path, monkeypatch):
-    """REGRESSION — chain12 (jul25), the first live E2E run.
+    """Verify that an adopted deep-replacement result becomes the pipeline best.
 
-    The recipe banked wns=-10.256 (84.57 MHz) into the MUX, but the pipeline's
-    best stayed at the baseline, so the log then read:
-        "running finalize with best_wns=-19.162"
-        bare-reroute polish: opening best_valid...   <- the BASELINE DCP
-        [tail-ctrl] ARMED: entry wns=-19.162
-        verdict=ERROR gain=+0.000ns   (after 925 s)
-    925 s of tail work on a design already beaten by 36 MHz. The MUX shipped
-    the right DCP so the run looked fine — the waste was invisible.
-
-    replace_gamble, this stage's declared sibling, has always promoted. Now
-    deep-replace does too, so the tail compounds on the recipe's result.
+    Subsequent tail stages must use the promoted checkpoint and its timing
+    result rather than reopening the baseline. This allows later optimization
+    to build on the adopted result.
     """
     stub, cand = _promotion_stub(tmp_path, monkeypatch,
                                  verdict=VERDICT_ADOPTED, post_wns=-10.256)
@@ -595,7 +569,7 @@ def test_recipe_first_runs_with_both_flags_and_passes_the_size_basis():
     assert len(stub.calls) == 1
     kw = stub.calls[0]
     assert kw["stage_label"] == "first"
-    # boom_soc's 377,972 cells must reproduce the measured 1644 s place+route
+    # The ~378k-cell fixture must select the cell-count cost basis.
     assert 1600.0 < kw["cost_basis_override"] < 1700.0
     assert "cells" in kw["basis_note"]
 

@@ -1,0 +1,22 @@
+RouteAgents — FPL'26 Agentic FPGA Backend Optimization Contest submission
+Copyright 2026 Georgios Chatzitsompanis
+
+This repository began from the FPL'26 contest starter kit published by the
+contest organizers (AMD / the FPL'26 contest team) at
+https://github.com/Xilinx/fpl26_optimization_contest, licensed under the
+Apache License, Version 2.0. Files retained from or derived from the starter
+kit include the MCP server scaffolding (VivadoMCP/, RapidWrightMCP/), the
+validation harness (validate_dcps.py), docs/optimization_example.md (an
+excerpt of the organizers' published optimization example; reproduced in full
+in the scored tree, tag `fpl26-final-submission`), and the original Makefile
+and README structure. All of these have been substantially modified.
+
+The optimization agent itself (dcp_optimizer.py, optimizer/, recipes/,
+scheduler/, scripts/, prompts/) is the work of Georgios Chatzitsompanis,
+developed on top of the starter kit's files of the same name. Both copyright
+notices are retained in those files as Apache-2.0 section 4 requires; the
+additions are likewise licensed under the Apache License, Version 2.0
+(see LICENSE).
+
+RapidWright is a project of AMD/Xilinx (https://github.com/Xilinx/RapidWright)
+and is not distributed in this repository.

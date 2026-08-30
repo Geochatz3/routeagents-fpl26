@@ -8,7 +8,7 @@ Phase 1 (this commit): CLASSIFICATION + LOGGING only.  Recovery
 behavior is unchanged.  Future phases can use the policy table to
 drive retry/rollback/escalation decisions.
 
-Codes (per structured_error_recovery_design.md):
+Codes:
   VIVADO_TIMEOUT, BUDGET_SKIP, TIMEOUT_BUDGET,
   INVALID_DCP, WRONG_CLOCK, ROUTE_FAILED, PLACE_FAILED,
   REGRESSION_DETECTED, STALE_MIRROR,
@@ -256,7 +256,7 @@ _VALIDATOR_MISMATCH_PAT = re.compile(
 )
 # MISSING_ARTIFACT — must be error/warning-tagged or a specific
 # named code.  The prior `file.*missing` substring matched benign
-# Vivado info-level chatter (the 2026-05-20 logicnets smoke
+# Vivado info-level chatter (an observed smoke-test
 # false-positive).  Tightened to require either:
 #   - an explicit error/warning tag preceding the phrase, OR
 #   - a specific dispatcher / output-DCP envelope phrase
@@ -284,19 +284,12 @@ def classify_tool_error(
     *,
     context: Optional[str] = None,
 ) -> Optional[ToolError]:
-    """Inspect a call_tool / finalize / validator payload and return a
-    typed ToolError if it looks like an error.  Returns None when the
-    payload is clearly NOT an error (success cases).
+    """Classify an error-like tool, finalization, or validation payload.
 
-    `payload` may be:
-      - dict — already-structured envelope (we look at "error", "code",
-        "reason", "status")
-      - str  — text output (Vivado logs, dispatcher messages)
-      - None — never an error
-
-    `context` is an optional free-form tag describing where the
-    classifier was called from (e.g., "call_tool",
-    "_finalize_output_dcp", "validator_step").  Used in reasons.
+    Returns a typed `ToolError` for recognized failures and `None` for clear
+    success or a null payload. Dictionaries are inspected for structured error
+    fields, while strings are inspected as tool or dispatcher output. The
+    optional context tag is included in generated reasons.
     """
     if payload is None:
         return None
@@ -320,7 +313,7 @@ def _classify_dict(d: dict, *, context: Optional[str]) -> Optional[ToolError]:
         return None
     err_str = str(err)
     # Common dispatcher envelopes have a "reason" or "error" field that
-    # is itself one of our codes.
+    # is itself one of this module's codes.
     err_upper = err_str.upper()
     if err_upper in TOOL_ERROR_CODES:
         return _new_error(err_upper,
@@ -391,7 +384,7 @@ def _classify_text(text: str, *, context: Optional[str]) -> Optional[ToolError]:
     if _VIVADO_TIMEOUT_PAT.search(text):
         return _new_error("VIVADO_TIMEOUT", "Vivado tool call timed out",
                           raw=text)
-    # Generic "ERROR" mention with no specific shape we recognize.
+    # Generic "ERROR" mention with no recognized specific shape.
     if re.search(r"\bERROR\b", text):
         return _new_error("UNKNOWN_TOOL_ERROR",
                           "unrecognized error pattern in tool payload",

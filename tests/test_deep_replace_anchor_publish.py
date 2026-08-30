@@ -1,24 +1,9 @@
-"""deep-replace must PUBLISH its measured place+route cycle (jul26).
+"""Verify that deep replacement publishes its measured place-and-route cost.
 
-THE BUG: run_deep_replace_sibling performs a real full place+route on this
-design and this box and returns place_s/route_s — and nothing consumed them.
-Every later cost-gated stage therefore fell back to
-replace_gamble_cost_basis()'s rung 3 (0.0 -> FAIL CLOSED). Observed live in
-chain15b:
-
-    deep-replace: B1 BANKED ... place=817s route=736s
-    deep-replace[tail]: skipped (no measured cost anchor (fail closed))
-
-i.e. a stage refused for want of a measurement that had been taken minutes
-earlier on the same run. Same class as the B2 predictive gate (54d875e) and the
-deep-replace ship gap (31fc835): the information exists, the consumer cannot
-see it.
-
-These tests pin the CONTRACT, not the plumbing:
-  * a measured cycle becomes the anchor when it beats what is there;
-  * the anchor is RAISE-ONLY (never made more permissive);
-  * downstream cost basis actually changes as a result;
-  * a zero/absent measurement leaves the anchor untouched.
+A positive measurement replaces the current anchor only when it is higher,
+keeping downstream cost gates conservative. The updated anchor must affect
+downstream cost estimation, while zero or absent measurements leave it
+unchanged.
 """
 from __future__ import annotations
 

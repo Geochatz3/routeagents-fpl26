@@ -1,18 +1,16 @@
-"""v4.0 lever bundle (aug05, branch v40-levers) — unit tests for every new
-predicate, the flag discipline, and the gate arithmetic invariants.
+"""Tests feature-lever predicates, flag precedence, and budget-gate arithmetic.
 
-THE CONTRACT UNDER TEST (PREREG_V40_LEVERS_aug05.md):
-  * all three flags are DEFAULT OFF in python and armed ONLY via the
-    Makefile, on BOTH launch branches (jul30 "Makefile not in the ship
-    surface" lesson);
-  * each FPL26_NO_* kill switch wins over its enable;
-  * feature keys are measured-characteristic only (|wns_in| bands, NO
-    md5/name keys), with the same None/positive-slack fail-OFF discipline
-    as recipe_pass_band;
-  * the latency audit (DQ protection) fails ON — unmeasured FF counts
-    abort the registration;
-  * the primary shallow RECIPE_PASS gate arithmetic is UNTOUCHED (2450 s)
-    and the new gates carry their own recomputed fail-closed arithmetic.
+All feature flags default off and are enabled only through the Makefile on both
+launch branches. Each `FPL26_NO_*` kill switch overrides its corresponding
+enable.
+
+Feature selection uses measured characteristics such as absolute input WNS,
+never design names or hashes. Missing WNS and positive slack fail off, matching
+the recipe pass band.
+
+The latency audit fails closed: registration aborts when FF counts are
+unavailable. The existing shallow recipe-pass contract pins the primary gate at
+2,450 s; new gates independently recompute fail-closed budgets.
 """
 from __future__ import annotations
 
@@ -33,9 +31,9 @@ from optimizer.ils_polish import (  # noqa: E402
 )
 
 ALL_V40_ENVS = (
-    "FPL26_VEX2_RETIME_CANDIDATE", "FPL26_NO_VEX2_RETIME_CANDIDATE",
-    "FPL26_MINIISP_RETRY_HOLD", "FPL26_NO_MINIISP_RETRY_HOLD",
-    "FPL26_CORESCORE_ROUTE_RUNG", "FPL26_NO_CORESCORE_ROUTE_RUNG",
+    "FPL26_ETO_RETIME_CANDIDATE", "FPL26_NO_ETO_RETIME_CANDIDATE",
+    "FPL26_MIDBAND_RETRY_HOLD", "FPL26_NO_MIDBAND_RETRY_HOLD",
+    "FPL26_MIDBAND_ROUTE_RUNG", "FPL26_NO_MIDBAND_ROUTE_RUNG",
     "FPL26_ILS_RETRY_BASELINE_GATE",
 )
 
@@ -48,12 +46,12 @@ def clean_env(monkeypatch):
 
 
 FLAG_FNS = [
-    ("FPL26_VEX2_RETIME_CANDIDATE", "FPL26_NO_VEX2_RETIME_CANDIDATE",
-     d.vex2_retime_candidate_enabled),
-    ("FPL26_MINIISP_RETRY_HOLD", "FPL26_NO_MINIISP_RETRY_HOLD",
-     d.miniisp_retry_hold_enabled),
-    ("FPL26_CORESCORE_ROUTE_RUNG", "FPL26_NO_CORESCORE_ROUTE_RUNG",
-     d.corescore_route_rung_enabled),
+    ("FPL26_ETO_RETIME_CANDIDATE", "FPL26_NO_ETO_RETIME_CANDIDATE",
+     d.eto_retime_candidate_enabled),
+    ("FPL26_MIDBAND_RETRY_HOLD", "FPL26_NO_MIDBAND_RETRY_HOLD",
+     d.midband_retry_hold_enabled),
+    ("FPL26_MIDBAND_ROUTE_RUNG", "FPL26_NO_MIDBAND_ROUTE_RUNG",
+     d.midband_route_rung_enabled),
 ]
 
 
@@ -97,7 +95,7 @@ class TestVex2RetimeSubband:
         -1.05,    # upper bound inclusive (== shallow band max)
     ])
     def test_in_band(self, wns):
-        assert d.vex2_retime_subband_match(wns) is True
+        assert d.eto_retime_subband_match(wns) is True
 
     @pytest.mark.parametrize("wns", [
         -0.313,   # fir — carve-out zone, must never see the chain
@@ -112,29 +110,29 @@ class TestVex2RetimeSubband:
         "garbage",
     ])
     def test_out_of_band(self, wns):
-        assert d.vex2_retime_subband_match(wns) is False
+        assert d.eto_retime_subband_match(wns) is False
 
     def test_band_top_matches_shallow_band(self):
         """The sub-band may never exceed the shallow band it lives in."""
-        assert (d.VEX2_RETIME_WNS_MAG_MAX_NS
+        assert (d.ETO_RETIME_WNS_MAG_MAX_NS
                 == d.RECIPE_PASS_SHALLOW_WNS_MAG_MAX_NS == 1.05)
-        assert d.VEX2_RETIME_WNS_MAG_MIN_NS > d.FIR_CARVEOUT_WNS_MAG_MAX_NS
+        assert d.ETO_RETIME_WNS_MAG_MIN_NS > d.SUBBAND_CARVEOUT_WNS_MAG_MAX_NS
 
 
 class TestVex2LatencyAudit:
     """DQ protection: protections fail ON (unmeasured -> abort)."""
 
     def test_q07_measured_pair_passes(self):
-        # q07 FF audit: 1678 -> 1682 (+0.24%, replication-class moves).
-        assert d.vex2_retime_ff_drift_ok(1678, 1682) is True
+        # A 0.24% FF-count increase remains within the drift guard.
+        assert d.eto_retime_ff_drift_ok(1678, 1682) is True
 
     def test_exact_one_percent_inclusive(self):
-        assert d.vex2_retime_ff_drift_ok(1000, 1010) is True
-        assert d.vex2_retime_ff_drift_ok(1000, 990) is True
+        assert d.eto_retime_ff_drift_ok(1000, 1010) is True
+        assert d.eto_retime_ff_drift_ok(1000, 990) is True
 
     def test_beyond_one_percent_aborts(self):
-        assert d.vex2_retime_ff_drift_ok(1000, 1011) is False
-        assert d.vex2_retime_ff_drift_ok(1000, 989) is False
+        assert d.eto_retime_ff_drift_ok(1000, 1011) is False
+        assert d.eto_retime_ff_drift_ok(1000, 989) is False
 
     @pytest.mark.parametrize("before,after", [
         (None, 1682), (1678, None), (None, None),
@@ -142,19 +140,22 @@ class TestVex2LatencyAudit:
         (0, 0), (-5, 100), (100, -1),
     ])
     def test_unmeasured_or_degenerate_fails_closed(self, before, after):
-        assert d.vex2_retime_ff_drift_ok(before, after) is False
+        assert d.eto_retime_ff_drift_ok(before, after) is False
 
     def test_identity_passes(self):
-        assert d.vex2_retime_ff_drift_ok(1678, 1678) is True
+        assert d.eto_retime_ff_drift_ok(1678, 1678) is True
 
 
 class TestVex2FrozenChain:
-    """The chain is FROZEN (feedback_same_build_not_just_same_config):
-    the q07 effective recipe, place-first (retime from an unrouted basin
-    measured actively harmful, -0.874 x3)."""
+    """Keep the matching-build feedback chain place-first.
+
+    Feedback applies only to the same build, not merely the same configuration.
+    Placement must precede retiming because retiming from an unrouted state is
+    harmful.
+    """
 
     def test_frozen_steps_verbatim(self):
-        assert d.VEX2_RETIME_TCL == (
+        assert d.ETO_RETIME_TCL == (
             "route_design -unroute",
             "place_design -unplace",
             "place_design -directive ExtraTimingOpt",
@@ -164,7 +165,7 @@ class TestVex2FrozenChain:
         )
 
     def test_retime_after_place(self):
-        steps = list(d.VEX2_RETIME_TCL)
+        steps = list(d.ETO_RETIME_TCL)
         assert (steps.index("phys_opt_design -retime")
                 > steps.index("place_design -directive ExtraTimingOpt"))
 
@@ -181,20 +182,22 @@ class TestGateArithmetic:
         """need2 = 1.5x460 + 540 + 1100 = 2330 s <= 3200 s max remaining;
         the second candidate is fundable on the ship wall after a typical
         primary pass, and fail-closed otherwise."""
-        cap = d.RECIPE_PASS_TIMEOUT_FACTOR * d.VEX2_RETIME_EXPECTED_S
+        cap = d.RECIPE_PASS_TIMEOUT_FACTOR * d.ETO_RETIME_EXPECTED_S
         assert cap == 690.0
-        need2 = cap + d.VEX2_RETIME_OVERHEAD_RESERVE_S + 1100.0
+        need2 = cap + d.ETO_RETIME_OVERHEAD_RESERVE_S + 1100.0
         assert need2 == 2330.0
         assert need2 <= 3200.0
         # no reset term in the second candidate's overheads — the caller's
         # single post-pass reset covers both candidates.
-        assert d.VEX2_RETIME_OVERHEAD_RESERVE_S == 540.0
+        assert d.ETO_RETIME_OVERHEAD_RESERVE_S == 540.0
 
     def test_route_rung_fits_stranded_wall(self):
-        """need = 500 + 540 = 1040 s — inside the measured 750-1300 s
-        stranded band's upper half and far below the deep postloop slot's
-        1890 s; hard pass deadline 1.5x500 = 750 s."""
-        need = (d.CORESCORE_ROUTE_RUNG_EXPECTED_S
+        """Verify that the route rung fits the available runtime window.
+
+        A 500 s pass plus a 540 s route allowance requires 1,040 s. The
+        separate hard-pass deadline is 750 s.
+        """
+        need = (d.MIDBAND_ROUTE_RUNG_EXPECTED_S
                 + d.RECIPE_PASS_POSTLOOP_OVERHEAD_RESERVE_S)
         assert need == 1040.0
         assert need <= 1300.0
@@ -204,13 +207,13 @@ class TestGateArithmetic:
         assert deep_need == 1890.0
         assert need < deep_need
         assert (d.RECIPE_PASS_TIMEOUT_FACTOR
-                * d.CORESCORE_ROUTE_RUNG_EXPECTED_S) == 750.0
+                * d.MIDBAND_ROUTE_RUNG_EXPECTED_S) == 750.0
 
     def test_route_rung_tcl_frozen(self):
-        assert d.CORESCORE_ROUTE_RUNG_TCL == "route_design -directive Explore"
+        assert d.MIDBAND_ROUTE_RUNG_TCL == "route_design -directive Explore"
 
 
-class TestMiniispRetryHoldScope:
+class TestMidbandRetryHoldScope:
     """Band scoping facts the arming site relies on (recipe_pass_band on
     the PRISTINE initial_wns)."""
 
@@ -218,7 +221,7 @@ class TestMiniispRetryHoldScope:
         (-1.686, "mid"),      # mini-ISP — the evidence design
         (-1.238, "mid"),      # corescore
         (-1.078, "mid"),      # optical — IN scope; disclosed prereg risk
-        (-0.686, "shallow"),  # spam — the jul29 clean harm, OUT by scope
+        (-0.686, "shallow"),  # spam — the clean harm, OUT by scope
         (-0.313, "shallow"),  # fir
         (-1.05, "shallow"),   # boundary inclusive to shallow
         (-8.0, "deep"),       # boundary inclusive to deep
@@ -273,24 +276,24 @@ class TestManifestRecords:
 
 class TestMakefileArming:
     """Both launch branches (wrapper + `||` safety net) must arm all
-    three flags — one branch armed alone measures nothing (jul30)."""
+    three flags — one branch armed alone measures nothing."""
 
     @pytest.fixture(scope="class")
     def branches(self):
         text = (ROOT / "Makefile").read_text()
         wrapper = [ln for ln in text.splitlines()
                    if "multi_restart_optimize.py" in ln
-                   and "FPL26_FIR_SUBBAND_FLOOR" in ln]
+                   and "FPL26_SUBBAND_PHYSOPT_FLOOR" in ln]
         fallback = [ln for ln in text.splitlines()
                     if "dcp_optimizer.py" in ln and ln.strip().startswith("||")
-                    and "FPL26_FIR_SUBBAND_FLOOR" in ln]
+                    and "FPL26_SUBBAND_PHYSOPT_FLOOR" in ln]
         assert len(wrapper) == 1 and len(fallback) == 1
         return wrapper[0], fallback[0]
 
     @pytest.mark.parametrize("var,knob", [
-        ("FPL26_VEX2_RETIME_CANDIDATE", "VEX2_RETIME"),
-        ("FPL26_MINIISP_RETRY_HOLD", "MINIISP_RETRY_HOLD"),
-        ("FPL26_CORESCORE_ROUTE_RUNG", "CORESCORE_ROUTE_RUNG"),
+        ("FPL26_ETO_RETIME_CANDIDATE", "ETO_RETIME"),
+        ("FPL26_MIDBAND_RETRY_HOLD", "MIDBAND_RETRY_HOLD"),
+        ("FPL26_MIDBAND_ROUTE_RUNG", "MIDBAND_ROUTE_RUNG"),
     ])
     def test_both_branches_armed(self, branches, var, knob):
         expected = f"{var}=$(if $({knob}),$({knob}),1)"
@@ -299,12 +302,12 @@ class TestMakefileArming:
 
 
 class TestPreShipAcks:
-    """Post-review pre-ship fixes (PREREG post-review additions):
+    """Post-review pre-ship fixes:
     FF-probe sentinel anchor + disabled-audit-line log-byte parity."""
 
     def test_ff_probe_tcl_carries_sentinel(self):
-        assert d.VEX2_RETIME_FF_COUNT_TCL.startswith("puts FFCOUNT=")
-        assert "PRIMITIVE_TYPE =~ REGISTER.*" in d.VEX2_RETIME_FF_COUNT_TCL
+        assert d.ETO_RETIME_FF_COUNT_TCL.startswith("puts FFCOUNT=")
+        assert "PRIMITIVE_TYPE =~ REGISTER.*" in d.ETO_RETIME_FF_COUNT_TCL
 
     @pytest.mark.parametrize("res,expect", [
         ("FFCOUNT=1678", 1678),
@@ -317,32 +320,32 @@ class TestPreShipAcks:
         (1678, None),                        # non-str fails closed
     ])
     def test_sentinel_parse_fail_closed(self, res, expect):
-        assert d.vex2_retime_parse_ffcount(res) == expect
+        assert d.eto_retime_parse_ffcount(res) == expect
 
     def test_env_present_gates_audit_line(self, monkeypatch):
         # absent -> False (log-byte parity with v3.3)
         assert d.v40_flag_env_present(
-            "FPL26_VEX2_RETIME_CANDIDATE",
-            "FPL26_NO_VEX2_RETIME_CANDIDATE") is False
+            "FPL26_ETO_RETIME_CANDIDATE",
+            "FPL26_NO_ETO_RETIME_CANDIDATE") is False
         # present-but-off ("0" knob, the A/B OFF arm) -> True (line audits)
-        monkeypatch.setenv("FPL26_VEX2_RETIME_CANDIDATE", "0")
+        monkeypatch.setenv("FPL26_ETO_RETIME_CANDIDATE", "0")
         assert d.v40_flag_env_present(
-            "FPL26_VEX2_RETIME_CANDIDATE",
-            "FPL26_NO_VEX2_RETIME_CANDIDATE") is True
+            "FPL26_ETO_RETIME_CANDIDATE",
+            "FPL26_NO_ETO_RETIME_CANDIDATE") is True
         # kill switch alone also audits
-        monkeypatch.delenv("FPL26_VEX2_RETIME_CANDIDATE")
-        monkeypatch.setenv("FPL26_NO_VEX2_RETIME_CANDIDATE", "1")
+        monkeypatch.delenv("FPL26_ETO_RETIME_CANDIDATE")
+        monkeypatch.setenv("FPL26_NO_ETO_RETIME_CANDIDATE", "1")
         assert d.v40_flag_env_present(
-            "FPL26_VEX2_RETIME_CANDIDATE",
-            "FPL26_NO_VEX2_RETIME_CANDIDATE") is True
+            "FPL26_ETO_RETIME_CANDIDATE",
+            "FPL26_NO_ETO_RETIME_CANDIDATE") is True
 
 
 class TestRetryHoldSubbandFloor:
-    """aug05 re-scope (pre-registered prereg-risk-#2 fallback): the retry-hold
+    """re-scope (pre-registered prereg-risk-#2 fallback): the retry-hold
     floor at |wns_in| >= 1.20 — optical-class [1.05, 1.20) reverts to v3.3."""
 
     def test_floor_constant(self):
-        assert d.MINIISP_RETRY_HOLD_WNS_MAG_MIN_NS == 1.20
+        assert d.MIDBAND_RETRY_HOLD_WNS_MAG_MIN_NS == 1.20
 
     @pytest.mark.parametrize("wns,held", [
         (-1.078, False),   # optical — parity-measured harm, MUST be out
@@ -357,5 +360,5 @@ class TestRetryHoldSubbandFloor:
     def test_floor_scope(self, wns, held):
         band = d.recipe_pass_band(wns)
         in_scope = (band == "mid"
-                    and abs(wns) >= d.MINIISP_RETRY_HOLD_WNS_MAG_MIN_NS)
+                    and abs(wns) >= d.MIDBAND_RETRY_HOLD_WNS_MAG_MIN_NS)
         assert in_scope is held
