@@ -14,12 +14,11 @@ and nothing is adopted on a model's say-so.
 
 ## Results
 
-Built for the [FPL'26 Agentic FPGA Backend Optimization
-Contest](https://xilinx.github.io/fpl26_optimization_contest/). The official
-evaluation scored it **369.9**: 7 of 7 hidden benchmarks improved, none failed
-validation, inside a budget of one hour and one dollar per design. The score
-is the megahertz each design gained, less a penalty for the wall time and the
-model spend it took.
+The contest's official evaluation scored it **369.9**: 7 of 7 hidden
+benchmarks improved, none failed validation, inside a budget of one hour and
+one dollar per design, placing it in the round's top five. The score is the
+megahertz each design gained, less a penalty for the wall time and the model
+spend it took.
 
 All seven are in the public benchmark set,
 [`fpl26_contest_benchmarks_v1.2.0`](https://github.com/Xilinx/fpl26_optimization_contest/releases/tag/v1.2.0),

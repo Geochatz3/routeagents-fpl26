@@ -6,6 +6,7 @@ authors:
     given-names: "Georgios"
 type: software
 license: Apache-2.0
+repository-code: "https://github.com/Geochatz3/routeagents-fpl26"
 version: 5.5.3
 date-released: "2026-08-10"
 abstract: >-
